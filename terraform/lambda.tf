@@ -243,6 +243,35 @@ resource "aws_apigatewayv2_route" "delete_version" {
   authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
 }
 
+# Processed-artefact reads — the Lambda router handles these, but the HTTP API
+# needs an explicit route per path or the gateway 404s before reaching Lambda.
+resource "aws_apigatewayv2_route" "get_classification" {
+  api_id    = aws_apigatewayv2_api.documents.id
+  route_key = "GET /documents/{docId}/classification"
+  target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
+}
+
+resource "aws_apigatewayv2_route" "get_diff" {
+  api_id    = aws_apigatewayv2_api.documents.id
+  route_key = "GET /documents/{docId}/diff"
+  target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
+}
+
+resource "aws_apigatewayv2_route" "get_timeline" {
+  api_id    = aws_apigatewayv2_api.documents.id
+  route_key = "GET /documents/{docId}/timeline"
+  target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
+}
+
 resource "aws_apigatewayv2_stage" "default" {
   api_id      = aws_apigatewayv2_api.documents.id
   name        = "$default"
