@@ -23,8 +23,8 @@ from botocore.awsrequest import AWSRequest
 from shared.aws import get_credentials
 from shared.config import settings
 from shared.logger import get_logger
-from shared.openai_client import openai_client, embed_texts
-from shared.opensearch import hybrid_search
+from shared.openai_client import openai_client, embed_texts, chat_text
+from shared.opensearch import hybrid_search, clause_search
 
 log: Logger = get_logger("blue-iq.rag")
 tracer = Tracer(service="blue-iq.rag")
@@ -57,11 +57,75 @@ _TOKEN_MUTATION = """
 @tracer.capture_lambda_handler
 def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
     log.append_keys(invocation_id=str(uuid.uuid4()))
+    is_http = isinstance(event, dict) and bool(event.get("requestContext", {}).get("http"))
     try:
-        return _handle(event)
+        return _http_handle(event) if is_http else _handle(event)
     except Exception:
         log.exception("rag.handler.error")
+        if is_http:
+            return _http_resp(500, {"error": "Internal server error"})
         raise
+
+
+# ---------------------------------------------------------------------------
+# HTTP API path — POST /documents/{docId}/chat (non-streaming JSON)
+# ---------------------------------------------------------------------------
+
+
+def _http_handle(event: dict[str, Any]) -> dict[str, Any]:
+    method = (event.get("requestContext", {}).get("http", {}).get("method") or "POST").upper()
+    if method == "OPTIONS":
+        return _http_resp(200, {})
+
+    claims = (event.get("requestContext", {}).get("authorizer", {}) or {}).get("jwt", {}).get("claims", {}) or {}
+    tenant_id = claims.get("custom:tenantId") or (event.get("headers") or {}).get("x-tenant-id") or "default"
+    doc_id = (event.get("pathParameters") or {}).get("docId")
+
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _http_resp(400, {"error": "Invalid JSON body"})
+
+    question = (body.get("question") or "").strip()
+    if not question:
+        return _http_resp(400, {"error": "A 'question' is required"})
+    top_k = max(1, min(int(body.get("topK") or MAX_CONTEXT_CLAUSES), 20))
+
+    log.append_keys(tenant_id=tenant_id, docId=doc_id or "all")
+
+    [q_vec] = embed_texts([question], model=settings.embedding_model)
+    hits = clause_search(text=question, vector=q_vec, tenant_id=tenant_id, k=top_k, doc_id=doc_id)
+
+    if not hits:
+        return _http_resp(200, {
+            "answer": "I couldn't find any clauses relevant to that question in this document. Try rephrasing, or ask about a specific clause or topic.",
+            "citations": [],
+        })
+
+    context_blocks: list[str] = []
+    citations: list[dict[str, str]] = []
+    for h in hits:
+        src = h.get("_source", {})
+        cn = src.get("clauseNumber", "")
+        context_blocks.append(f"[§{cn}] {(src.get('text') or '')[:MAX_CLAUSE_CHARS]}")
+        citations.append({
+            "clauseNumber": cn,
+            "docId": src.get("docId", ""),
+            "category": src.get("category", ""),
+        })
+
+    answer = chat_text(
+        system=_SYSTEM_PROMPT,
+        user=f"<context>\n{chr(10).join(context_blocks)}\n</context>\n\nQuestion: {question}",
+        model=settings.chat_model,
+        temperature=0.2,
+        max_tokens=600,
+    )
+    return _http_resp(200, {"answer": answer, "citations": citations})
+
+
+def _http_resp(status: int, body: dict[str, Any]) -> dict[str, Any]:
+    return {"statusCode": status, "headers": {"Content-Type": "application/json"}, "body": json.dumps(body)}
 
 
 def _handle(event: dict[str, Any]) -> dict[str, Any]:

@@ -213,6 +213,7 @@ def knn_search(
     k: int = 10,
     doc_types: list[str] | None = None,
     exclude_doc_id: str | None = None,
+    doc_id: str | None = None,
 ) -> list[dict[str, Any]]:
     must_not: list[dict] = []
     if exclude_doc_id:
@@ -220,6 +221,8 @@ def knn_search(
     filters: list[dict] = [{"term": {"tenantId": tenant_id}}]
     if doc_types:
         filters.append({"terms": {"docType": doc_types}})
+    if doc_id:
+        filters.append({"term": {"docId": doc_id}})
     query = {
         "size": k,
         "query": {
@@ -244,10 +247,13 @@ def bm25_search(
     doc_types: list[str] | None = None,
     exclude_doc_id: str | None = None,
     structural_hash_prefix: str | None = None,
+    doc_id: str | None = None,
 ) -> list[dict[str, Any]]:
     filters: list[dict] = [{"term": {"tenantId": tenant_id}}]
     if doc_types:
         filters.append({"terms": {"docType": doc_types}})
+    if doc_id:
+        filters.append({"term": {"docId": doc_id}})
     if structural_hash_prefix:
         filters.append({"prefix": {"structuralHash": structural_hash_prefix}})
     must_not = []
@@ -267,6 +273,30 @@ def bm25_search(
     }
     resp = client().search(index=settings.clause_text_index, body=query)
     return resp.get("hits", {}).get("hits", [])
+
+
+def clause_search(
+    *,
+    text: str,
+    vector: list[float],
+    tenant_id: str,
+    k: int = 8,
+    doc_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return up to `k` individual clause hits for RAG (NOT grouped per doc).
+
+    Vector (KNN) results lead for semantic relevance; BM25 fills any remaining
+    slots for keyword recall. Optionally scoped to a single document.
+    Each hit is a raw OpenSearch hit with `_source` = {docId, clauseNumber,
+    category, text, ...}.
+    """
+    knn = knn_search(vector=vector, tenant_id=tenant_id, k=k, doc_id=doc_id)
+    if len(knn) >= k:
+        return knn[:k]
+    seen = {h.get("_id") for h in knn}
+    bm = bm25_search(text=text, tenant_id=tenant_id, k=k, doc_id=doc_id)
+    extra = [h for h in bm if h.get("_id") not in seen]
+    return (knn + extra)[:k]
 
 
 def hybrid_search(

@@ -158,7 +158,7 @@ resource "aws_apigatewayv2_api" "documents" {
     # allowed_origins variable. allow_credentials stays false — the API uses
     # bearer tokens, not cookies.
     allow_origins = var.allowed_origins
-    allow_methods = ["GET", "DELETE", "PATCH", "OPTIONS"]
+    allow_methods = ["GET", "POST", "DELETE", "PATCH", "OPTIONS"]
     allow_headers = ["Content-Type", "Authorization", "x-tenant-id"]
     max_age       = 300
   }
@@ -337,4 +337,31 @@ resource "aws_lambda_function" "rag" {
   tracing_config { mode = "Active" }
 
   depends_on = [aws_cloudwatch_log_group.rag]
+}
+
+# ─── RAG over the HTTP API — POST /documents/{docId}/chat ─────────────────────
+# Keeps RAG in its own Lambda (separate concern) but exposes it on the same
+# documents HTTP API so the frontend Co-pilot can call it directly.
+resource "aws_apigatewayv2_integration" "rag_lambda" {
+  api_id                 = aws_apigatewayv2_api.documents.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.rag.invoke_arn
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "post_chat" {
+  api_id    = aws_apigatewayv2_api.documents.id
+  route_key = "POST /documents/{docId}/chat"
+  target    = "integrations/${aws_apigatewayv2_integration.rag_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
+}
+
+resource "aws_lambda_permission" "apigw_rag" {
+  statement_id  = "AllowAPIGatewayInvokeRAG"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.rag.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.documents.execution_arn}/*/*"
 }
