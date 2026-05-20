@@ -180,14 +180,13 @@ resource "aws_cloudwatch_event_target" "raw_to_sfn" {
       bucket = "$.detail.bucket.name"
       key    = "$.detail.object.key"
     }
+    # IMPORTANT: Do NOT use jsonencode() here. Terraform's jsonencode() HTML-escapes
+    # < and > as < / >, which makes EventBridge unable to recognise the
+    # <bucket> and <key> placeholders — they arrive at the Lambda as the literal
+    # strings "<bucket>" and "<key>". Use a plain string so the angle brackets are
+    # preserved verbatim for EventBridge substitution.
     # docId and tenantId are extracted from the S3 key by the parse stage.
     # Key format: tenants/<tenantId>/uploads/<docId>/<filename>
-    input_template = jsonencode({
-      rawBucket       = "<bucket>"
-      rawKey          = "<key>"
-      processedBucket = aws_s3_bucket.processed.bucket
-      docId           = "<key>"
-      tenantId        = "unknown"
-    })
+    input_template = "{\"rawBucket\":\"<bucket>\",\"rawKey\":\"<key>\",\"processedBucket\":\"${aws_s3_bucket.processed.bucket}\",\"docId\":\"<key>\",\"tenantId\":\"unknown\"}"
   }
 }
