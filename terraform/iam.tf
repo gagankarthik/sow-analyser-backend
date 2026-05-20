@@ -259,10 +259,10 @@ resource "aws_iam_role_policy" "sfn" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "InvokeLambdas"
+        Sid      = "InvokePipeline"
         Effect   = "Allow"
         Action   = ["lambda:InvokeFunction"]
-        Resource = [for fn in aws_lambda_function.pipeline : fn.arn]
+        Resource = [aws_lambda_function.pipeline.arn]
       },
       {
         Sid      = "DDBMarkFailed"

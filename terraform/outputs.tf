@@ -28,9 +28,9 @@ output "state_machine_arn" {
   value       = aws_sfn_state_machine.pipeline.arn
 }
 
-output "lambda_arns" {
-  description = "Map of pipeline-stage-name → Lambda ARN."
-  value       = { for k, fn in aws_lambda_function.pipeline : k => fn.arn }
+output "pipeline_lambda_arn" {
+  description = "Single pipeline Lambda ARN (handles all seven stages)."
+  value       = aws_lambda_function.pipeline.arn
 }
 
 output "rag_lambda_arn" {

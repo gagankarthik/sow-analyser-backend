@@ -7,10 +7,14 @@ resource "aws_cloudwatch_log_group" "sfn" {
 
 
 # ─── Express state machine ─────────────────────────────────────────────────────
-# Runs 7 stages in series.  Any failure catches → MarkFailed (DDB update).
-# On success: emit blue-iq.documentReady event on the default EventBridge bus.
+# Single Lambda handles all seven stages.  Each state injects _stage into the
+# payload via States.JsonMerge; the handler pops it, dispatches, and returns the
+# clean pipeline event for the next stage.
 
 locals {
+  _fn  = aws_lambda_function.pipeline.arn
+  _catch = [{ ErrorEquals = ["States.ALL"], Next = "MarkFailed", ResultPath = "$.error" }]
+
   sfn_definition = jsonencode({
     Comment = "Blue-IQ document ingestion pipeline"
     StartAt = "Parse"
@@ -19,78 +23,78 @@ locals {
         Type     = "Task"
         Resource = "arn:aws:states:::lambda:invoke"
         Parameters = {
-          FunctionName = aws_lambda_function.pipeline["01-parse"].arn
-          "Payload.$"  = "$"
+          FunctionName = local._fn
+          "Payload.$"  = "States.JsonMerge($, States.StringToJson('{\"_stage\":\"01_parse\"}'), false)"
         }
         OutputPath = "$.Payload"
-        Catch = [{ ErrorEquals = ["States.ALL"], Next = "MarkFailed", ResultPath = "$.error" }]
-        Next = "Classify"
+        Catch      = local._catch
+        Next       = "Classify"
       }
       Classify = {
         Type     = "Task"
         Resource = "arn:aws:states:::lambda:invoke"
         Parameters = {
-          FunctionName = aws_lambda_function.pipeline["02-classify"].arn
-          "Payload.$"  = "$"
+          FunctionName = local._fn
+          "Payload.$"  = "States.JsonMerge($, States.StringToJson('{\"_stage\":\"02_classify\"}'), false)"
         }
         OutputPath = "$.Payload"
-        Catch = [{ ErrorEquals = ["States.ALL"], Next = "MarkFailed", ResultPath = "$.error" }]
-        Next = "Embed"
+        Catch      = local._catch
+        Next       = "Embed"
       }
       Embed = {
         Type     = "Task"
         Resource = "arn:aws:states:::lambda:invoke"
         Parameters = {
-          FunctionName = aws_lambda_function.pipeline["03-embed"].arn
-          "Payload.$"  = "$"
+          FunctionName = local._fn
+          "Payload.$"  = "States.JsonMerge($, States.StringToJson('{\"_stage\":\"03_embed\"}'), false)"
         }
         OutputPath = "$.Payload"
-        Catch = [{ ErrorEquals = ["States.ALL"], Next = "MarkFailed", ResultPath = "$.error" }]
-        Next = "Graph"
+        Catch      = local._catch
+        Next       = "Graph"
       }
       Graph = {
         Type     = "Task"
         Resource = "arn:aws:states:::lambda:invoke"
         Parameters = {
-          FunctionName = aws_lambda_function.pipeline["04-graph"].arn
-          "Payload.$"  = "$"
+          FunctionName = local._fn
+          "Payload.$"  = "States.JsonMerge($, States.StringToJson('{\"_stage\":\"04_graph\"}'), false)"
         }
         OutputPath = "$.Payload"
-        Catch = [{ ErrorEquals = ["States.ALL"], Next = "MarkFailed", ResultPath = "$.error" }]
-        Next = "Diff"
+        Catch      = local._catch
+        Next       = "Diff"
       }
       Diff = {
         Type     = "Task"
         Resource = "arn:aws:states:::lambda:invoke"
         Parameters = {
-          FunctionName = aws_lambda_function.pipeline["05-diff"].arn
-          "Payload.$"  = "$"
+          FunctionName = local._fn
+          "Payload.$"  = "States.JsonMerge($, States.StringToJson('{\"_stage\":\"05_diff\"}'), false)"
         }
         OutputPath = "$.Payload"
-        Catch = [{ ErrorEquals = ["States.ALL"], Next = "MarkFailed", ResultPath = "$.error" }]
-        Next = "Timeline"
+        Catch      = local._catch
+        Next       = "Timeline"
       }
       Timeline = {
         Type     = "Task"
         Resource = "arn:aws:states:::lambda:invoke"
         Parameters = {
-          FunctionName = aws_lambda_function.pipeline["06-timeline"].arn
-          "Payload.$"  = "$"
+          FunctionName = local._fn
+          "Payload.$"  = "States.JsonMerge($, States.StringToJson('{\"_stage\":\"06_timeline\"}'), false)"
         }
         OutputPath = "$.Payload"
-        Catch = [{ ErrorEquals = ["States.ALL"], Next = "MarkFailed", ResultPath = "$.error" }]
-        Next = "Persist"
+        Catch      = local._catch
+        Next       = "Persist"
       }
       Persist = {
         Type     = "Task"
         Resource = "arn:aws:states:::lambda:invoke"
         Parameters = {
-          FunctionName = aws_lambda_function.pipeline["07-persist"].arn
-          "Payload.$"  = "$"
+          FunctionName = local._fn
+          "Payload.$"  = "States.JsonMerge($, States.StringToJson('{\"_stage\":\"07_persist\"}'), false)"
         }
         OutputPath = "$.Payload"
-        Catch = [{ ErrorEquals = ["States.ALL"], Next = "MarkFailed", ResultPath = "$.error" }]
-        Next = "DocumentReady"
+        Catch      = local._catch
+        Next       = "DocumentReady"
       }
       DocumentReady = {
         Type     = "Task"
@@ -114,8 +118,8 @@ locals {
             PK = { "S.$" = "States.Format('DOC#{}', $.docId)" }
             SK = { S = "META" }
           }
-          UpdateExpression = "SET #st = :failed, updatedAt = :ts"
-          ExpressionAttributeNames = { "#st" = "status" }
+          UpdateExpression          = "SET #st = :failed, updatedAt = :ts"
+          ExpressionAttributeNames  = { "#st" = "status" }
           ExpressionAttributeValues = {
             ":failed" = { S = "FAILED" }
             ":ts"     = { "S.$" = "$$.State.EnteredTime" }
@@ -152,7 +156,7 @@ resource "aws_cloudwatch_event_rule" "raw_object_created" {
   description = "Trigger Blue-IQ pipeline when a file lands in the raw S3 bucket"
 
   event_pattern = jsonencode({
-    source      = ["aws.s3"]
+    source        = ["aws.s3"]
     "detail-type" = ["Object Created"]
     detail = {
       bucket = { name = [aws_s3_bucket.raw.bucket] }
@@ -165,20 +169,19 @@ resource "aws_cloudwatch_event_target" "raw_to_sfn" {
   arn      = aws_sfn_state_machine.pipeline.arn
   role_arn = aws_iam_role.events_to_sfn.arn
 
-  # Remap S3 event fields into the PipelineEvent shape the parse stage expects.
   input_transformer {
     input_paths = {
       bucket = "$.detail.bucket.name"
       key    = "$.detail.object.key"
     }
-    # docId and tenantId are extracted by the parse Lambda from the S3 key.
+    # docId and tenantId are extracted from the S3 key by the parse stage.
     # Key format: tenants/<tenantId>/uploads/<docId>/<filename>
     input_template = jsonencode({
-      rawBucket        = "<bucket>"
-      rawKey           = "<key>"
-      processedBucket  = aws_s3_bucket.processed.bucket
-      docId            = "<key>"
-      tenantId         = "unknown"
+      rawBucket       = "<bucket>"
+      rawKey          = "<key>"
+      processedBucket = aws_s3_bucket.processed.bucket
+      docId           = "<key>"
+      tenantId        = "unknown"
     })
   }
 }

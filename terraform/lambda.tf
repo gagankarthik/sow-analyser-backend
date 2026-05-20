@@ -13,9 +13,10 @@ resource "aws_lambda_layer_version" "shared" {
 }
 
 
-# ─── Pipeline Lambda functions ──────────────────────────────────────────────────
-# All seven stages run from the same code zip (lambdas/pipeline/).
-# PIPELINE_STAGE env var controls which stage.run() is called.
+# ─── Pipeline Lambda (single function — all seven stages) ──────────────────────
+# Step Functions injects _stage into the payload via States.JsonMerge so the
+# same Lambda handles every stage.  Memory and timeout are sized for the most
+# demanding stage (Textract async + GPT classify/embed/diff).
 
 data "archive_file" "pipeline" {
   type        = "zip"
@@ -24,45 +25,7 @@ data "archive_file" "pipeline" {
 }
 
 locals {
-  pipeline_stages = {
-    "01-parse" = {
-      stage      = "01_parse"
-      memory_mb  = 1024
-      timeout_s  = 300  # 5 min (Textract async can be slow)
-    }
-    "02-classify" = {
-      stage      = "02_classify"
-      memory_mb  = 512
-      timeout_s  = 600  # 10 min (long docs + GPT latency)
-    }
-    "03-embed" = {
-      stage      = "03_embed"
-      memory_mb  = 512
-      timeout_s  = 600
-    }
-    "04-graph" = {
-      stage      = "04_graph"
-      memory_mb  = 256
-      timeout_s  = 180
-    }
-    "05-diff" = {
-      stage      = "05_diff"
-      memory_mb  = 512
-      timeout_s  = 600
-    }
-    "06-timeline" = {
-      stage      = "06_timeline"
-      memory_mb  = 256
-      timeout_s  = 180
-    }
-    "07-persist" = {
-      stage      = "07_persist"
-      memory_mb  = 256
-      timeout_s  = 120
-    }
-  }
-
-  common_env = {
+  pipeline_env = {
     PROJECT_NAME                 = var.project_name
     STAGE                        = var.stage
     DDB_TABLE_NAME               = aws_dynamodb_table.main.name
@@ -79,28 +42,25 @@ locals {
 }
 
 resource "aws_cloudwatch_log_group" "pipeline" {
-  for_each          = local.pipeline_stages
-  name              = "/aws/lambda/${local.prefix}-${each.key}"
+  name              = "/aws/lambda/${local.prefix}-pipeline"
   retention_in_days = var.log_retention_days
 }
 
 resource "aws_lambda_function" "pipeline" {
-  for_each = local.pipeline_stages
-
-  function_name    = "${local.prefix}-${each.key}"
-  description      = "Blue-IQ pipeline stage ${each.value.stage}"
+  function_name    = "${local.prefix}-pipeline"
+  description      = "Blue-IQ document ingestion pipeline — all seven stages"
   role             = aws_iam_role.pipeline_base.arn
   runtime          = "python3.12"
   architectures    = ["arm64"]
   handler          = "handler.handler"
   filename         = data.archive_file.pipeline.output_path
   source_code_hash = data.archive_file.pipeline.output_base64sha256
-  memory_size      = each.value.memory_mb
-  timeout          = each.value.timeout_s
+  memory_size      = 1024
+  timeout          = 600
   layers           = [aws_lambda_layer_version.shared.arn]
 
   environment {
-    variables = merge(local.common_env, { PIPELINE_STAGE = each.value.stage })
+    variables = local.pipeline_env
   }
 
   dead_letter_config {
@@ -266,7 +226,7 @@ resource "aws_lambda_function" "rag" {
   layers           = [aws_lambda_layer_version.shared.arn]
 
   environment {
-    variables = merge(local.common_env, {
+    variables = merge(local.pipeline_env, {
       PIPELINE_STAGE           = "08_rag"
       RAG_MAX_CONTEXT_CLAUSES  = "8"
       RAG_MAX_CLAUSE_CHARS     = "1200"
