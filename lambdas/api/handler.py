@@ -102,6 +102,11 @@ def _route(method: str, path: str, event: dict[str, Any], tenant_id: str) -> dic
     if method == "GET" and m:
         return _get_doc_diff(m.group(1), tenant_id)
 
+    # GET /documents/{docId}/timeline
+    m = re.fullmatch(r"/documents/([^/]+)/timeline/?", path)
+    if method == "GET" and m:
+        return _get_doc_timeline(m.group(1), tenant_id)
+
     m = re.fullmatch(r"/documents/([^/]+)/?", path)
     if m:
         doc_id = m.group(1)
@@ -331,6 +336,29 @@ def _get_doc_diff(doc_id: str, tenant_id: str) -> dict[str, Any]:
     except Exception as exc:
         log.warning("api.diff_read_failed", docId=doc_id, error=str(exc))
         return _err(404, "Diff data not found in storage")
+
+
+def _get_doc_timeline(doc_id: str, tenant_id: str) -> dict[str, Any]:
+    meta = get_doc_meta(doc_id)
+    if not meta or meta.get("tenantId") != tenant_id:
+        return _err(404, "Document not found")
+    versions = query_doc_versions(doc_id)
+    if not versions:
+        return _err(404, "No processed versions found")
+    latest = max(versions, key=lambda v: int(v.get("versionNumber", 0)))
+    key = latest.get("timelineKey")
+    if not key:
+        return _err(404, "Timeline not yet available")
+    processed_bucket = os.environ.get("PROCESSED_BUCKET", "")
+    if not processed_bucket:
+        return _err(500, "Server misconfiguration: PROCESSED_BUCKET not set")
+    try:
+        from shared.s3 import get_json
+        data = get_json(processed_bucket, key)
+        return _ok(data)
+    except Exception as exc:
+        log.warning("api.timeline_read_failed", docId=doc_id, error=str(exc))
+        return _err(404, "Timeline data not found in storage")
 
 
 # ---------------------------------------------------------------------------
