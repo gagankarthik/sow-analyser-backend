@@ -18,11 +18,6 @@ output "opensearch_endpoint" {
   value       = aws_opensearch_domain.main.endpoint
 }
 
-output "openai_secret_arn" {
-  description = "Secrets Manager ARN for the OpenAI API key."
-  value       = aws_secretsmanager_secret.openai.arn
-}
-
 output "pipeline_dlq_url" {
   description = "SQS DLQ URL for failed pipeline executions."
   value       = aws_sqs_queue.pipeline_dlq.url
