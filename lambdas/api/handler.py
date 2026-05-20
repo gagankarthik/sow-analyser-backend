@@ -92,6 +92,16 @@ def _route(method: str, path: str, event: dict[str, Any], tenant_id: str) -> dic
     if method == "DELETE" and m:
         return _delete_version(m.group(1), int(m.group(2)), tenant_id)
 
+    # GET /documents/{docId}/classification
+    m = re.fullmatch(r"/documents/([^/]+)/classification/?", path)
+    if method == "GET" and m:
+        return _get_doc_classification(m.group(1), tenant_id)
+
+    # GET /documents/{docId}/diff
+    m = re.fullmatch(r"/documents/([^/]+)/diff/?", path)
+    if method == "GET" and m:
+        return _get_doc_diff(m.group(1), tenant_id)
+
     m = re.fullmatch(r"/documents/([^/]+)/?", path)
     if m:
         doc_id = m.group(1)
@@ -275,6 +285,52 @@ def _delete_document(doc_id: str, tenant_id: str) -> dict[str, Any]:
     delete_doc_entirely(doc_id)
     log.info("api.document_deleted", docId=doc_id)
     return _ok({"deleted": True, "docId": doc_id})
+
+
+def _get_doc_classification(doc_id: str, tenant_id: str) -> dict[str, Any]:
+    meta = get_doc_meta(doc_id)
+    if not meta or meta.get("tenantId") != tenant_id:
+        return _err(404, "Document not found")
+    versions = query_doc_versions(doc_id)
+    if not versions:
+        return _err(404, "No processed versions found")
+    latest = max(versions, key=lambda v: int(v.get("versionNumber", 0)))
+    key = latest.get("classificationKey")
+    if not key:
+        return _err(404, "Classification not yet available")
+    processed_bucket = os.environ.get("PROCESSED_BUCKET", "")
+    if not processed_bucket:
+        return _err(500, "Server misconfiguration: PROCESSED_BUCKET not set")
+    try:
+        from shared.s3 import get_json
+        data = get_json(processed_bucket, key)
+        return _ok(data)
+    except Exception as exc:
+        log.warning("api.classification_read_failed", docId=doc_id, error=str(exc))
+        return _err(404, "Classification data not found in storage")
+
+
+def _get_doc_diff(doc_id: str, tenant_id: str) -> dict[str, Any]:
+    meta = get_doc_meta(doc_id)
+    if not meta or meta.get("tenantId") != tenant_id:
+        return _err(404, "Document not found")
+    versions = query_doc_versions(doc_id)
+    if not versions:
+        return _err(404, "No processed versions found")
+    latest = max(versions, key=lambda v: int(v.get("versionNumber", 0)))
+    key = latest.get("diffKey")
+    if not key:
+        return _err(404, "Diff not available — this is the first version or no parent was found")
+    processed_bucket = os.environ.get("PROCESSED_BUCKET", "")
+    if not processed_bucket:
+        return _err(500, "Server misconfiguration: PROCESSED_BUCKET not set")
+    try:
+        from shared.s3 import get_json
+        data = get_json(processed_bucket, key)
+        return _ok(data)
+    except Exception as exc:
+        log.warning("api.diff_read_failed", docId=doc_id, error=str(exc))
+        return _err(404, "Diff data not found in storage")
 
 
 # ---------------------------------------------------------------------------

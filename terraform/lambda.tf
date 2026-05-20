@@ -139,6 +139,12 @@ resource "aws_iam_role_policy" "api" {
         Action   = ["s3:PutObject"]
         Resource = "${aws_s3_bucket.raw.arn}/*"
       },
+      {
+        Sid      = "ProcessedBucketRead"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "${aws_s3_bucket.processed.arn}/*"
+      },
     ]
   })
 }
