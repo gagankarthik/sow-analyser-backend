@@ -115,7 +115,12 @@ locals {
         Parameters = {
           TableName = aws_dynamodb_table.main.name
           Key = {
-            PK = { "S.$" = "States.Format('DOC#{}', $.docId)" }
+            # Derive the REAL docId from the raw S3 key
+            # (tenants/<tenantId>/uploads/<docId>/<file>) rather than $.docId.
+            # On a Parse failure $.docId is still the full S3 key, so the old
+            # version updated a non-existent row and the document stayed stuck
+            # on "processing" forever. rawKey is always present in the event.
+            PK = { "S.$" = "States.Format('DOC#{}', States.ArrayGetItem(States.StringSplit($.rawKey, '/'), 3))" }
             SK = { S = "META" }
           }
           UpdateExpression          = "SET #st = :failed, updatedAt = :ts"
