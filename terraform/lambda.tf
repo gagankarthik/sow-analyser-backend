@@ -148,10 +148,29 @@ resource "aws_apigatewayv2_api" "documents" {
   name          = "${local.prefix}-docs-api"
   protocol_type = "HTTP"
   cors_configuration {
-    allow_origins = ["*"]
+    # Locked to known frontend origins (was "*"). Add deployed origins via the
+    # allowed_origins variable. allow_credentials stays false — the API uses
+    # bearer tokens, not cookies.
+    allow_origins = var.allowed_origins
     allow_methods = ["GET", "DELETE", "OPTIONS"]
     allow_headers = ["Content-Type", "Authorization", "x-tenant-id"]
     max_age       = 300
+  }
+}
+
+# Cognito JWT authorizer — validates the ID token's signature (via the pool's
+# JWKS), issuer, and audience (app client id) on every protected route. This is
+# the real enforcement layer: requests without a valid token are rejected at the
+# gateway before the Lambda runs.
+resource "aws_apigatewayv2_authorizer" "cognito" {
+  api_id           = aws_apigatewayv2_api.documents.id
+  authorizer_type  = "JWT"
+  identity_sources = ["$request.header.Authorization"]
+  name             = "${local.prefix}-cognito-jwt"
+
+  jwt_configuration {
+    audience = [var.cognito_client_id]
+    issuer   = "https://cognito-idp.${var.aws_region}.amazonaws.com/${var.cognito_user_pool_id}"
   }
 }
 
@@ -166,6 +185,9 @@ resource "aws_apigatewayv2_route" "get_documents" {
   api_id    = aws_apigatewayv2_api.documents.id
   route_key = "GET /documents"
   target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
 }
 
 # Literal route — must be declared before the {docId} wildcard so API GW
@@ -174,30 +196,49 @@ resource "aws_apigatewayv2_route" "get_upload_url" {
   api_id    = aws_apigatewayv2_api.documents.id
   route_key = "GET /documents/upload-url"
   target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
 }
 
 resource "aws_apigatewayv2_route" "get_document" {
   api_id    = aws_apigatewayv2_api.documents.id
   route_key = "GET /documents/{docId}"
   target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
 }
 
 resource "aws_apigatewayv2_route" "delete_document" {
   api_id    = aws_apigatewayv2_api.documents.id
   route_key = "DELETE /documents/{docId}"
   target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
 }
 
 resource "aws_apigatewayv2_route" "delete_version" {
   api_id    = aws_apigatewayv2_api.documents.id
   route_key = "DELETE /documents/{docId}/versions/{version}"
   target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
 }
 
 resource "aws_apigatewayv2_stage" "default" {
   api_id      = aws_apigatewayv2_api.documents.id
   name        = "$default"
   auto_deploy = true
+
+  # Baseline throttling so a single client can't flood the API (defense in
+  # depth alongside the JWT authorizer).
+  default_route_settings {
+    throttling_rate_limit  = 50
+    throttling_burst_limit = 100
+  }
 
   access_log_settings {
     destination_arn = aws_cloudwatch_log_group.api.arn

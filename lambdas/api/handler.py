@@ -40,11 +40,11 @@ from shared.s3 import object_exists
 log = get_logger("blue-iq.api")
 tracer = Tracer(service="blue-iq.api")
 
-_CORS = {
-    "Access-Control-Allow-Origin":  "*",
-    "Access-Control-Allow-Headers": "Content-Type,Authorization,x-tenant-id",
-    "Access-Control-Allow-Methods": "GET,DELETE,OPTIONS",
-}
+# CORS is owned by the HTTP API Gateway (cors_configuration in lambda.tf), which
+# is locked to var.allowed_origins. The integration must NOT also emit CORS
+# headers, or the browser sees a conflicting/duplicate Access-Control-Allow-Origin
+# (the old "*" here defeated the gateway lockdown). Left empty intentionally.
+_CORS: dict[str, str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -120,9 +120,18 @@ _VALID_DOC_TYPES = {"SOW", "MSA", "AMENDMENT", "NDA", "OTHER"}
 def _get_upload_url(event: dict, tenant_id: str) -> dict[str, Any]:
     """Return a presigned S3 PUT URL so the client can upload a document directly."""
     qs = event.get("queryStringParameters") or {}
-    filename = qs.get("filename", "").strip()
-    if not filename:
+    raw_filename = qs.get("filename", "").strip()
+    if not raw_filename:
         return _err(400, "Missing required query parameter: filename")
+
+    # Sanitize: collapse any path components to a basename and allow only a
+    # safe character set, so a crafted filename (e.g. "../../other/x") cannot
+    # escape the per-tenant key prefix and write to an arbitrary S3 location.
+    filename = os.path.basename(raw_filename.replace("\\", "/"))
+    if filename in ("", ".", "..") or not re.fullmatch(r"[A-Za-z0-9._ -]{1,200}", filename):
+        return _err(400, "Invalid filename")
+    if not re.search(r"\.(pdf|docx|doc|txt)$", filename, re.IGNORECASE):
+        return _err(400, "Unsupported file type. Allowed: pdf, docx, doc, txt")
 
     doc_type = qs.get("docType", "OTHER").strip().upper()
     if doc_type not in _VALID_DOC_TYPES:
@@ -136,9 +145,14 @@ def _get_upload_url(event: dict, tenant_id: str) -> dict[str, Any]:
     doc_id = str(uuid.uuid4())
     key = f"tenants/{tenant_id}/uploads/{doc_id}/{filename}"
 
+    # NOTE: ContentType is intentionally NOT signed. If it were, the browser PUT
+    # would have to send the exact same Content-Type or S3 returns
+    # SignatureDoesNotMatch. By omitting it, the client may send the real file
+    # MIME type (which S3 still records on the object) without breaking the
+    # signature. SignedHeaders is therefore just "host".
     upload_url = s3_client().generate_presigned_url(
         "put_object",
-        Params={"Bucket": raw_bucket, "Key": key, "ContentType": "application/octet-stream"},
+        Params={"Bucket": raw_bucket, "Key": key},
         ExpiresIn=300,
     )
 
@@ -212,10 +226,16 @@ def _delete_document(doc_id: str, tenant_id: str) -> dict[str, Any]:
 
 def _tenant(event: dict) -> str:
     ctx = event.get("requestContext", {})
-    # Cognito authorizer injects tenantId into claims / resolver context.
+    # HTTP API (payload format 2.0) puts verified JWT claims under
+    # requestContext.authorizer.jwt.claims — NOT .authorizer.claims (that's the
+    # REST/v1 shape). Read the verified claim FIRST so tenant isolation can't be
+    # spoofed via the x-tenant-id header. The header remains a dev/local
+    # fallback only (for calls made without a token).
+    authorizer = ctx.get("authorizer", {}) or {}
+    jwt_claims = authorizer.get("jwt", {}).get("claims", {}) or {}
     tenant = (
-        ctx.get("authorizer", {}).get("claims", {}).get("custom:tenantId")
-        or ctx.get("authorizer", {}).get("tenantId")
+        jwt_claims.get("custom:tenantId")
+        or authorizer.get("claims", {}).get("custom:tenantId")  # REST/v1 compat
         or (event.get("headers") or {}).get("x-tenant-id")
         or "default"
     )

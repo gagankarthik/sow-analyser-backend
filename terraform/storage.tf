@@ -57,6 +57,22 @@ resource "aws_s3_bucket_notification" "raw" {
   eventbridge = true
 }
 
+# CORS for the raw bucket. The browser uploads files DIRECTLY to S3 with the
+# presigned PUT URL from GET /documents/upload-url, so S3 itself must allow the
+# frontend origin and the preflight (OPTIONS) — otherwise the upload fails with
+# "No 'Access-Control-Allow-Origin' header". Origins are shared with the API
+# CORS via var.allowed_origins.
+resource "aws_s3_bucket_cors_configuration" "raw" {
+  bucket = aws_s3_bucket.raw.id
+  cors_rule {
+    allowed_origins = var.allowed_origins
+    allowed_methods = ["PUT", "GET", "HEAD"]
+    allowed_headers = ["*"]
+    expose_headers  = ["ETag"]
+    max_age_seconds = 3000
+  }
+}
+
 
 # ─── DynamoDB ──────────────────────────────────────────────────────────────────
 #

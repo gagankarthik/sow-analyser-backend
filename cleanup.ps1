@@ -10,7 +10,7 @@ $region  = $env:AWS_REGION
 $account = (aws sts get-caller-identity --query Account --output text)
 
 if (-not $region)  { Write-Error "AWS_REGION not set"; exit 1 }
-if (-not $account) { Write-Error "Cannot resolve AWS account ID — check credentials"; exit 1 }
+if (-not $account) { Write-Error "Cannot resolve AWS account ID - check credentials"; exit 1 }
 
 Write-Host "Cleaning up prefix=$prefix  region=$region  account=$account"
 Write-Host ""

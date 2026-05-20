@@ -59,3 +59,27 @@ variable "layer_zip_path" {
   type        = string
   default     = "../build/shared-layer.zip"
 }
+
+# ─── Authentication (Cognito JWT authorizer on the documents API) ──────────────
+# These IDs are NOT secrets — they are public client config. They reference the
+# existing Cognito User Pool created outside Terraform. The frontend signs in
+# against the same pool and sends the Cognito ID token as `Authorization:
+# Bearer <token>`; the authorizer validates the signature, issuer, and audience.
+
+variable "cognito_user_pool_id" {
+  description = "Existing Cognito User Pool ID used to authorize the documents API."
+  type        = string
+  default     = "us-east-2_97cPE7VKm"
+}
+
+variable "cognito_client_id" {
+  description = "Cognito App Client ID — the JWT audience for ID-token validation."
+  type        = string
+  default     = "5c3l92c8v1d3ucfn0bm37gsquq"
+}
+
+variable "allowed_origins" {
+  description = "Browser origins permitted by CORS. Add each deployed frontend origin."
+  type        = list(string)
+  default     = ["http://localhost:3000"]
+}
