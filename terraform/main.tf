@@ -16,12 +16,9 @@ terraform {
     }
   }
 
-  # Uncomment and configure for remote state.
-  # backend "s3" {
-  #   bucket = "your-terraform-state-bucket"
-  #   key    = "blue-iq/terraform.tfstate"
-  #   region = "us-east-1"
-  # }
+  # State stored in S3 — bucket is created by the CI workflow before terraform init.
+  # Config values are passed via -backend-config flags (see deploy.yml).
+  backend "s3" {}
 }
 
 provider "aws" {

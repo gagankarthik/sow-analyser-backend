@@ -22,10 +22,9 @@ jobs:
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.stage || 'dev' }}
 
-    # Job-level env so all steps inherit these. Secrets ARE accessible here.
     env:
-      AWS_REGION:   ${{ secrets.AWS_REGION }}
-      STAGE:        ${{ github.event.inputs.stage || 'dev' }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      STAGE:      ${{ github.event.inputs.stage || 'dev' }}
 
     steps:
       # ── Checkout ────────────────────────────────────────────────────────────
@@ -51,6 +50,31 @@ jobs:
           chmod +x build.sh
           ./build.sh
 
+      # ── Bootstrap Terraform state bucket (idempotent) ───────────────────────
+      # Creates an S3 bucket to store tfstate so it persists across CI runs.
+      # Without this every run starts with empty state and conflicts on existing
+      # resources.
+      - name: Bootstrap Terraform state bucket
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          STATE_BUCKET="blue-iq-sow-tfstate-${ACCOUNT_ID}"
+          echo "STATE_BUCKET=${STATE_BUCKET}" >> $GITHUB_ENV
+
+          # create-bucket fails silently if it already exists (|| true)
+          aws s3api create-bucket \
+            --bucket "${STATE_BUCKET}" \
+            --region "${AWS_REGION}" \
+            --create-bucket-configuration LocationConstraint="${AWS_REGION}" 2>/dev/null || true
+
+          aws s3api put-bucket-versioning \
+            --bucket "${STATE_BUCKET}" \
+            --versioning-configuration Status=Enabled
+
+          aws s3api put-public-access-block \
+            --bucket "${STATE_BUCKET}" \
+            --public-access-block-configuration \
+              BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
       # ── Terraform ───────────────────────────────────────────────────────────
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
@@ -59,7 +83,11 @@ jobs:
 
       - name: Terraform init
         working-directory: terraform
-        run: terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="key=${STAGE}/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}"
 
       - name: Terraform validate
         working-directory: terraform
