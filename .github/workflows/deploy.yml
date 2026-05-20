@@ -13,8 +13,7 @@ on:
         options: [dev, staging, prod]
 
 env:
-  AWS_REGION: us-east-2
-  TF_VERSION: "1.9.0"
+  TF_VERSION:     "1.9.0"
   PYTHON_VERSION: "3.12"
 
 jobs:
@@ -22,6 +21,11 @@ jobs:
     name: Build & Deploy (${{ github.event.inputs.stage || 'dev' }})
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.stage || 'dev' }}
+
+    # Job-level env so all steps inherit these. Secrets ARE accessible here.
+    env:
+      AWS_REGION:   ${{ secrets.AWS_REGION }}
+      STAGE:        ${{ github.event.inputs.stage || 'dev' }}
 
     steps:
       # ── Checkout ────────────────────────────────────────────────────────────
@@ -34,7 +38,7 @@ jobs:
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ env.AWS_REGION }}
+          aws-region:            ${{ secrets.AWS_REGION }}
 
       # ── Python + build shared Lambda layer ──────────────────────────────────
       - name: Set up Python ${{ env.PYTHON_VERSION }}
@@ -65,21 +69,29 @@ jobs:
         working-directory: terraform
         env:
           TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          TF_VAR_chat_model:     ${{ secrets.CHAT_MODEL }}
+          TF_VAR_aws_region:     ${{ secrets.AWS_REGION }}
           TF_VAR_stage:          ${{ github.event.inputs.stage || 'dev' }}
           TF_VAR_project_name:   blue-iq-sow
-          TF_VAR_aws_region:     ${{ env.AWS_REGION }}
         run: terraform plan -out=tfplan
 
       - name: Terraform apply
         working-directory: terraform
         env:
           TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          TF_VAR_chat_model:     ${{ secrets.CHAT_MODEL }}
+          TF_VAR_aws_region:     ${{ secrets.AWS_REGION }}
           TF_VAR_stage:          ${{ github.event.inputs.stage || 'dev' }}
           TF_VAR_project_name:   blue-iq-sow
-          TF_VAR_aws_region:     ${{ env.AWS_REGION }}
         run: terraform apply -auto-approve tfplan
 
       - name: Print API URL
         working-directory: terraform
+        env:
+          TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          TF_VAR_chat_model:     ${{ secrets.CHAT_MODEL }}
+          TF_VAR_aws_region:     ${{ secrets.AWS_REGION }}
+          TF_VAR_stage:          ${{ github.event.inputs.stage || 'dev' }}
+          TF_VAR_project_name:   blue-iq-sow
         run: |
           echo "Documents API: $(terraform output -raw documents_api_url)"

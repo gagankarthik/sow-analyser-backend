@@ -6,7 +6,6 @@ from typing import Any
 from shared.dynamodb import get_doc_meta, query_doc_changes, query_doc_children, query_doc_parents
 from shared.logger import get_logger
 from shared.s3 import get_json, processed_key, put_json
-from shared.text import normalize
 
 log = get_logger("blue-iq.timeline")
 

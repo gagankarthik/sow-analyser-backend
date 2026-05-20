@@ -26,11 +26,15 @@ TEXTRACT_MAX_WAIT_S      = 240
 
 
 def run(event: dict) -> dict:
-    doc_id           = event["docId"]
-    tenant_id        = event["tenantId"]
     raw_bucket       = event["rawBucket"]
     raw_key          = event["rawKey"]
     processed_bucket = event["processedBucket"]
+
+    # EventBridge passes the raw S3 key as docId; extract the real IDs from the key path.
+    # Expected format: tenants/<tenantId>/uploads/<docId>/<filename>
+    doc_id, tenant_id = _extract_ids(raw_key, event)
+    event["docId"]    = doc_id
+    event["tenantId"] = tenant_id
 
     log.append_keys(docId=doc_id, tenantId=tenant_id)
     log.info("parse.start", rawKey=raw_key)
@@ -168,6 +172,20 @@ def _textract_from_s3(bucket: str, key: str) -> dict[str, Any]:
         for p, lines in sorted(page_lines.items())
     ]
     return {"text": "\n\n".join(p["text"] for p in page_list), "pages": page_list}
+
+
+# ---------------------------------------------------------------------------
+# ID extraction from S3 key path
+# ---------------------------------------------------------------------------
+
+
+def _extract_ids(raw_key: str, event: dict) -> tuple[str, str]:
+    """Parse tenantId and docId from key: tenants/<tenantId>/uploads/<docId>/<file>."""
+    parts = raw_key.split("/")
+    if len(parts) >= 4 and parts[0] == "tenants" and parts[2] == "uploads":
+        return parts[3], parts[1]
+    # Fallback: use whatever is in the event (may be the raw key itself).
+    return event.get("docId", raw_key), event.get("tenantId", "default")
 
 
 # ---------------------------------------------------------------------------
