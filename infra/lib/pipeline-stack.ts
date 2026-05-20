@@ -426,13 +426,16 @@ export class PipelineStack extends Stack {
     rule.addTarget(
       new SfnStateMachine(this.stateMachine, {
         input: RuleTargetInput.fromObject({
-          bucket: EventField.fromPath("$.detail.bucket.name"),
-          key: EventField.fromPath("$.detail.object.key"),
-          // docId / tenantId are filled in by the parse Lambda after it cracks
-          // the key. We seed them as null here so the failure path doesn't
-          // crash on missing fields (DynamoUpdateItem treats null as the
-          // literal string "null" if it ever reaches that state without a
-          // docId; the catch handler runs *after* parse, so this is safe).
+          // Use the field names the parse Lambda reads: rawBucket / rawKey.
+          // The parse Lambda also accepts the legacy "bucket"/"key" aliases
+          // but using the canonical names here avoids any ambiguity.
+          rawBucket: EventField.fromPath("$.detail.bucket.name"),
+          rawKey: EventField.fromPath("$.detail.object.key"),
+          // docId and tenantId are extracted from the S3 key by the parse
+          // Lambda (key shape: tenants/<tenantId>/uploads/<docId>/<file>).
+          // We pass the full key as a seed so the MarkFailed catch state can
+          // still reference $.docId without crashing; the parse Lambda
+          // overwrites these with the real values on first invocation.
           docId: EventField.fromPath("$.detail.object.key"),
           tenantId: "unknown",
         }),

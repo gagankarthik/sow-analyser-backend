@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 from shared.aws import textract_client
+from shared.dynamodb import update_status
 from shared.logger import get_logger
 from shared.s3 import get_object, processed_key, put_json
 from shared.schema import ExtractionMethod, now_iso
@@ -38,6 +39,10 @@ def run(event: dict) -> dict:
 
     log.append_keys(docId=doc_id, tenantId=tenant_id)
     log.info("parse.start", rawKey=raw_key)
+    try:
+        update_status(doc_id, "PARSING")
+    except Exception:
+        pass  # DDB may not have the row yet for very early failures
 
     blob     = get_object(raw_bucket, raw_key)
     checksum = sha256_hex(blob)

@@ -6,6 +6,8 @@ updated pipeline event.
 """
 from __future__ import annotations
 
+import os
+import uuid as _uuid
 from typing import Any
 
 from aws_lambda_powertools import Tracer
@@ -52,11 +54,46 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001
 
 
 def _run(event: dict) -> dict:
-    doc_id: str = event["docId"]
-    tenant_id: str = event["tenantId"]
-    raw_bucket: str = event["rawBucket"]
-    raw_key: str = event["rawKey"]
-    processed_bucket: str = event["processedBucket"]
+    # Accept both naming conventions:
+    #   - EventBridge S3 ObjectCreated sends "bucket" / "key"
+    #   - Direct / test invocations may use "rawBucket" / "rawKey"
+    raw_bucket: str = event.get("rawBucket") or event.get("bucket") or ""
+    raw_key: str = event.get("rawKey") or event.get("key") or ""
+    # processedBucket is never in the EventBridge payload — read from env.
+    processed_bucket: str = (
+        event.get("processedBucket") or os.environ.get("PROCESSED_BUCKET", "")
+    )
+
+    if not raw_bucket:
+        raise ValueError("parse: rawBucket/bucket missing from event and environment")
+    if not raw_key:
+        raise ValueError("parse: rawKey/key missing from event and environment")
+    if not processed_bucket:
+        raise ValueError("parse: PROCESSED_BUCKET env var not set")
+
+    # Extract tenantId and docId from the S3 key.
+    # Upload keys have the form:  tenants/<tenantId>/uploads/<docId>/<filename>
+    parts = raw_key.split("/")
+    if len(parts) >= 4 and parts[0] == "tenants" and parts[2] == "uploads":
+        tenant_id = parts[1]
+        doc_id = parts[3]
+    else:
+        # Fallback for direct invocations or unexpected key shapes.
+        tenant_id = event.get("tenantId") or "default"
+        doc_id = event.get("docId") or str(_uuid.uuid4())
+        log.warning(
+            "parse.key_parse_fallback",
+            rawKey=raw_key,
+            tenantId=tenant_id,
+            docId=doc_id,
+        )
+
+    # Normalise event so every downstream stage has consistent field names.
+    event["docId"] = doc_id
+    event["tenantId"] = tenant_id
+    event["rawBucket"] = raw_bucket
+    event["rawKey"] = raw_key
+    event["processedBucket"] = processed_bucket
 
     log.append_keys(docId=doc_id, tenantId=tenant_id)
     log.info("parse.start", rawKey=raw_key)

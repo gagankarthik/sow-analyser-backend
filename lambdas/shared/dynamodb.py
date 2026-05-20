@@ -86,6 +86,27 @@ def put_doc_meta(doc: dict[str, Any]) -> None:
     _put(item)
 
 
+def update_doc_fields(doc_id: str, fields: dict[str, Any]) -> None:
+    """Update arbitrary fields on a document META record (title, lifecycle, docType, etc.)."""
+    expr_parts = ["updatedAt = :ts"]
+    names: dict[str, str] = {}
+    values: dict[str, Any] = {":ts": now_iso()}
+    for i, (k, v) in enumerate(fields.items()):
+        nk = f"#k{i}"
+        vk = f":v{i}"
+        names[nk] = k
+        values[vk] = _to_ddb(v)
+        expr_parts.append(f"{nk} = {vk}")
+    kwargs: dict[str, Any] = {
+        "Key": {"PK": f"DOC#{doc_id}", "SK": "META"},
+        "UpdateExpression": "SET " + ", ".join(expr_parts),
+        "ExpressionAttributeValues": values,
+    }
+    if names:
+        kwargs["ExpressionAttributeNames"] = names
+    _table().update_item(**kwargs)
+
+
 def update_status(doc_id: str, status: str, extra: dict[str, Any] | None = None) -> None:
     """Atomic status update."""
     extra = extra or {}

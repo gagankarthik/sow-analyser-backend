@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from shared.config import settings
+from shared.dynamodb import update_status
 from shared.logger import get_logger
 from shared.openai_client import chat_json
 from shared.s3 import processed_key, put_json
@@ -100,6 +101,7 @@ def run(event: dict) -> dict:
         raise ValueError("classify: pipeline event missing parsed.text")
 
     log.append_keys(docId=doc_id, tenantId=tenant_id)
+    update_status(doc_id, "CLASSIFYING")
 
     text    = truncate_to_tokens(parsed["text"], max_tokens=settings.classify_max_input_tokens, model=settings.chat_model)
     headers = detect_clause_headers(parsed["text"])

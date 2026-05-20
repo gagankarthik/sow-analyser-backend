@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from shared.dynamodb import get_doc_meta, query_doc_changes, query_doc_children, query_doc_parents
+from shared.dynamodb import get_doc_meta, query_doc_changes, query_doc_children, query_doc_parents, update_status
 from shared.logger import get_logger
 from shared.s3 import get_json, processed_key, put_json
 
@@ -19,6 +19,7 @@ def run(event: dict) -> dict:
     parent_id        = (event.get("lineage") or {}).get("parentDocId")
 
     log.append_keys(docId=doc_id, tenantId=tenant_id)
+    update_status(doc_id, "TIMELINING")
 
     root_id, current_is_root = _find_root(doc_id=doc_id, doc_type=doc_type, parent_id=parent_id)
 

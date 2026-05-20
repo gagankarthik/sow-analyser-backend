@@ -43,10 +43,42 @@ log = get_logger("blue-iq.openai")
 # ---------------------------------------------------------------------------
 
 
+@lru_cache(maxsize=1)
 def _fetch_api_key() -> str:
+    """Return the OpenAI API key.
+
+    Resolution order:
+      1. OPENAI_API_KEY env var (direct inject, local dev, CI).
+      2. Secrets Manager secret at OPENAI_SECRET_ARN (Lambda production path —
+         the CDK never puts the raw key in env; it only passes the ARN).
+    """
     key = settings.openai_api_key
+    if key:
+        return key
+
+    import os
+    secret_arn = os.environ.get("OPENAI_SECRET_ARN", "")
+    if not secret_arn:
+        raise RuntimeError(
+            "OpenAI API key not found: set OPENAI_API_KEY or OPENAI_SECRET_ARN"
+        )
+
+    try:
+        from .aws import secrets_client
+        resp = secrets_client().get_secret_value(SecretId=secret_arn)
+        key = resp.get("SecretString", "")
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to fetch OpenAI key from Secrets Manager ({secret_arn}): {exc}"
+        ) from exc
+
     if not key:
-        raise RuntimeError("OPENAI_API_KEY env var is not set")
+        raise RuntimeError(
+            "OpenAI secret in Secrets Manager is empty — "
+            "set the secret value in the AWS console or via CLI: "
+            f"aws secretsmanager put-secret-value --secret-id {secret_arn} "
+            "--secret-string 'sk-proj-...'"
+        )
     return key
 
 

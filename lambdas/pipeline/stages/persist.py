@@ -1,7 +1,7 @@
 """Stage 07 — Persist: write DynamoDB records and finalize pipeline state."""
 from __future__ import annotations
 
-from shared.dynamodb import get_doc_meta, put_change, put_doc_meta, put_version, query_doc_versions
+from shared.dynamodb import get_doc_meta, put_change, put_doc_meta, put_version, query_doc_versions, update_status
 from shared.logger import get_logger
 from shared.s3 import processed_key
 from shared.schema import ProcessingStatus, now_iso
@@ -16,6 +16,7 @@ def run(event: dict) -> dict:
     processed_bucket = event.get("processedBucket", "")
 
     log.append_keys(docId=doc_id, tenantId=tenant_id)
+    update_status(doc_id, "PERSISTING")
 
     classification = event.get("classification") or {}
     parsed         = event.get("parsed") or {}

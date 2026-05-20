@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from shared.config import settings
-from shared.dynamodb import get_doc_meta, put_lineage
+from shared.dynamodb import get_doc_meta, put_lineage, update_status
 from shared.logger import get_logger
 from shared.openai_client import embed_texts
 from shared.opensearch import bm25_search, hybrid_search
@@ -24,6 +24,7 @@ def run(event: dict) -> dict:
     doc_type       = classification.get("docType", "OTHER")
 
     log.append_keys(docId=doc_id, tenantId=tenant_id)
+    update_status(doc_id, "GRAPHING")
 
     lineage: dict[str, Any] = {"parentDocId": None, "matchConfidence": 0.0, "matchReason": ""}
 

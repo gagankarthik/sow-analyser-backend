@@ -5,6 +5,7 @@ Routes
 GET    /documents                         → list all documents for tenant
 GET    /documents/upload-url              → generate a presigned S3 PUT URL
 GET    /documents/{docId}                 → get document + all versions
+PATCH  /documents/{docId}                 → update title / lifecycle / docType
 DELETE /documents/{docId}                 → delete all document data
 DELETE /documents/{docId}/versions/{n}   → delete version n, rollback to n-1
 
@@ -31,9 +32,9 @@ from shared.dynamodb import (
     list_tenant_docs,
     put_doc_meta,
     query_doc_versions,
+    update_doc_fields,
 )
 from shared.logger import get_logger
-from shared.s3 import object_exists
 
 # The API Lambda role needs s3:PutObject on the raw bucket to sign presigned
 # PUT URLs on behalf of callers.  See aws_iam_role_policy.api in lambda.tf.
@@ -91,6 +92,11 @@ def _route(method: str, path: str, event: dict, tenant_id: str) -> dict[str, Any
     m = re.fullmatch(r"/documents/([^/]+)/?", path)
     if method == "GET" and m:
         return _get_document(m.group(1), tenant_id)
+
+    # PATCH /documents/{docId}
+    m = re.fullmatch(r"/documents/([^/]+)/?", path)
+    if method == "PATCH" and m:
+        return _update_document(m.group(1), tenant_id, event)
 
     # DELETE /documents/{docId}/versions/{n}
     m = re.fullmatch(r"/documents/([^/]+)/versions/(\d+)/?", path)
@@ -209,6 +215,55 @@ def _get_document(doc_id: str, tenant_id: str) -> dict[str, Any]:
         key=lambda v: v["versionNumber"],
     )
     return _ok({"document": _clean(meta), "versions": versions})
+
+
+_VALID_LIFECYCLES = {"draft", "review", "negotiation", "approval", "signed", "active", "renewal", "expired"}
+
+
+def _update_document(doc_id: str, tenant_id: str, event: dict) -> dict[str, Any]:
+    meta = get_doc_meta(doc_id)
+    if not meta or meta.get("tenantId") != tenant_id:
+        return _err(404, "Document not found")
+
+    raw_body = event.get("body") or ""
+    if not raw_body:
+        return _err(400, "Request body is required")
+    try:
+        body = json.loads(raw_body)
+    except json.JSONDecodeError:
+        return _err(400, "Invalid JSON body")
+
+    if not isinstance(body, dict):
+        return _err(400, "Body must be a JSON object")
+
+    allowed = {"title", "lifecycle", "docType"}
+    unknown = set(body.keys()) - allowed
+    if unknown:
+        return _err(400, f"Unknown field(s): {', '.join(sorted(unknown))}")
+
+    if not body:
+        return _err(400, "No fields to update")
+
+    if "lifecycle" in body:
+        if body["lifecycle"] not in _VALID_LIFECYCLES:
+            return _err(400, f"Invalid lifecycle. Must be one of: {', '.join(sorted(_VALID_LIFECYCLES))}")
+
+    if "docType" in body:
+        if body["docType"] not in _VALID_DOC_TYPES:
+            return _err(400, f"Invalid docType. Must be one of: {', '.join(sorted(_VALID_DOC_TYPES))}")
+
+    if "title" in body:
+        title = str(body["title"]).strip()
+        if not title:
+            return _err(400, "title cannot be empty")
+        if len(title) > 500:
+            return _err(400, "title is too long (max 500 characters)")
+        body["title"] = title
+
+    update_doc_fields(doc_id, body)
+    updated = get_doc_meta(doc_id)
+    log.info("api.document_updated", docId=doc_id, fields=list(body.keys()))
+    return _ok({"document": _clean(updated)})
 
 
 def _delete_version(doc_id: str, version_number: int, tenant_id: str) -> dict[str, Any]:

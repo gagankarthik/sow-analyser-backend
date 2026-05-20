@@ -5,7 +5,7 @@ import uuid
 from typing import Any
 
 from shared.config import settings
-from shared.dynamodb import get_doc_meta, query_doc_versions
+from shared.dynamodb import get_doc_meta, query_doc_versions, update_status
 from shared.logger import get_logger
 from shared.openai_client import chat_json
 from shared.s3 import get_json, processed_key, put_json
@@ -46,6 +46,7 @@ def run(event: dict) -> dict:
     parent_id        = lineage.get("parentDocId")
 
     log.append_keys(docId=doc_id, tenantId=tenant_id)
+    update_status(doc_id, "DIFFING")
 
     if not parent_id:
         log.info("diff.skipped", reason="no parent")

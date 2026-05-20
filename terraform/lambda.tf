@@ -152,7 +152,7 @@ resource "aws_apigatewayv2_api" "documents" {
     # allowed_origins variable. allow_credentials stays false — the API uses
     # bearer tokens, not cookies.
     allow_origins = var.allowed_origins
-    allow_methods = ["GET", "DELETE", "OPTIONS"]
+    allow_methods = ["GET", "DELETE", "PATCH", "OPTIONS"]
     allow_headers = ["Content-Type", "Authorization", "x-tenant-id"]
     max_age       = 300
   }
@@ -204,6 +204,15 @@ resource "aws_apigatewayv2_route" "get_upload_url" {
 resource "aws_apigatewayv2_route" "get_document" {
   api_id    = aws_apigatewayv2_api.documents.id
   route_key = "GET /documents/{docId}"
+  target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
+}
+
+resource "aws_apigatewayv2_route" "patch_document" {
+  api_id    = aws_apigatewayv2_api.documents.id
+  route_key = "PATCH /documents/{docId}"
   target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
 
   authorization_type = "JWT"
