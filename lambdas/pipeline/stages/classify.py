@@ -1,7 +1,16 @@
-"""Stage 02 — Classify: extract structured contract metadata via OpenAI.
+"""Stage 02 — Classify: extract structured contract intelligence via OpenAI.
 
-Outputs a Classification object (docType, title, parties, effectiveDate,
-lifecycle, clauses) and writes it to S3 as classification.json.
+This stage does the heavy lifting of *understanding* the document. It returns a
+Classification object containing:
+  - document metadata (docType, title, parties, effectiveDate, lifecycle)
+  - an executive summary of the whole contract
+  - keyFindings — the important things a reviewer must know (risks, unusual
+    terms, key dates, financial exposure)
+  - clauses — each with verbatim body, a category, an LLM-assessed risk level,
+    and a plain-English one-line summary
+
+The result is written to S3 as classification.json and is the source of truth
+for the SOW analyzer, overview, and portfolio dashboard.
 """
 from __future__ import annotations
 
@@ -28,10 +37,16 @@ _CLAUSE_CATEGORIES = [
     "Other",
 ]
 
+_RISK_LEVELS = ["low", "medium", "high", "critical"]
+_FINDING_SEVERITY = ["info", "low", "medium", "high", "critical"]
+
 _SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["docType", "title", "parties", "effectiveDate", "lifecycle", "clauses"],
+    "required": [
+        "docType", "title", "parties", "effectiveDate", "lifecycle",
+        "summary", "keyFindings", "clauses",
+    ],
     "properties": {
         "docType":       {"type": "string", "enum": ["SOW", "MSA", "AMENDMENT", "NDA", "OTHER"]},
         "title":         {"type": "string"},
@@ -42,17 +57,33 @@ _SCHEMA: dict[str, Any] = {
             "enum": ["draft", "review", "negotiation", "approval",
                      "signed", "active", "renewal", "expired"],
         },
+        "summary": {"type": "string"},
+        "keyFindings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["label", "detail", "severity"],
+                "properties": {
+                    "label":    {"type": "string"},
+                    "detail":   {"type": "string"},
+                    "severity": {"type": "string", "enum": _FINDING_SEVERITY},
+                },
+            },
+        },
         "clauses": {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["number", "title", "body", "category"],
+                "required": ["number", "title", "body", "category", "riskLevel", "summary"],
                 "properties": {
-                    "number":   {"type": "string"},
-                    "title":    {"type": "string"},
-                    "body":     {"type": "string"},
-                    "category": {"type": "string", "enum": _CLAUSE_CATEGORIES},
+                    "number":    {"type": "string"},
+                    "title":     {"type": "string"},
+                    "body":      {"type": "string"},
+                    "category":  {"type": "string", "enum": _CLAUSE_CATEGORIES},
+                    "riskLevel": {"type": "string", "enum": _RISK_LEVELS},
+                    "summary":   {"type": "string"},
                 },
             },
         },
@@ -60,28 +91,46 @@ _SCHEMA: dict[str, Any] = {
 }
 
 _SYSTEM = """\
-You are a senior contracts analyst. You classify legal documents (SOWs, MSAs,
-Amendments, NDAs) and extract their structured contents.
+You are a senior contracts analyst. You read legal documents (SOWs, MSAs,
+Amendments, NDAs) and extract a complete, structured, decision-ready analysis.
 
-Rules:
-- Return ONLY JSON conforming to the provided schema. No prose.
+Return ONLY JSON conforming to the provided schema. No prose outside the JSON.
+
+DOCUMENT-LEVEL FIELDS
 - docType: one of SOW, MSA, AMENDMENT, NDA, OTHER.
-- lifecycle: one of draft, review, negotiation, approval, signed, active, renewal, expired.
-  If unclear, use "draft".
+- lifecycle: one of draft, review, negotiation, approval, signed, active,
+  renewal, expired. If unclear, use "draft".
 - effectiveDate: ISO 8601 (YYYY-MM-DD) or null.
-- parties: legal entity names only (not signatories).
-- Split the document into numbered clauses. Each clause needs a number (e.g. "1",
-  "2.1", "§7.4"), short title, verbatim body, and category.
-- If no clause number is found, fabricate one in document order.
-- Body must be verbatim clause text — do not paraphrase.
+- parties: legal entity names only (not individual signatories).
+- summary: 2-4 sentences. What is this contract, between whom, for what scope,
+  and what stands out commercially. Write for a busy executive.
+- keyFindings: the 3-8 things a reviewer MUST know before signing. Each finding
+  has a short label, a one-sentence detail, and a severity (info/low/medium/
+  high/critical). Surface unusual terms, one-sided liability, missing caps,
+  auto-renewals, aggressive termination rights, payment risk, IP assignment,
+  data/privacy obligations, and notable dates or dollar amounts.
+
+CLAUSE EXTRACTION
+- Split the document into numbered clauses. Each needs a number (e.g. "1",
+  "2.1", "§7.4"), a short title, the verbatim body, and a category.
+- If no clause number exists, fabricate one in document order.
+- body MUST be verbatim clause text — never paraphrase the body.
+- category: choose the single best fit from the allowed list.
+- riskLevel: assess the COMMERCIAL/LEGAL risk this specific clause poses to the
+  receiving party, based on its ACTUAL wording — not just its category. A
+  standard mutual liability cap is low/medium; an uncapped indemnity is critical.
+  Use: low (standard, balanced), medium (worth noting), high (one-sided or
+  costly), critical (serious exposure or a dealbreaker).
+- summary: one plain-English sentence explaining what the clause does and why it
+  matters. No legalese.
 """
 
 
 def _user_prompt(text: str, hints: list[str]) -> str:
     hints_str = "\n".join(f"- {h}" for h in hints) if hints else "(none)"
     return (
-        f"Classify and extract this contract document.\n\n"
-        f"Detected headers/party hints:\n{hints_str}\n\n"
+        f"Analyze and extract this contract document.\n\n"
+        f"Detected headers / party hints:\n{hints_str}\n\n"
         f"Document text:\n<<<DOC\n{text}\nDOC>>>"
     )
 
@@ -123,12 +172,23 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
     result.setdefault("clauses", [])
     result.setdefault("effectiveDate", None)
     result.setdefault("lifecycle", "draft")
+    result.setdefault("summary", "")
+    result.setdefault("keyFindings", [])
+
+    # Defensive per-clause defaults — keep older consumers working even if the
+    # model omits a field on an edge case.
+    for c in result["clauses"]:
+        c.setdefault("riskLevel", "low")
+        c.setdefault("summary", "")
 
     result["structuralHash"] = structural_hash(result["clauses"])
 
     out_key = processed_key(tenant_id, doc_id, "classification.json")
     put_json(processed_bucket, out_key, result)
-    log.info("classify.done", docType=result["docType"], clauses=len(result["clauses"]))
+    log.info("classify.done",
+             docType=result["docType"],
+             clauses=len(result["clauses"]),
+             findings=len(result["keyFindings"]))
 
     event["classification"] = result
     return event

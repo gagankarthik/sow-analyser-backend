@@ -57,6 +57,15 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
     # user has intentionally overridden it.
     title = classification.get("title") or existing_meta.get("title") or "Untitled"
 
+    # Pre-compute portfolio-level aggregates so the dashboard and document list
+    # can render risk without fetching each document's classification.json.
+    clauses        = classification.get("clauses") or []
+    findings       = classification.get("keyFindings") or []
+    clause_count   = len(clauses)
+    risk_counts    = _risk_counts(clauses)
+    high_risk      = risk_counts["high"] + risk_counts["critical"]
+    overall_risk   = _overall_risk(risk_counts)
+
     put_doc_meta({
         "docId":           doc_id,
         "tenantId":        tenant_id,
@@ -73,6 +82,13 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
         "checksum":        parsed.get("checksum", ""),
         "latestVersion":   version_n,
         "createdAt":       created_at,
+        # Analysis aggregates (cheap to read in list views)
+        "summary":         classification.get("summary", ""),
+        "clauseCount":     clause_count,
+        "highRiskCount":   high_risk,
+        "findingsCount":   len(findings),
+        "overallRisk":     overall_risk,
+        "riskCounts":      risk_counts,
     })
 
     put_version({
@@ -101,5 +117,28 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
         })
         n_changes += 1
 
-    log.info("persist.done", version=version_n, changes=n_changes)
+    log.info("persist.done", version=version_n, changes=n_changes,
+             clauses=clause_count, highRisk=high_risk, overallRisk=overall_risk)
     return {"status": ProcessingStatus.READY.value, "docId": doc_id}
+
+
+# ---------------------------------------------------------------------------
+# Risk aggregation helpers
+# ---------------------------------------------------------------------------
+
+
+def _risk_counts(clauses: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"low": 0, "medium": 0, "high": 0, "critical": 0}
+    for c in clauses:
+        level = (c.get("riskLevel") or "low").lower()
+        if level in counts:
+            counts[level] += 1
+    return counts
+
+
+def _overall_risk(counts: dict[str, int]) -> str:
+    """Highest risk level present in the document (or 'low' if no clauses)."""
+    for level in ("critical", "high", "medium", "low"):
+        if counts.get(level, 0) > 0:
+            return level
+    return "low"
