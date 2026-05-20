@@ -1,4 +1,12 @@
-"""Stage 05 — Diff: field-level change detection + LLM impact scoring."""
+"""Stage 05 — Diff: field-level change detection + LLM impact scoring.
+
+Compares the current document's clauses against its parent (if any). For each
+changed clause, heuristic scoring assigns an initial impact score; then the top-N
+most-changed clauses are refined via GPT for a more accurate rationale.
+
+If no parent exists (graph stage found none), the stage exits immediately with
+an empty diff — this is the happy path for first-version documents.
+"""
 from __future__ import annotations
 
 import uuid
@@ -13,7 +21,7 @@ from shared.text import normalize
 
 log = get_logger("blue-iq.diff")
 
-HIGH_RISK_CATEGORIES = {"Liability", "IP", "Indemnity", "Termination"}
+_HIGH_RISK = {"Liability", "IP", "Indemnity", "Termination"}
 
 _IMPACT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -26,10 +34,10 @@ _IMPACT_SCHEMA: dict[str, Any] = {
 }
 
 _IMPACT_SYSTEM = (
-    "You assess commercial risk impact of contract clause changes. "
-    "Given before/after text of a single clause, return a strict JSON object with: "
-    "score (integer 1..100, higher = more risk) and rationale (one sentence). "
-    "Be conservative; small wording changes are usually low."
+    "You assess commercial risk of contract clause changes. "
+    "Given before/after text, return JSON with: "
+    "score (integer 1-100, higher = more risk) and rationale (one sentence). "
+    "Be conservative — minor wording tweaks are usually low risk."
 )
 
 
@@ -38,36 +46,34 @@ _IMPACT_SYSTEM = (
 # ---------------------------------------------------------------------------
 
 
-def run(event: dict) -> dict:
+def run(event: dict[str, Any]) -> dict[str, Any]:
     doc_id           = event["docId"]
     tenant_id        = event["tenantId"]
     processed_bucket = event["processedBucket"]
-    lineage          = event.get("lineage") or {}
-    parent_id        = lineage.get("parentDocId")
+    parent_id        = (event.get("lineage") or {}).get("parentDocId")
 
     log.append_keys(docId=doc_id, tenantId=tenant_id)
     update_status(doc_id, "DIFFING")
 
     if not parent_id:
-        log.info("diff.skipped", reason="no parent")
-        event["diffs"] = {"changes": [], "impactSummary": "No parent — nothing to diff."}
+        log.info("diff.skipped", reason="no parent document")
+        event["diffs"] = {"changes": [], "impactSummary": "First version — no diff."}
         return event
 
     current_clauses = (event.get("classification") or {}).get("clauses") or []
     parent_clauses  = _load_parent_clauses(processed_bucket, tenant_id, parent_id)
+
     if not parent_clauses:
-        log.warning("diff.parent_classification_missing", parentDocId=parent_id)
+        log.warning("diff.parent_unavailable", parentDocId=parent_id)
         event["diffs"] = {"changes": [], "impactSummary": "Parent classification unavailable."}
         return event
 
-    changes = _diff_clauses(current_clauses, parent_clauses)
+    changes = _diff(current_clauses, parent_clauses)
     _score_impacts(changes, current_clauses)
 
-    summary = _build_summary(changes)
+    summary = _summarise(changes)
     payload = {"changes": changes, "impactSummary": summary}
-
-    out_key = processed_key(tenant_id, doc_id, "diff.json")
-    put_json(processed_bucket, out_key, payload)
+    put_json(processed_bucket, processed_key(tenant_id, doc_id, "diff.json"), payload)
     log.info("diff.done", changes=len(changes), summary=summary)
 
     event["diffs"] = payload
@@ -79,13 +85,13 @@ def run(event: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _diff_clauses(current: list[dict], parent: list[dict]) -> list[dict[str, Any]]:
-    parent_by_num = {_norm(c.get("number", "")): c for c in parent}
+def _diff(current: list[dict[str, Any]], parent: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    parent_map = {_norm_num(c.get("number", "")): c for c in parent}
     changes: list[dict[str, Any]] = []
 
     for cur in current:
-        key = _norm(cur.get("number", ""))
-        par = parent_by_num.get(key)
+        key = _norm_num(cur.get("number", ""))
+        par = parent_map.get(key)
         if not par:
             changes.append(_mk_change(cur.get("number", ""), "body", "", cur.get("body", "")))
             continue
@@ -95,31 +101,31 @@ def _diff_clauses(current: list[dict], parent: list[dict]) -> list[dict[str, Any
             if normalize(before) != normalize(after):
                 changes.append(_mk_change(cur.get("number", ""), field, before, after))
 
-    current_keys = {_norm(c.get("number", "")) for c in current}
-    for k, par_clause in parent_by_num.items():
-        if k not in current_keys:
-            changes.append(_mk_change(par_clause.get("number", ""), "body", par_clause.get("body", ""), ""))
-
+    current_keys = {_norm_num(c.get("number", "")) for c in current}
+    for key, par_clause in parent_map.items():
+        if key not in current_keys:
+            changes.append(_mk_change(par_clause.get("number", ""), "body",
+                                       par_clause.get("body", ""), ""))
     return changes
 
 
-def _mk_change(clause_number: str, field: str, before: str, after: str) -> dict[str, Any]:
+def _mk_change(num: str, field: str, before: str, after: str) -> dict[str, Any]:
     a, b      = len(before), len(after)
     delta_pct = abs(b - a) / max(a, b, 1) * 100.0
     return {
-        "changeId":         uuid.uuid4().hex,
-        "clauseNumber":     clause_number,
-        "field":            field,
-        "before":           before,
-        "after":            after,
-        "impactScore":      0,
-        "impactRationale":  "",
-        "_delta_pct":       delta_pct,
-        "_cat":             "",
+        "changeId":        uuid.uuid4().hex,
+        "clauseNumber":    num,
+        "field":           field,
+        "before":          before,
+        "after":           after,
+        "impactScore":     0,
+        "impactRationale": "",
+        "_deltaPct":       delta_pct,
+        "_cat":            "",
     }
 
 
-def _norm(num: str) -> str:
+def _norm_num(num: str) -> str:
     return "".join(ch for ch in (num or "").lower() if ch.isalnum() or ch == ".")
 
 
@@ -128,27 +134,28 @@ def _norm(num: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _score_impacts(changes: list[dict[str, Any]], current: list[dict]) -> None:
-    cat_by_num = {_norm(c.get("number", "")): c.get("category", "Other") for c in current}
+def _score_impacts(changes: list[dict[str, Any]], current: list[dict[str, Any]]) -> None:
+    cat_map = {_norm_num(c.get("number", "")): c.get("category", "Other") for c in current}
 
     for ch in changes:
-        cat     = cat_by_num.get(_norm(ch["clauseNumber"]), "Other")
+        cat = cat_map.get(_norm_num(ch["clauseNumber"]), "Other")
         ch["_cat"] = cat
-        base    = 60 if cat in HIGH_RISK_CATEGORIES else 30
-        if ch["_delta_pct"] > 30: base += 20
+        base = 60 if cat in _HIGH_RISK else 30
+        if ch["_deltaPct"] > 30: base += 20
         if ch["field"] == "category": base += 10
         ch["impactScore"]     = min(100, base)
-        ch["impactRationale"] = f"Heuristic: {cat} field={ch['field']} Δlen={ch['_delta_pct']:.0f}%"
+        ch["impactRationale"] = (
+            f"Heuristic: {cat}, field={ch['field']}, Δ={ch['_deltaPct']:.0f}%"
+        )
 
     # LLM refinement for top-N most-changed clauses.
-    cap        = settings.diff_impact_call_cap
-    candidates = sorted(changes, key=lambda c: c["_delta_pct"], reverse=True)[:cap]
-    for ch in candidates:
+    top = sorted(changes, key=lambda c: c["_deltaPct"], reverse=True)[:settings.diff_impact_call_cap]
+    for ch in top:
         try:
             result = chat_json(
                 system=_IMPACT_SYSTEM,
                 user=(
-                    f"Category: {ch.get('_cat', 'Other')}\nField: {ch['field']}\n"
+                    f"Category: {ch['_cat']}\nField: {ch['field']}\n"
                     f"BEFORE:\n{(ch['before'] or '')[:3000]}\n\n"
                     f"AFTER:\n{(ch['after'] or '')[:3000]}"
                 ),
@@ -159,19 +166,20 @@ def _score_impacts(changes: list[dict[str, Any]], current: list[dict]) -> None:
             ch["impactScore"]     = int(result["score"])
             ch["impactRationale"] = result["rationale"]
         except Exception as exc:
-            log.warning("diff.impact.llm_failed", changeId=ch.get("changeId"), error=str(exc))
+            log.warning("diff.impact_llm_failed",
+                        changeId=ch.get("changeId"), error=str(exc))
 
     for ch in changes:
-        ch.pop("_delta_pct", None)
+        ch.pop("_deltaPct", None)
         ch.pop("_cat", None)
 
 
-def _build_summary(changes: list[dict]) -> str:
+def _summarise(changes: list[dict[str, Any]]) -> str:
     if not changes:
         return "No changes detected vs. parent."
     high = sum(1 for c in changes if c["impactScore"] >= 70)
     med  = sum(1 for c in changes if 40 <= c["impactScore"] < 70)
-    return f"{len(changes)} change(s): {high} high-impact, {med} medium, {len(changes) - high - med} low."
+    return f"{len(changes)} change(s): {high} high, {med} medium, {len(changes)-high-med} low impact."
 
 
 # ---------------------------------------------------------------------------
@@ -179,23 +187,27 @@ def _build_summary(changes: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _load_parent_clauses(processed_bucket: str, tenant_id: str, parent_id: str) -> list[dict]:
-    versions = query_doc_versions(parent_id)
-    if versions:
-        versions.sort(key=lambda v: v.get("SK", ""), reverse=True)
-        for v in versions:
-            key = v.get("classificationKey")
-            if key:
-                try:
-                    return get_json(processed_bucket, key).get("clauses", [])
-                except Exception as exc:
-                    log.warning("diff.parent_version_load_failed", key=key, error=str(exc))
-                    break
+def _load_parent_clauses(
+    bucket: str, tenant_id: str, parent_id: str
+) -> list[dict[str, Any]]:
+    versions = sorted(
+        query_doc_versions(parent_id),
+        key=lambda v: v.get("SK", ""),
+        reverse=True,
+    )
+    for v in versions:
+        key = v.get("classificationKey")
+        if key:
+            try:
+                return get_json(bucket, key).get("clauses", [])
+            except Exception as exc:
+                log.warning("diff.parent_version_load_failed", key=key, error=str(exc))
+                break
 
-    meta   = get_doc_meta(parent_id)
-    tenant = (meta or {}).get("tenantId", tenant_id)
+    meta   = get_doc_meta(parent_id) or {}
+    tenant = meta.get("tenantId", tenant_id)
     try:
-        return get_json(processed_bucket, processed_key(tenant, parent_id, "classification.json")).get("clauses", [])
+        return get_json(bucket, processed_key(tenant, parent_id, "classification.json")).get("clauses", [])
     except Exception as exc:
-        log.warning("diff.parent_classification_fallback_failed", error=str(exc))
+        log.warning("diff.parent_fallback_failed", parentDocId=parent_id, error=str(exc))
         return []

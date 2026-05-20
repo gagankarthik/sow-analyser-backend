@@ -23,7 +23,7 @@ from botocore.awsrequest import AWSRequest
 from shared.aws import get_credentials
 from shared.config import settings
 from shared.logger import get_logger
-from shared.openai_client import client as openai_client, embed_texts
+from shared.openai_client import openai_client, embed_texts
 from shared.opensearch import hybrid_search
 
 log: Logger = get_logger("blue-iq.rag")

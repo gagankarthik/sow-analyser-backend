@@ -1,18 +1,20 @@
-"""Document management API Lambda — backs API Gateway routes.
+"""Document management API Lambda — backs API Gateway HTTP API routes.
 
 Routes
 ------
-GET    /documents                         → list all documents for tenant
-GET    /documents/upload-url              → generate a presigned S3 PUT URL
-GET    /documents/{docId}                 → get document + all versions
-PATCH  /documents/{docId}                 → update title / lifecycle / docType
-DELETE /documents/{docId}                 → delete all document data
-DELETE /documents/{docId}/versions/{n}   → delete version n, rollback to n-1
+GET    /documents                       list all documents for the tenant
+GET    /documents/upload-url            generate a presigned S3 PUT URL
+GET    /documents/{docId}               get document metadata + version list
+PATCH  /documents/{docId}               update title / lifecycle / docType
+DELETE /documents/{docId}               delete all document data
+DELETE /documents/{docId}/versions/{n}  delete version n, rollback to n-1
 
-The tenantId is read from the Cognito authorizer context or a fallback
-`x-tenant-id` header for dev/testing.
+tenantId is read from the Cognito JWT claim first; the x-tenant-id header is
+accepted only as a fallback for local development.
 
-All responses are JSON with CORS headers.
+CORS is owned entirely by the API Gateway cors_configuration — this Lambda emits
+no CORS headers. Emitting them would create a duplicate/conflicting
+Access-Control-Allow-Origin header and break browser requests.
 """
 from __future__ import annotations
 
@@ -36,17 +38,14 @@ from shared.dynamodb import (
 )
 from shared.logger import get_logger
 
-# The API Lambda role needs s3:PutObject on the raw bucket to sign presigned
-# PUT URLs on behalf of callers.  See aws_iam_role_policy.api in lambda.tf.
-
 log = get_logger("blue-iq.api")
 tracer = Tracer(service="blue-iq.api")
 
-# CORS is owned by the HTTP API Gateway (cors_configuration in lambda.tf), which
-# is locked to var.allowed_origins. The integration must NOT also emit CORS
-# headers, or the browser sees a conflicting/duplicate Access-Control-Allow-Origin
-# (the old "*" here defeated the gateway lockdown). Left empty intentionally.
-_CORS: dict[str, str] = {}
+_VALID_DOC_TYPES  = frozenset({"SOW", "MSA", "AMENDMENT", "NDA", "OTHER"})
+_VALID_LIFECYCLES = frozenset({
+    "draft", "review", "negotiation", "approval",
+    "signed", "active", "renewal", "expired",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -57,10 +56,12 @@ _CORS: dict[str, str] = {}
 @tracer.capture_lambda_handler
 @log.inject_lambda_context(log_event=False)
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
-    method = (event.get("httpMethod") or event.get("requestContext", {}).get("http", {}).get("method", "GET")).upper()
-    path   = event.get("path") or event.get("rawPath") or "/"
+    method = (
+        event.get("httpMethod")
+        or event.get("requestContext", {}).get("http", {}).get("method", "GET")
+    ).upper()
+    path = event.get("path") or event.get("rawPath") or "/"
 
-    # Preflight
     if method == "OPTIONS":
         return _ok({})
 
@@ -79,40 +80,30 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _route(method: str, path: str, event: dict, tenant_id: str) -> dict[str, Any]:
-    # GET /documents
+def _route(method: str, path: str, event: dict[str, Any], tenant_id: str) -> dict[str, Any]:
     if method == "GET" and re.fullmatch(r"/documents/?", path):
         return _list_documents(tenant_id)
 
-    # GET /documents/upload-url  — must come before the /{docId} wildcard
+    # upload-url must be matched before the /{docId} wildcard
     if method == "GET" and re.fullmatch(r"/documents/upload-url/?", path):
         return _get_upload_url(event, tenant_id)
 
-    # GET /documents/{docId}
-    m = re.fullmatch(r"/documents/([^/]+)/?", path)
-    if method == "GET" and m:
-        return _get_document(m.group(1), tenant_id)
-
-    # PATCH /documents/{docId}
-    m = re.fullmatch(r"/documents/([^/]+)/?", path)
-    if method == "PATCH" and m:
-        return _update_document(m.group(1), tenant_id, event)
-
-    # DELETE /documents/{docId}/versions/{n}
     m = re.fullmatch(r"/documents/([^/]+)/versions/(\d+)/?", path)
     if method == "DELETE" and m:
         return _delete_version(m.group(1), int(m.group(2)), tenant_id)
 
-    # DELETE /documents/{docId}
     m = re.fullmatch(r"/documents/([^/]+)/?", path)
-    if method == "DELETE" and m:
-        return _delete_document(m.group(1), tenant_id)
+    if m:
+        doc_id = m.group(1)
+        if method == "GET":    return _get_document(doc_id, tenant_id)
+        if method == "PATCH":  return _update_document(doc_id, tenant_id, event)
+        if method == "DELETE": return _delete_document(doc_id, tenant_id)
 
     return _err(404, f"No route for {method} {path}")
 
 
 # ---------------------------------------------------------------------------
-# Handlers
+# Route handlers
 # ---------------------------------------------------------------------------
 
 
@@ -121,19 +112,13 @@ def _list_documents(tenant_id: str) -> dict[str, Any]:
     return _ok({"documents": [_clean(d) for d in docs], "count": len(docs)})
 
 
-_VALID_DOC_TYPES = {"SOW", "MSA", "AMENDMENT", "NDA", "OTHER"}
-
-
-def _get_upload_url(event: dict, tenant_id: str) -> dict[str, Any]:
-    """Return a presigned S3 PUT URL so the client can upload a document directly."""
-    qs = event.get("queryStringParameters") or {}
+def _get_upload_url(event: dict[str, Any], tenant_id: str) -> dict[str, Any]:
+    qs           = event.get("queryStringParameters") or {}
     raw_filename = qs.get("filename", "").strip()
     if not raw_filename:
         return _err(400, "Missing required query parameter: filename")
 
-    # Sanitize: collapse any path components to a basename and allow only a
-    # safe character set, so a crafted filename (e.g. "../../other/x") cannot
-    # escape the per-tenant key prefix and write to an arbitrary S3 location.
+    # Sanitize: collapse path separators, restrict to a safe character set.
     filename = os.path.basename(raw_filename.replace("\\", "/"))
     if filename in ("", ".", "..") or not re.fullmatch(r"[A-Za-z0-9._ -]{1,200}", filename):
         return _err(400, "Invalid filename")
@@ -150,43 +135,37 @@ def _get_upload_url(event: dict, tenant_id: str) -> dict[str, Any]:
         return _err(500, "Server misconfiguration: RAW_BUCKET not set")
 
     doc_id = str(uuid.uuid4())
-    key = f"tenants/{tenant_id}/uploads/{doc_id}/{filename}"
+    key    = f"tenants/{tenant_id}/uploads/{doc_id}/{filename}"
 
-    # NOTE: ContentType is intentionally NOT signed. If it were, the browser PUT
-    # would have to send the exact same Content-Type or S3 returns
-    # SignatureDoesNotMatch. By omitting it, the client may send the real file
-    # MIME type (which S3 still records on the object) without breaking the
-    # signature. SignedHeaders is therefore just "host".
+    # ContentType is intentionally NOT signed — the browser can send the real
+    # MIME type without breaking the signature (SignedHeaders = "host" only).
     upload_url = s3_client().generate_presigned_url(
         "put_object",
         Params={"Bucket": raw_bucket, "Key": key},
         ExpiresIn=300,
     )
 
-    # Create a PENDING metadata row immediately so the document is visible in
-    # the UI the moment it's uploaded. The ingestion pipeline otherwise only
-    # writes the document row at its final persist stage (~90s later), which
-    # made GET /documents/{docId} return 404 during processing. The persist
-    # stage upserts over this row with the fully extracted data.
+    # Write a PENDING row immediately so the document appears in the UI during
+    # processing. The persist stage upserts this row with the full extracted data.
     title = filename.rsplit(".", 1)[0] or filename
     try:
         put_doc_meta({
-            "docId": doc_id,
-            "tenantId": tenant_id,
-            "title": title,
-            "docType": doc_type,
-            "lifecycle": "draft",
-            "status": "PENDING",
-            "parties": [],
-            "effectiveDate": None,
-            "parentDocId": None,
-            "rawKey": key,
+            "docId":           doc_id,
+            "tenantId":        tenant_id,
+            "title":           title,
+            "docType":         doc_type,
+            "lifecycle":       "draft",
+            "status":          "PENDING",
+            "parties":         [],
+            "effectiveDate":   None,
+            "parentDocId":     None,
+            "rawKey":          key,
             "processedPrefix": "",
-            "structuralHash": "",
-            "checksum": "",
-            "latestVersion": 0,
+            "structuralHash":  "",
+            "checksum":        "",
+            "latestVersion":   0,
         })
-    except Exception:  # noqa: BLE001 — metadata write must never block the upload
+    except Exception:
         log.exception("api.upload_url.meta_write_failed", docId=doc_id)
 
     log.info("api.upload_url_generated", docId=doc_id, key=key, docType=doc_type)
@@ -202,13 +181,13 @@ def _get_document(doc_id: str, tenant_id: str) -> dict[str, Any]:
     versions = sorted(
         [
             {
-                "versionNumber":    int(v.get("versionNumber", 0)),
-                "extractionMethod": v.get("extractionMethod", ""),
-                "createdAt":        v.get("createdAt", ""),
-                "parsedKey":        v.get("parsedKey", ""),
+                "versionNumber":     int(v.get("versionNumber", 0)),
+                "extractionMethod":  v.get("extractionMethod", ""),
+                "createdAt":         v.get("createdAt", ""),
+                "parsedKey":         v.get("parsedKey", ""),
                 "classificationKey": v.get("classificationKey", ""),
-                "timelineKey":      v.get("timelineKey"),
-                "diffKey":          v.get("diffKey"),
+                "timelineKey":       v.get("timelineKey"),
+                "diffKey":           v.get("diffKey"),
             }
             for v in versions_raw
         ],
@@ -217,10 +196,7 @@ def _get_document(doc_id: str, tenant_id: str) -> dict[str, Any]:
     return _ok({"document": _clean(meta), "versions": versions})
 
 
-_VALID_LIFECYCLES = {"draft", "review", "negotiation", "approval", "signed", "active", "renewal", "expired"}
-
-
-def _update_document(doc_id: str, tenant_id: str, event: dict) -> dict[str, Any]:
+def _update_document(doc_id: str, tenant_id: str, event: dict[str, Any]) -> dict[str, Any]:
     meta = get_doc_meta(doc_id)
     if not meta or meta.get("tenantId") != tenant_id:
         return _err(404, "Document not found")
@@ -235,22 +211,19 @@ def _update_document(doc_id: str, tenant_id: str, event: dict) -> dict[str, Any]
 
     if not isinstance(body, dict):
         return _err(400, "Body must be a JSON object")
+    if not body:
+        return _err(400, "No fields to update")
 
     allowed = {"title", "lifecycle", "docType"}
     unknown = set(body.keys()) - allowed
     if unknown:
         return _err(400, f"Unknown field(s): {', '.join(sorted(unknown))}")
 
-    if not body:
-        return _err(400, "No fields to update")
+    if "lifecycle" in body and body["lifecycle"] not in _VALID_LIFECYCLES:
+        return _err(400, f"Invalid lifecycle. Must be one of: {', '.join(sorted(_VALID_LIFECYCLES))}")
 
-    if "lifecycle" in body:
-        if body["lifecycle"] not in _VALID_LIFECYCLES:
-            return _err(400, f"Invalid lifecycle. Must be one of: {', '.join(sorted(_VALID_LIFECYCLES))}")
-
-    if "docType" in body:
-        if body["docType"] not in _VALID_DOC_TYPES:
-            return _err(400, f"Invalid docType. Must be one of: {', '.join(sorted(_VALID_DOC_TYPES))}")
+    if "docType" in body and body["docType"] not in _VALID_DOC_TYPES:
+        return _err(400, f"Invalid docType. Must be one of: {', '.join(sorted(_VALID_DOC_TYPES))}")
 
     if "title" in body:
         title = str(body["title"]).strip()
@@ -273,21 +246,24 @@ def _delete_version(doc_id: str, version_number: int, tenant_id: str) -> dict[st
 
     versions = query_doc_versions(doc_id)
     if len(versions) <= 1:
-        # Only one version left — delete the whole document.
         delete_doc_entirely(doc_id)
         log.info("api.delete_last_version", docId=doc_id)
-        return _ok({"deleted": True, "docId": doc_id, "versionDeleted": version_number,
-                    "message": "Last version deleted — document removed."})
+        return _ok({
+            "deleted":        True,
+            "docId":          doc_id,
+            "versionDeleted": version_number,
+            "message":        "Last version deleted — document removed.",
+        })
 
     new_meta = delete_doc_version(doc_id, version_number)
     log.info("api.version_deleted", docId=doc_id, deletedVersion=version_number,
-             rolledBackTo=new_meta.get("latestVersion") if new_meta else None)
+             rolledBackTo=(new_meta or {}).get("latestVersion"))
     return _ok({
-        "deleted":         True,
-        "docId":           doc_id,
-        "versionDeleted":  version_number,
-        "latestVersion":   new_meta.get("latestVersion") if new_meta else None,
-        "document":        _clean(new_meta) if new_meta else None,
+        "deleted":        True,
+        "docId":          doc_id,
+        "versionDeleted": version_number,
+        "latestVersion":  (new_meta or {}).get("latestVersion"),
+        "document":       _clean(new_meta) if new_meta else None,
     })
 
 
@@ -306,26 +282,19 @@ def _delete_document(doc_id: str, tenant_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _tenant(event: dict) -> str:
-    ctx = event.get("requestContext", {})
-    # HTTP API (payload format 2.0) puts verified JWT claims under
-    # requestContext.authorizer.jwt.claims — NOT .authorizer.claims (that's the
-    # REST/v1 shape). Read the verified claim FIRST so tenant isolation can't be
-    # spoofed via the x-tenant-id header. The header remains a dev/local
-    # fallback only (for calls made without a token).
+def _tenant(event: dict[str, Any]) -> str:
+    ctx        = event.get("requestContext", {}) or {}
     authorizer = ctx.get("authorizer", {}) or {}
-    jwt_claims = authorizer.get("jwt", {}).get("claims", {}) or {}
-    tenant = (
+    jwt_claims = (authorizer.get("jwt") or {}).get("claims") or {}
+    return (
         jwt_claims.get("custom:tenantId")
-        or authorizer.get("claims", {}).get("custom:tenantId")  # REST/v1 compat
+        or (authorizer.get("claims") or {}).get("custom:tenantId")  # REST v1 compat
         or (event.get("headers") or {}).get("x-tenant-id")
         or "default"
     )
-    return tenant
 
 
-def _clean(item: dict | None) -> dict:
-    """Strip DDB internals and convert Decimal → float/int for JSON."""
+def _clean(item: dict[str, Any] | None) -> dict[str, Any]:
     if not item:
         return {}
     skip = {"PK", "SK", "GSI1PK", "GSI1SK", "entityType"}
@@ -345,7 +314,7 @@ def _conv(val: Any) -> Any:
 def _ok(body: Any, status: int = 200) -> dict[str, Any]:
     return {
         "statusCode": status,
-        "headers":    {**_CORS, "Content-Type": "application/json"},
+        "headers":    {"Content-Type": "application/json"},
         "body":       json.dumps(body, default=str),
     }
 

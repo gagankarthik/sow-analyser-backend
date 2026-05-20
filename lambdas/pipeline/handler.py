@@ -1,8 +1,11 @@
-"""Unified pipeline Lambda entry point — single function, all seven stages.
+"""Pipeline Lambda entry point — single function, seven stages.
 
-Step Functions injects `_stage` into the event payload via States.JsonMerge.
-The handler pops it, dispatches to the correct stage module, and returns the
-enriched event so the next state receives a clean pipeline event.
+Step Functions injects `_stage` via States.JsonMerge. The handler pops it,
+dispatches to the matching stage module, and returns the enriched event so the
+next state receives a clean pipeline payload.
+
+Failure contract: any unhandled exception bubbles up; Step Functions catches it
+and routes to the MarkFailed state, which writes status=FAILED to DynamoDB.
 """
 from __future__ import annotations
 
@@ -16,7 +19,7 @@ from shared.logger import get_logger
 log = get_logger("blue-iq.pipeline")
 tracer = Tracer(service="blue-iq.pipeline")
 
-_STAGE_MAP: dict[str, str] = {
+_STAGES: dict[str, str] = {
     "01_parse":    "stages.parse",
     "02_classify": "stages.classify",
     "03_embed":    "stages.embed",
@@ -30,17 +33,20 @@ _STAGE_MAP: dict[str, str] = {
 @tracer.capture_lambda_handler
 @log.inject_lambda_context(log_event=False)
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
-    # _stage is injected by Step Functions via States.JsonMerge; fall back to
-    # PIPELINE_STAGE env var so local/test invocations still work.
     stage = event.pop("_stage", None) or os.environ.get("PIPELINE_STAGE", "")
     if not stage:
-        raise ValueError("_stage must be present in the event payload or PIPELINE_STAGE env var")
+        raise ValueError("_stage must be present in the event or PIPELINE_STAGE env var")
 
-    module_path = _STAGE_MAP.get(stage)
+    module_path = _STAGES.get(stage)
     if not module_path:
-        raise ValueError(f"Unknown pipeline stage: {stage!r}")
+        raise ValueError(f"Unknown pipeline stage: {stage!r}. Valid: {list(_STAGES)}")
 
-    log.append_keys(stage=stage)
+    log.append_keys(stage=stage, docId=event.get("docId", "?"))
+
+    # Surface remaining Lambda time for timeout-aware stages.
+    if context and hasattr(context, "get_remaining_time_in_millis"):
+        event["_remainingMs"] = context.get_remaining_time_in_millis()
+
     mod = importlib.import_module(module_path)
     try:
         return mod.run(event)

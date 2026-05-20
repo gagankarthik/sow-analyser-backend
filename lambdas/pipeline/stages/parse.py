@@ -1,4 +1,14 @@
-"""Stage 01 — Parse: extract text from DOCX / PDF."""
+"""Stage 01 — Parse: extract raw text from DOCX or PDF.
+
+Strategy:
+  DOCX  → python-docx (direct)
+  PDF   → pdfplumber first (fast, native text)
+        → Textract async fallback (scanned / image-only PDFs)
+
+Textract is only invoked when pdfplumber yields fewer than 200 total characters,
+meaning the PDF is scanned/image-only. A single page with sparse text (cover,
+blank, ToC) does NOT trigger Textract — only truly empty extractions do.
+"""
 from __future__ import annotations
 
 import io
@@ -26,23 +36,23 @@ TEXTRACT_MAX_WAIT_S      = 240
 # ---------------------------------------------------------------------------
 
 
-def run(event: dict) -> dict:
+def run(event: dict[str, Any]) -> dict[str, Any]:
     raw_bucket       = event["rawBucket"]
     raw_key          = event["rawKey"]
     processed_bucket = event["processedBucket"]
 
-    # EventBridge passes the raw S3 key as docId; extract the real IDs from the key path.
-    # Expected format: tenants/<tenantId>/uploads/<docId>/<filename>
-    doc_id, tenant_id = _extract_ids(raw_key, event)
+    # Parse tenantId / docId from key: tenants/<tenantId>/uploads/<docId>/<file>
+    doc_id, tenant_id = _ids_from_key(raw_key, event)
     event["docId"]    = doc_id
     event["tenantId"] = tenant_id
 
     log.append_keys(docId=doc_id, tenantId=tenant_id)
     log.info("parse.start", rawKey=raw_key)
+
     try:
         update_status(doc_id, "PARSING")
     except Exception:
-        pass  # DDB may not have the row yet for very early failures
+        pass  # Row may not exist yet on very early failures; non-fatal.
 
     blob     = get_object(raw_bucket, raw_key)
     checksum = sha256_hex(blob)
@@ -52,11 +62,12 @@ def run(event: dict) -> dict:
         extracted = _parse_docx(blob)
         method    = ExtractionMethod.DOCX
     else:
-        extracted = _parse_pdf_pdfplumber(blob)
-        if extracted and _looks_extractable(extracted["pages"]):
+        extracted = _try_pdfplumber(blob)
+        if extracted and _has_content(extracted["pages"]):
             method = ExtractionMethod.PDFPLUMBER
         else:
-            extracted = _textract_from_s3(raw_bucket, raw_key)
+            log.info("parse.pdf.fallback_to_textract", reason="insufficient pdfplumber text")
+            extracted = _textract_async(raw_bucket, raw_key)
             method    = ExtractionMethod.TEXTRACT
 
     parsed = {
@@ -68,14 +79,15 @@ def run(event: dict) -> dict:
     }
     out_key = processed_key(tenant_id, doc_id, "parsed.json")
     put_json(processed_bucket, out_key, parsed)
-    log.info("parse.done", method=method.value, pages=len(parsed["pages"]))
+    log.info("parse.done", method=method.value, pages=len(parsed["pages"]),
+             chars=len(parsed["text"]))
 
     event["parsed"] = parsed
     return event
 
 
 # ---------------------------------------------------------------------------
-# DOCX
+# DOCX extraction
 # ---------------------------------------------------------------------------
 
 
@@ -94,11 +106,11 @@ def _parse_docx(data: bytes) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# PDF — pdfplumber
+# PDF — pdfplumber (native text layer)
 # ---------------------------------------------------------------------------
 
 
-def _parse_pdf_pdfplumber(data: bytes) -> dict[str, Any] | None:
+def _try_pdfplumber(data: bytes) -> dict[str, Any] | None:
     try:
         import pdfplumber  # type: ignore
     except ImportError:
@@ -111,46 +123,48 @@ def _parse_pdf_pdfplumber(data: bytes) -> dict[str, Any] | None:
                 text = (page.extract_text() or "").strip()
                 pages.append({"page": i, "text": text, "char_count": len(text)})
     except Exception as exc:
-        log.warning("parse.pdf.pdfplumber_failed", error=str(exc))
+        log.warning("parse.pdf.pdfplumber_error", error=str(exc))
         return None
 
     full = "\n\n".join(p["text"] for p in pages)
     return {"text": full, "pages": pages}
 
 
-def _looks_extractable(pages: list[dict]) -> bool:
-    # Require only that the document has meaningful total text.  Requiring every
-    # page to have chars incorrectly rejects normal PDFs with cover/blank pages.
-    total = sum(p["char_count"] for p in pages)
-    return total >= 200
+def _has_content(pages: list[dict[str, Any]]) -> bool:
+    """Return True when the document has enough text to be usable.
+
+    Only the TOTAL character count matters — a single sparse page (cover,
+    blank, table-of-contents) should not force an expensive Textract call.
+    """
+    return sum(p["char_count"] for p in pages) >= 200
 
 
 # ---------------------------------------------------------------------------
-# PDF — Textract async (requires S3 object)
+# PDF — Textract async (scanned / image-only)
 # ---------------------------------------------------------------------------
 
 
-def _textract_from_s3(bucket: str, key: str) -> dict[str, Any]:
+def _textract_async(bucket: str, key: str) -> dict[str, Any]:
     tx     = textract_client()
-    job    = tx.start_document_text_detection(
+    job_id = tx.start_document_text_detection(
         DocumentLocation={"S3Object": {"Bucket": bucket, "Name": key}}
-    )
-    job_id = job["JobId"]
+    )["JobId"]
     log.info("textract.started", jobId=job_id)
 
-    status = "IN_PROGRESS"
     waited = 0
-    while status == "IN_PROGRESS":
+    while True:
         if waited >= TEXTRACT_MAX_WAIT_S:
             raise TimeoutError(f"Textract job {job_id} timed out after {TEXTRACT_MAX_WAIT_S}s")
         time.sleep(TEXTRACT_POLL_INTERVAL_S)
         waited += TEXTRACT_POLL_INTERVAL_S
         status  = tx.get_document_text_detection(JobId=job_id, MaxResults=1)["JobStatus"]
+        if status != "IN_PROGRESS":
+            break
 
     if status != "SUCCEEDED":
-        raise RuntimeError(f"Textract job {job_id} ended with status {status}")
+        raise RuntimeError(f"Textract job {job_id} failed with status: {status}")
 
-    blocks: list[dict] = []
+    blocks: list[dict[str, Any]] = []
     next_token: str | None = None
     while True:
         kwargs: dict[str, Any] = {"JobId": job_id, "MaxResults": 1000}
@@ -171,33 +185,29 @@ def _textract_from_s3(bucket: str, key: str) -> dict[str, Any]:
         {"page": p, "text": "\n".join(lines), "char_count": sum(len(l) for l in lines)}
         for p, lines in sorted(page_lines.items())
     ]
-    return {"text": "\n\n".join(p["text"] for p in page_list), "pages": page_list}
+    full = "\n\n".join(p["text"] for p in page_list)
+    log.info("textract.done", pages=len(page_list), chars=len(full))
+    return {"text": full, "pages": page_list}
 
 
 # ---------------------------------------------------------------------------
-# ID extraction from S3 key path
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-def _extract_ids(raw_key: str, event: dict) -> tuple[str, str]:
-    """Parse tenantId and docId from key: tenants/<tenantId>/uploads/<docId>/<file>."""
+def _ids_from_key(raw_key: str, event: dict[str, Any]) -> tuple[str, str]:
+    """Extract (docId, tenantId) from key: tenants/<tenantId>/uploads/<docId>/<file>."""
     parts = raw_key.split("/")
     if len(parts) >= 4 and parts[0] == "tenants" and parts[2] == "uploads":
         return parts[3], parts[1]
-    # Fallback: use whatever is in the event (may be the raw key itself).
     return event.get("docId", raw_key), event.get("tenantId", "default")
 
 
-# ---------------------------------------------------------------------------
-# Type detection
-# ---------------------------------------------------------------------------
-
-
 def _detect_type(filename: str, blob: bytes) -> str:
-    name = (filename or "").lower()
+    name = filename.lower()
     head = blob[:8]
     if name.endswith(".pdf") or head.startswith(_PDF_MAGIC) or _PDF_MAGIC in blob[:1024]:
         return "pdf"
     if name.endswith(".docx") or head.startswith(_DOCX_MAGIC):
         return "docx"
-    raise ValueError(f"Unsupported file type: {filename!r}")
+    raise ValueError(f"Unsupported file type: {filename!r}. Supported: pdf, docx")

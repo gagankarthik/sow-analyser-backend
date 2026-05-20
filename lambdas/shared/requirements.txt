@@ -1,33 +1,38 @@
-# Shared Lambda runtime deps. Pinned for reproducible builds.
-# These get packaged into the shared Lambda layer.
+# Shared Lambda layer dependencies — pinned for reproducible builds.
+# Run build.sh to package these for linux/arm64 (Python 3.12).
 
-# AWS SDK (Lambda already provides boto3, but we pin for parity with local dev)
+# ── AWS SDK ─────────────────────────────────────────────────────────────────
+# Lambda provides boto3 at runtime, but we pin so local dev and the layer match.
 boto3==1.35.36
 botocore==1.35.36
 
-# Document parsing
+# ── Document parsing ─────────────────────────────────────────────────────────
 pdfplumber==0.11.4
 python-docx==1.1.2
 
-# OpenAI
+# ── OpenAI ───────────────────────────────────────────────────────────────────
+# httpx must be pinned explicitly: we import it directly in openai_client.py to
+# work around the aws-xray-sdk monkey-patch incompatibility (see that file).
+# The version must be compatible with the openai SDK's own httpx requirement.
+httpx==0.27.2
 openai==1.51.0
 tiktoken==0.8.0
 
-# JSON / data
+# ── Data / serialisation ─────────────────────────────────────────────────────
 pydantic==2.9.2
 orjson==3.10.7
 
-# Utility
-structlog==24.4.0
-tenacity==9.0.0    # retries with backoff
+# ── Resilience ───────────────────────────────────────────────────────────────
+tenacity==9.0.0
 
-# Observability
+# ── Observability ────────────────────────────────────────────────────────────
 aws-lambda-powertools[tracer]==3.2.0
 
-# Hashing / text normalization
+# ── Text utilities ───────────────────────────────────────────────────────────
+structlog==24.4.0
 unidecode==1.3.8
 
-# OpenSearch SigV4 auth + client
+# ── OpenSearch (hybrid k-NN + BM25) ─────────────────────────────────────────
 opensearch-py==2.7.1
 requests==2.32.3
 requests-aws4auth==1.3.1
