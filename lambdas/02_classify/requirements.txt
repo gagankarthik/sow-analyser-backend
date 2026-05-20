@@ -1,0 +1,2 @@
+# Stage 2 — Classify
+# No extra deps beyond shared/ (OpenAI + tiktoken already there).

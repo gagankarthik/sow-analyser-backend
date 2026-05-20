@@ -1,0 +1,33 @@
+{
+  "name": "blue-iq-infra",
+  "version": "0.1.0",
+  "private": true,
+  "bin": {
+    "infra": "bin/infra.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "test": "vitest run",
+    "cdk": "cdk",
+    "synth": "cdk synth",
+    "deploy": "cdk deploy --all --require-approval never",
+    "deploy:storage": "cdk deploy BlueIQ-Storage",
+    "deploy:pipeline": "cdk deploy BlueIQ-Pipeline",
+    "deploy:search": "cdk deploy BlueIQ-Search",
+    "deploy:api": "cdk deploy BlueIQ-Api",
+    "destroy": "cdk destroy --all"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "aws-cdk": "^2.158.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.158.0",
+    "constructs": "^10.3.0",
+    "source-map-support": "^0.5.21"
+  }
+}

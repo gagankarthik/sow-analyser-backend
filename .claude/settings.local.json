@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc *)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(python -m compileall -q lambdas)",
+      "Bash(echo \"PY_EXIT: $?\")",
+      "Bash(python -m pip --version)"
+    ]
+  }
+}

@@ -1,0 +1,2 @@
+# Stage 5 — Diff
+# No extra deps beyond shared/.

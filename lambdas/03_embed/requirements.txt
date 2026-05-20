@@ -1,0 +1,3 @@
+# Stage 3 — Embed
+# opensearch-py + requests-aws4auth live in the shared layer per CDK config.
+# No additional deps needed at this stage.

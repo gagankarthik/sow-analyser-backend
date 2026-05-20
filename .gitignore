@@ -1,0 +1,42 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+build/
+*.zip
+
+# Node / CDK
+node_modules/
+cdk.out/
+*.d.ts
+*.js.map
+infra/dist/
+.cdk.staging/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# Lambda packaging
+lambdas/**/package/
+lambdas/**/*.zip
+lambdas/**/build/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Local
+.DS_Store
+*.log
+.vscode/settings.json
+.idea/
+
+# OS
+Thumbs.db

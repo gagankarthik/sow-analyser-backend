@@ -1,0 +1,240 @@
+###############################################################################
+# Blue-IQ AppSync GraphQL schema
+#
+# Auth model:
+#   - IAM (primary) for service-to-service calls from Next.js server actions.
+#   - API_KEY (additional) for local development only.
+#   - Cognito user pools can be added later as an additional auth mode.
+#
+# Conventions:
+#   - All timestamps are AWSDateTime (ISO-8601).
+#   - documentId is the S3 object key prefix (uuid).
+#   - tenantId is the multi-tenant partition. Required on every query that lists.
+###############################################################################
+
+schema {
+  query: Query
+  mutation: Mutation
+  subscription: Subscription
+}
+
+# ----------------------------------------------------------------------------
+# Enums
+# ----------------------------------------------------------------------------
+
+enum DocumentType {
+  SOW
+  MSA
+  AMENDMENT
+  NDA
+  OTHER
+}
+
+enum ProcessingStatus {
+  PENDING
+  PARSING
+  CLASSIFYING
+  EMBEDDING
+  DIFFING
+  READY
+  FAILED
+}
+
+# ----------------------------------------------------------------------------
+# Core types
+# ----------------------------------------------------------------------------
+
+type Document
+  @aws_iam
+  @aws_api_key {
+  id: ID!
+  tenantId: String!
+  type: DocumentType!
+  title: String
+  status: ProcessingStatus!
+  currentVersion: Int!
+  uploadedAt: AWSDateTime!
+  parentDocId: ID
+  rawS3Uri: AWSURL!
+  processedS3Uri: AWSURL
+  errorMessage: String
+  updatedAt: AWSDateTime
+}
+
+type DocumentConnection
+  @aws_iam
+  @aws_api_key {
+  items: [Document!]!
+  nextToken: String
+}
+
+type Version
+  @aws_iam
+  @aws_api_key {
+  documentId: ID!
+  version: Int!
+  createdAt: AWSDateTime!
+  changes: [Change!]!
+  summary: String
+}
+
+type Change
+  @aws_iam
+  @aws_api_key {
+  id: ID!
+  documentId: ID!
+  fromVersion: Int!
+  toVersion: Int!
+  clauseNumber: String!
+  field: String!
+  before: String
+  after: String
+  impactScore: Int! # 1-100
+  aiRationale: String
+}
+
+type ClauseSearchResult
+  @aws_iam
+  @aws_api_key {
+  documentId: ID!
+  clauseNumber: String!
+  text: String!
+  score: Float!
+  highlights: [String!]
+}
+
+type AskBluelySession
+  @aws_iam
+  @aws_api_key {
+  sessionId: ID!
+  documentId: ID
+  answer: String # full answer once streaming completes; tokens come via subscription
+  citations: [ClauseSearchResult!]
+}
+
+# ----------------------------------------------------------------------------
+# Query
+# ----------------------------------------------------------------------------
+
+type Query {
+  getDocument(id: ID!): Document
+    @aws_iam
+    @aws_api_key
+
+  listDocumentsByTenant(
+    tenantId: String!
+    limit: Int = 20
+    nextToken: String
+  ): DocumentConnection!
+    @aws_iam
+    @aws_api_key
+
+  listVersions(documentId: ID!): [Version!]!
+    @aws_iam
+    @aws_api_key
+
+  listChanges(
+    documentId: ID!
+    fromVersion: Int
+    toVersion: Int
+  ): [Change!]!
+    @aws_iam
+    @aws_api_key
+
+  searchClauses(
+    query: String!
+    tenantId: String!
+    limit: Int = 10
+  ): [ClauseSearchResult!]!
+    @aws_iam
+    @aws_api_key
+}
+
+# ----------------------------------------------------------------------------
+# Mutation
+# ----------------------------------------------------------------------------
+
+input AskBluelyInput {
+  documentId: ID
+  question: String!
+  topK: Int = 5
+  tenantId: String!
+}
+
+type Mutation {
+  # Kicks off a RAG session. Tokens are streamed via the `bluelyTokens`
+  # subscription keyed on the returned sessionId.
+  askBluely(input: AskBluelyInput!): AskBluelySession!
+    @aws_iam
+    @aws_api_key
+
+  # Internal mutations — used by pipeline Lambdas (IAM-only) to fan out
+  # subscription events. Never call from a public client.
+  onDocumentStatusChanged(input: DocumentStatusInput!): Document
+    @aws_iam
+
+  onVersionAdded(input: VersionAddedInput!): Version
+    @aws_iam
+
+  onBluelyToken(input: BluelyTokenInput!): BluelyToken
+    @aws_iam
+}
+
+input DocumentStatusInput {
+  id: ID!
+  tenantId: String!
+  type: DocumentType!
+  status: ProcessingStatus!
+  currentVersion: Int!
+  uploadedAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+  rawS3Uri: AWSURL!
+  processedS3Uri: AWSURL
+  errorMessage: String
+  title: String
+  parentDocId: ID
+}
+
+input VersionAddedInput {
+  documentId: ID!
+  version: Int!
+  createdAt: AWSDateTime!
+  summary: String
+}
+
+input BluelyTokenInput {
+  sessionId: ID!
+  token: String!
+  index: Int!
+  done: Boolean!
+}
+
+type BluelyToken
+  @aws_iam
+  @aws_api_key {
+  sessionId: ID!
+  token: String!
+  index: Int!
+  done: Boolean!
+}
+
+# ----------------------------------------------------------------------------
+# Subscription
+# ----------------------------------------------------------------------------
+
+type Subscription {
+  documentStatusChanged(documentId: ID!): Document
+    @aws_subscribe(mutations: ["onDocumentStatusChanged"])
+    @aws_iam
+    @aws_api_key
+
+  versionAdded(documentId: ID!): Version
+    @aws_subscribe(mutations: ["onVersionAdded"])
+    @aws_iam
+    @aws_api_key
+
+  bluelyTokens(sessionId: ID!): BluelyToken
+    @aws_subscribe(mutations: ["onBluelyToken"])
+    @aws_iam
+    @aws_api_key
+}

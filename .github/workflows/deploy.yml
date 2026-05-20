@@ -1,0 +1,85 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "Deployment stage"
+        required: true
+        default: "dev"
+        type: choice
+        options: [dev, staging, prod]
+
+env:
+  AWS_REGION: us-east-2
+  TF_VERSION: "1.9.0"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  deploy:
+    name: Build & Deploy (${{ github.event.inputs.stage || 'dev' }})
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.stage || 'dev' }}
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── AWS credentials ─────────────────────────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      # ── Python + build shared Lambda layer ──────────────────────────────────
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build shared Lambda layer
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      # ── Terraform ───────────────────────────────────────────────────────────
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Terraform validate
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Terraform plan
+        working-directory: terraform
+        env:
+          TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          TF_VAR_stage:          ${{ github.event.inputs.stage || 'dev' }}
+          TF_VAR_project_name:   blue-iq-sow
+          TF_VAR_aws_region:     ${{ env.AWS_REGION }}
+        run: terraform plan -out=tfplan
+
+      - name: Terraform apply
+        working-directory: terraform
+        env:
+          TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          TF_VAR_stage:          ${{ github.event.inputs.stage || 'dev' }}
+          TF_VAR_project_name:   blue-iq-sow
+          TF_VAR_aws_region:     ${{ env.AWS_REGION }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Print API URL
+        working-directory: terraform
+        run: |
+          echo "Documents API: $(terraform output -raw documents_api_url)"
