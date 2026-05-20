@@ -123,11 +123,12 @@ locals {
             PK = { "S.$" = "States.Format('DOC#{}', States.ArrayGetItem(States.StringSplit($.rawKey, '/'), 3))" }
             SK = { S = "META" }
           }
-          UpdateExpression          = "SET #st = :failed, updatedAt = :ts"
+          UpdateExpression          = "SET #st = :failed, updatedAt = :ts, errorMessage = :err"
           ExpressionAttributeNames  = { "#st" = "status" }
           ExpressionAttributeValues = {
             ":failed" = { S = "FAILED" }
             ":ts"     = { "S.$" = "$$.State.EnteredTime" }
+            ":err"    = { "S.$" = "States.Format('{}: {}', $.error.Error, $.error.Cause)" }
           }
         }
         End = true

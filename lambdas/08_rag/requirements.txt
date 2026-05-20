@@ -1,3 +1,0 @@
-# All deps live in shared/requirements.txt (boto3, openai, opensearch-py,
-# aws-lambda-powertools, etc.). This file is intentionally empty so the
-# packager doesn't try to layer-merge anything specific to the RAG handler.

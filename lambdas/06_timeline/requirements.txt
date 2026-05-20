@@ -1,2 +1,0 @@
-# Stage 6 — Timeline
-# No extra deps beyond shared/.

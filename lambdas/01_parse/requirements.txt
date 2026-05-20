@@ -1,3 +1,0 @@
-# Stage 1 — Parse
-# No extra deps beyond shared/ (pdfplumber + python-docx already there).
-# This file exists so CDK's per-stage bundling has a deterministic input.

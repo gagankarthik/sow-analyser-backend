@@ -68,27 +68,32 @@ def run(event: dict) -> dict:
                 except Exception as exc:
                     log.warning("embed.cache_write_failed", error=str(exc))
 
-    # Index all clauses into OpenSearch.
+    # Index all clauses into OpenSearch.  Each clause is wrapped independently
+    # so a single bad document or a transient OpenSearch hiccup doesn't kill
+    # the entire pipeline — RAG quality degrades gracefully instead of failing.
     vector_ids: list[str] = []
     for i, c in enumerate(clauses):
         vector = cached_vecs.get(i) or new_vecs.get(i)
         if vector is None:
             log.warning("embed.skip_no_vector", clause=c.get("number"))
             continue
-        cid = index_clause_vector(
-            doc_id=doc_id, tenant_id=tenant_id,
-            clause_number=c.get("number", str(i)),
-            category=c.get("category", "Other"), doc_type=doc_type,
-            text=c.get("body", ""), vector=vector,
-        )
-        index_clause_text(
-            doc_id=doc_id, tenant_id=tenant_id,
-            clause_number=c.get("number", str(i)),
-            category=c.get("category", "Other"), doc_type=doc_type,
-            title=c.get("title", ""), text=c.get("body", ""),
-            structural_hash=structural,
-        )
-        vector_ids.append(cid)
+        try:
+            cid = index_clause_vector(
+                doc_id=doc_id, tenant_id=tenant_id,
+                clause_number=c.get("number", str(i)),
+                category=c.get("category", "Other"), doc_type=doc_type,
+                text=c.get("body", ""), vector=vector,
+            )
+            index_clause_text(
+                doc_id=doc_id, tenant_id=tenant_id,
+                clause_number=c.get("number", str(i)),
+                category=c.get("category", "Other"), doc_type=doc_type,
+                title=c.get("title", ""), text=c.get("body", ""),
+                structural_hash=structural,
+            )
+            vector_ids.append(cid)
+        except Exception as exc:
+            log.warning("embed.clause_index_failed", clause=c.get("number"), error=str(exc))
 
     event["embeddings"] = {"clauseVectorIds": vector_ids, "embeddedCount": len(vector_ids)}
     log.info("embed.done", embedded=len(vector_ids))

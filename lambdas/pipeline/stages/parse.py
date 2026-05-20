@@ -59,13 +59,6 @@ def run(event: dict) -> dict:
             extracted = _textract_from_s3(raw_bucket, raw_key)
             method    = ExtractionMethod.TEXTRACT
 
-    # Upgrade scanned PDFs that pdfplumber parsed anaemically.
-    if ftype == "pdf" and method == ExtractionMethod.PDFPLUMBER:
-        if not _looks_extractable(extracted["pages"]):
-            log.info("parse.pdf.upgrading_to_textract")
-            extracted = _textract_from_s3(raw_bucket, raw_key)
-            method    = ExtractionMethod.TEXTRACT
-
     parsed = {
         "text":              extracted["text"],
         "pages":             extracted["pages"],
@@ -126,8 +119,10 @@ def _parse_pdf_pdfplumber(data: bytes) -> dict[str, Any] | None:
 
 
 def _looks_extractable(pages: list[dict]) -> bool:
+    # Require only that the document has meaningful total text.  Requiring every
+    # page to have chars incorrectly rejects normal PDFs with cover/blank pages.
     total = sum(p["char_count"] for p in pages)
-    return total >= 200 and all(p["char_count"] >= 50 for p in pages)
+    return total >= 200
 
 
 # ---------------------------------------------------------------------------
