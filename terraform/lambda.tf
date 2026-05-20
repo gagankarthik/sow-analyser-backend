@@ -132,6 +132,13 @@ resource "aws_iam_role_policy" "api" {
         ]
         Resource = [aws_dynamodb_table.main.arn, "${aws_dynamodb_table.main.arn}/index/*"]
       },
+      {
+        # Required so the Lambda can sign presigned PUT URLs for GET /documents/upload-url
+        Sid      = "RawBucketPresignedPut"
+        Effect   = "Allow"
+        Action   = ["s3:PutObject"]
+        Resource = "${aws_s3_bucket.raw.arn}/*"
+      },
     ]
   })
 }
@@ -158,6 +165,14 @@ resource "aws_apigatewayv2_integration" "api_lambda" {
 resource "aws_apigatewayv2_route" "get_documents" {
   api_id    = aws_apigatewayv2_api.documents.id
   route_key = "GET /documents"
+  target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+}
+
+# Literal route — must be declared before the {docId} wildcard so API GW
+# resolves the more-specific path first.
+resource "aws_apigatewayv2_route" "get_upload_url" {
+  api_id    = aws_apigatewayv2_api.documents.id
+  route_key = "GET /documents/upload-url"
   target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
 }
 

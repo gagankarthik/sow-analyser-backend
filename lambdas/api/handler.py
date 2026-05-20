@@ -3,6 +3,7 @@
 Routes
 ------
 GET    /documents                         → list all documents for tenant
+GET    /documents/upload-url              → generate a presigned S3 PUT URL
 GET    /documents/{docId}                 → get document + all versions
 DELETE /documents/{docId}                 → delete all document data
 DELETE /documents/{docId}/versions/{n}   → delete version n, rollback to n-1
@@ -15,11 +16,14 @@ All responses are JSON with CORS headers.
 from __future__ import annotations
 
 import json
+import os
 import re
+import uuid
 from decimal import Decimal
 from typing import Any
 
 from aws_lambda_powertools import Tracer
+from shared.aws import s3_client
 from shared.dynamodb import (
     delete_doc_entirely,
     delete_doc_version,
@@ -29,6 +33,9 @@ from shared.dynamodb import (
 )
 from shared.logger import get_logger
 from shared.s3 import object_exists
+
+# The API Lambda role needs s3:PutObject on the raw bucket to sign presigned
+# PUT URLs on behalf of callers.  See aws_iam_role_policy.api in lambda.tf.
 
 log = get_logger("blue-iq.api")
 tracer = Tracer(service="blue-iq.api")
@@ -75,6 +82,10 @@ def _route(method: str, path: str, event: dict, tenant_id: str) -> dict[str, Any
     if method == "GET" and re.fullmatch(r"/documents/?", path):
         return _list_documents(tenant_id)
 
+    # GET /documents/upload-url  — must come before the /{docId} wildcard
+    if method == "GET" and re.fullmatch(r"/documents/upload-url/?", path):
+        return _get_upload_url(event, tenant_id)
+
     # GET /documents/{docId}
     m = re.fullmatch(r"/documents/([^/]+)/?", path)
     if method == "GET" and m:
@@ -101,6 +112,38 @@ def _route(method: str, path: str, event: dict, tenant_id: str) -> dict[str, Any
 def _list_documents(tenant_id: str) -> dict[str, Any]:
     docs = list_tenant_docs(tenant_id)
     return _ok({"documents": [_clean(d) for d in docs], "count": len(docs)})
+
+
+_VALID_DOC_TYPES = {"SOW", "MSA", "AMENDMENT", "NDA", "OTHER"}
+
+
+def _get_upload_url(event: dict, tenant_id: str) -> dict[str, Any]:
+    """Return a presigned S3 PUT URL so the client can upload a document directly."""
+    qs = event.get("queryStringParameters") or {}
+    filename = qs.get("filename", "").strip()
+    if not filename:
+        return _err(400, "Missing required query parameter: filename")
+
+    doc_type = qs.get("docType", "OTHER").strip().upper()
+    if doc_type not in _VALID_DOC_TYPES:
+        return _err(400, f"Invalid docType '{doc_type}'. Must be one of: {', '.join(sorted(_VALID_DOC_TYPES))}")
+
+    raw_bucket = os.environ.get("RAW_BUCKET", "")
+    if not raw_bucket:
+        log.error("api.upload_url.missing_bucket")
+        return _err(500, "Server misconfiguration: RAW_BUCKET not set")
+
+    doc_id = str(uuid.uuid4())
+    key = f"tenants/{tenant_id}/uploads/{doc_id}/{filename}"
+
+    upload_url = s3_client().generate_presigned_url(
+        "put_object",
+        Params={"Bucket": raw_bucket, "Key": key, "ContentType": "application/octet-stream"},
+        ExpiresIn=300,
+    )
+
+    log.info("api.upload_url_generated", docId=doc_id, key=key, docType=doc_type)
+    return _ok({"uploadUrl": upload_url, "key": key, "docId": doc_id})
 
 
 def _get_document(doc_id: str, tenant_id: str) -> dict[str, Any]:
