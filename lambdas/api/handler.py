@@ -29,6 +29,7 @@ from shared.dynamodb import (
     delete_doc_version,
     get_doc_meta,
     list_tenant_docs,
+    put_doc_meta,
     query_doc_versions,
 )
 from shared.logger import get_logger
@@ -155,6 +156,32 @@ def _get_upload_url(event: dict, tenant_id: str) -> dict[str, Any]:
         Params={"Bucket": raw_bucket, "Key": key},
         ExpiresIn=300,
     )
+
+    # Create a PENDING metadata row immediately so the document is visible in
+    # the UI the moment it's uploaded. The ingestion pipeline otherwise only
+    # writes the document row at its final persist stage (~90s later), which
+    # made GET /documents/{docId} return 404 during processing. The persist
+    # stage upserts over this row with the fully extracted data.
+    title = filename.rsplit(".", 1)[0] or filename
+    try:
+        put_doc_meta({
+            "docId": doc_id,
+            "tenantId": tenant_id,
+            "title": title,
+            "docType": doc_type,
+            "lifecycle": "draft",
+            "status": "PENDING",
+            "parties": [],
+            "effectiveDate": None,
+            "parentDocId": None,
+            "rawKey": key,
+            "processedPrefix": "",
+            "structuralHash": "",
+            "checksum": "",
+            "latestVersion": 0,
+        })
+    except Exception:  # noqa: BLE001 — metadata write must never block the upload
+        log.exception("api.upload_url.meta_write_failed", docId=doc_id)
 
     log.info("api.upload_url_generated", docId=doc_id, key=key, docType=doc_type)
     return _ok({"uploadUrl": upload_url, "key": key, "docId": doc_id})
