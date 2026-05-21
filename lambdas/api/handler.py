@@ -37,6 +37,8 @@ from shared.dynamodb import (
     update_doc_fields,
 )
 from shared.logger import get_logger
+from shared.s3 import presign_get
+from shared.schema import now_iso
 
 log = get_logger("blue-iq.api")
 tracer = Tracer(service="blue-iq.api")
@@ -96,6 +98,16 @@ def _route(method: str, path: str, event: dict[str, Any], tenant_id: str) -> dic
     m = re.fullmatch(r"/documents/([^/]+)/classification/?", path)
     if method == "GET" and m:
         return _get_doc_classification(m.group(1), tenant_id)
+
+    # GET /documents/{docId}/file → presigned URL to the original upload
+    m = re.fullmatch(r"/documents/([^/]+)/file/?", path)
+    if method == "GET" and m:
+        return _get_doc_file(m.group(1), tenant_id)
+
+    # POST /documents/{docId}/reprocess → re-run the pipeline on the stored upload
+    m = re.fullmatch(r"/documents/([^/]+)/reprocess/?", path)
+    if method == "POST" and m:
+        return _reprocess_document(m.group(1), tenant_id)
 
     # GET /documents/{docId}/diff
     m = re.fullmatch(r"/documents/([^/]+)/diff/?", path)
@@ -211,6 +223,65 @@ def _get_document(doc_id: str, tenant_id: str) -> dict[str, Any]:
     return _ok({"document": _clean(meta), "versions": versions})
 
 
+def _content_type(name: str) -> str:
+    n = name.lower()
+    if n.endswith(".pdf"):  return "application/pdf"
+    if n.endswith(".docx"): return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    if n.endswith(".doc"):  return "application/msword"
+    if n.endswith(".txt"):  return "text/plain"
+    return "application/octet-stream"
+
+
+def _get_doc_file(doc_id: str, tenant_id: str) -> dict[str, Any]:
+    """Return a short-lived presigned URL to the original uploaded file so the
+    UI can render it (PDF inline, DOCX via client-side conversion)."""
+    meta = get_doc_meta(doc_id)
+    if not meta or meta.get("tenantId") != tenant_id:
+        return _err(404, "Document not found")
+    raw_key = meta.get("rawKey")
+    if not raw_key:
+        return _err(404, "Original file is not available for this document")
+    raw_bucket = os.environ.get("RAW_BUCKET", "")
+    if not raw_bucket:
+        return _err(500, "Server misconfiguration: RAW_BUCKET not set")
+    filename = raw_key.rsplit("/", 1)[-1]
+    url = presign_get(raw_bucket, raw_key, expires_seconds=900)
+    return _ok({"url": url, "filename": filename, "contentType": _content_type(filename)})
+
+
+def _reprocess_document(doc_id: str, tenant_id: str) -> dict[str, Any]:
+    """Re-run the ingestion pipeline on the stored upload.
+
+    Re-writes the raw object in place (MetadataDirective=REPLACE), which fires the
+    same S3 'Object Created' EventBridge rule that starts a Step Functions
+    execution for a fresh upload — no separate pipeline-invoke permission needed.
+    """
+    meta = get_doc_meta(doc_id)
+    if not meta or meta.get("tenantId") != tenant_id:
+        return _err(404, "Document not found")
+    raw_key    = meta.get("rawKey")
+    raw_bucket = os.environ.get("RAW_BUCKET", "")
+    if not raw_key or not raw_bucket:
+        return _err(409, "Original upload is no longer available to re-analyze")
+
+    try:
+        s3_client().copy_object(
+            Bucket=raw_bucket,
+            Key=raw_key,
+            CopySource={"Bucket": raw_bucket, "Key": raw_key},
+            MetadataDirective="REPLACE",
+            Metadata={"reprocessedat": now_iso()},
+            ContentType=_content_type(raw_key),
+        )
+    except Exception as exc:
+        log.exception("api.reprocess_failed", docId=doc_id, error=str(exc))
+        return _err(500, "Failed to re-trigger analysis")
+
+    update_doc_fields(doc_id, {"status": "PENDING"})
+    log.info("api.reprocess_triggered", docId=doc_id)
+    return _ok({"reprocessing": True, "docId": doc_id})
+
+
 def _update_document(doc_id: str, tenant_id: str, event: dict[str, Any]) -> dict[str, Any]:
     meta = get_doc_meta(doc_id)
     if not meta or meta.get("tenantId") != tenant_id:
@@ -287,9 +358,44 @@ def _delete_document(doc_id: str, tenant_id: str) -> dict[str, Any]:
     if not meta or meta.get("tenantId") != tenant_id:
         return _err(404, "Document not found")
 
+    # Tear down ALL storage for this document, not just the DynamoDB rows:
+    #   - the original upload in the raw bucket
+    #   - every processed artefact (parsed/classification/diff/timeline JSON)
+    #   - the clause vectors + text in the OpenSearch index
+    # Each is best-effort so a single failure can't strip-mine the others or
+    # leave the document un-deletable; the DynamoDB rows are removed last.
+    _purge_storage(doc_id, meta)
+
     delete_doc_entirely(doc_id)
     log.info("api.document_deleted", docId=doc_id)
     return _ok({"deleted": True, "docId": doc_id})
+
+
+def _purge_storage(doc_id: str, meta: dict[str, Any]) -> None:
+    raw_bucket       = os.environ.get("RAW_BUCKET", "")
+    processed_bucket = os.environ.get("PROCESSED_BUCKET", "")
+    raw_key          = meta.get("rawKey")
+    processed_prefix = meta.get("processedPrefix") or f"{meta.get('tenantId', '')}/{doc_id}/"
+
+    from shared.s3 import delete_object, delete_prefix
+
+    if raw_bucket and raw_key:
+        try:
+            delete_object(raw_bucket, raw_key)
+        except Exception as exc:
+            log.warning("api.delete.raw_failed", docId=doc_id, error=str(exc))
+
+    if processed_bucket and processed_prefix:
+        try:
+            delete_prefix(processed_bucket, processed_prefix)
+        except Exception as exc:
+            log.warning("api.delete.processed_failed", docId=doc_id, error=str(exc))
+
+    try:
+        from shared.opensearch import delete_doc as os_delete_doc
+        os_delete_doc(doc_id)
+    except Exception as exc:
+        log.warning("api.delete.opensearch_failed", docId=doc_id, error=str(exc))
 
 
 def _get_doc_classification(doc_id: str, tenant_id: str) -> dict[str, Any]:

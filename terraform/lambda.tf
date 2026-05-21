@@ -133,17 +133,31 @@ resource "aws_iam_role_policy" "api" {
         Resource = [aws_dynamodb_table.main.arn, "${aws_dynamodb_table.main.arn}/index/*"]
       },
       {
-        # Required so the Lambda can sign presigned PUT URLs for GET /documents/upload-url
-        Sid      = "RawBucketPresignedPut"
+        # PutObject    → sign presigned PUT URLs for GET /documents/upload-url, and
+        #                re-write the object in place for POST .../reprocess.
+        # GetObject    → sign presigned GET URLs for GET .../file and serve as the
+        #                copy source when re-firing the pipeline on reprocess.
+        # DeleteObject → remove the original upload on DELETE /documents/{docId}.
+        Sid      = "RawBucketReadWrite"
         Effect   = "Allow"
-        Action   = ["s3:PutObject"]
+        Action   = ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"]
         Resource = "${aws_s3_bucket.raw.arn}/*"
       },
       {
-        Sid      = "ProcessedBucketRead"
+        # GetObject    → read processed artefacts (classification/diff/timeline).
+        # DeleteObject → purge every processed artefact on document delete.
+        Sid      = "ProcessedBucketReadDelete"
         Effect   = "Allow"
-        Action   = ["s3:GetObject"]
+        Action   = ["s3:GetObject", "s3:DeleteObject"]
         Resource = "${aws_s3_bucket.processed.arn}/*"
+      },
+      {
+        # ListBucket → enumerate the document's processed prefix so delete can
+        #              remove every artefact under tenants/<tenant>/<docId>/.
+        Sid      = "ProcessedBucketList"
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = aws_s3_bucket.processed.arn
       },
     ]
   })
@@ -266,6 +280,26 @@ resource "aws_apigatewayv2_route" "get_diff" {
 resource "aws_apigatewayv2_route" "get_timeline" {
   api_id    = aws_apigatewayv2_api.documents.id
   route_key = "GET /documents/{docId}/timeline"
+  target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
+}
+
+# Presigned URL to the original uploaded file (for the split-screen viewer).
+resource "aws_apigatewayv2_route" "get_file" {
+  api_id    = aws_apigatewayv2_api.documents.id
+  route_key = "GET /documents/{docId}/file"
+  target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
+}
+
+# Re-run the analysis pipeline on the stored upload.
+resource "aws_apigatewayv2_route" "post_reprocess" {
+  api_id    = aws_apigatewayv2_api.documents.id
+  route_key = "POST /documents/{docId}/reprocess"
   target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
 
   authorization_type = "JWT"

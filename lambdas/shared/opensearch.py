@@ -202,6 +202,36 @@ def bulk_index(actions: Iterable[dict[str, Any]]) -> tuple[int, list[dict]]:
 
 
 # ---------------------------------------------------------------------------
+# Deletion
+# ---------------------------------------------------------------------------
+
+
+def delete_doc(doc_id: str) -> int:
+    """Remove every indexed clause (vector + text) for a document.
+
+    Best-effort: returns the number of documents deleted across both indices.
+    A missing index or unconfigured OpenSearch is logged, not raised, so a
+    document delete never fails just because its search index is already gone.
+    """
+    deleted = 0
+    c = client()
+    for index in (settings.clause_vector_index, settings.clause_text_index):
+        try:
+            resp = c.delete_by_query(
+                index=index,
+                body={"query": {"term": {"docId": doc_id}}},
+                refresh=True,
+                conflicts="proceed",
+                ignore_unavailable=True,
+            )
+            deleted += int(resp.get("deleted", 0))
+        except Exception as exc:  # pragma: no cover - best effort
+            log.warning("opensearch.delete_doc_failed", index=index, docId=doc_id, error=str(exc))
+    log.info("opensearch.delete_doc", docId=doc_id, deleted=deleted)
+    return deleted
+
+
+# ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
 

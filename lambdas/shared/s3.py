@@ -79,6 +79,33 @@ def presign_put(
     )
 
 
+def delete_object(bucket: str, key: str) -> None:
+    if not key:
+        return
+    log.debug("s3.delete_object", bucket=bucket, key=key)
+    s3_client().delete_object(Bucket=bucket, Key=key)
+
+
+def delete_prefix(bucket: str, prefix: str) -> int:
+    """Delete every object under `prefix`. Returns the number deleted."""
+    if not prefix:
+        return 0
+    s3 = s3_client()
+    deleted = 0
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        contents = page.get("Contents") or []
+        if not contents:
+            continue
+        s3.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": [{"Key": o["Key"]} for o in contents]},
+        )
+        deleted += len(contents)
+    log.debug("s3.delete_prefix", bucket=bucket, prefix=prefix, deleted=deleted)
+    return deleted
+
+
 def processed_key(tenant_id: str, doc_id: str, filename: str) -> str:
     """Canonical S3 key layout for processed artefacts."""
     return f"{tenant_id}/{doc_id}/{filename}"

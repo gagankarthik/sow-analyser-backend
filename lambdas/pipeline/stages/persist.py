@@ -66,6 +66,14 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
     high_risk      = risk_counts["high"] + risk_counts["critical"]
     overall_risk   = _overall_risk(risk_counts)
 
+    # Commercials — surface the validated headline figures so the document list
+    # and portfolio dashboard can show value/terms without fetching each
+    # document's classification.json.
+    commercials    = classification.get("commercials") or {}
+    amendment      = classification.get("amendment") or {}
+    validation     = classification.get("validation") or {}
+    identification = classification.get("identification") or {}
+
     put_doc_meta({
         "docId":           doc_id,
         "tenantId":        tenant_id,
@@ -89,6 +97,15 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
         "findingsCount":   len(findings),
         "overallRisk":     overall_risk,
         "riskCounts":      risk_counts,
+        # Commercial aggregates (validated; cheap to read in list/dashboard views)
+        "contractValue":   commercials.get("totalContractValue"),
+        "baseValue":       commercials.get("baseValue"),
+        "valueDelta":      amendment.get("valueDelta"),
+        "currency":        commercials.get("currency"),
+        "pricingModel":    commercials.get("pricingModel"),
+        "paymentTerms":    commercials.get("paymentTerms"),
+        "reconciled":      validation.get("reconciled"),
+        "parentReference": identification.get("parentReference"),
     })
 
     put_version({
