@@ -340,18 +340,24 @@ document text. If a figure the first model produced does not actually appear in 
 text, drop or correct it and note it in `issues`.
 
 Rules:
-- baseValue: the original/base contract or SOW fee. For an AMENDMENT, baseValue is
-  null unless the amendment restates the original.
-- totalContractValue: the document's stated total / not-to-exceed / new total.
+- baseValue: the original/base contract or SOW fee (e.g. "Original Website SOW:
+  $7,500" → 7500). For a pure AMENDMENT, baseValue is null unless it restates the
+  original.
+- totalContractValue: the document's stated CURRENT/NEW total. A phrase like
+  "New Total Project Cost: $12,300", "Total Project Cost", "Total Contract Value",
+  or "not-to-exceed" IS this value — capture it verbatim, never compute it. When a
+  document lists an original fee PLUS amendment amounts AND a new total, set
+  baseValue = the original fee and totalContractValue = the stated new total.
 - amendmentDelta: for an AMENDMENT only, the net amount it adds or removes (a
-  reduction is negative); null for a base SOW/MSA.
+  reduction is negative); null for a base SOW/MSA. e.g. "Amendment #1 (ATS
+  Integration): $3,000" → 3000.
 - newTotalValue: an amendment's restated total, if stated.
 - lineItems: list EVERY distinct monetary figure in the document with its label and
-  verbatim source.
-- reconciled: set true only if the numbers are internally consistent — e.g. for an
-  amendment, base + amendmentDelta == newTotalValue (within $1 rounding), or for a
-  SOW the line items sum to the stated total. If they do NOT reconcile, set false
-  and explain the discrepancy in `issues`.
+  verbatim source (the original fee and each amendment amount are separate items).
+- reconciled: set true only if the numbers are internally consistent —
+  baseValue + Σ(amendment amounts) == totalContractValue / newTotalValue (within $1
+  rounding). For the example above: 7500 + 3000 + 1800 == 12300 → reconciled true.
+  If they do NOT add up, set false and explain the discrepancy in `issues`.
 - confidence: high/medium/low based on how clearly the figures appear in the text.
 Return ONLY JSON conforming to the schema.
 """
