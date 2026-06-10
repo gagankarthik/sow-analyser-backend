@@ -8,6 +8,8 @@ GET    /documents/{docId}               get document metadata + version list
 PATCH  /documents/{docId}               update title / lifecycle / docType
 DELETE /documents/{docId}               delete all document data
 DELETE /documents/{docId}/versions/{n}  delete version n, rollback to n-1
+GET    /tenant/compliance               get enabled compliance packs (frameworks)
+POST   /tenant/compliance               set enabled compliance packs
 
 tenantId is read from the Cognito JWT claim first; the x-tenant-id header is
 accepted only as a fallback for local development.
@@ -33,14 +35,17 @@ from shared.aws import s3_client
 from shared.dynamodb import (
     delete_doc_entirely,
     delete_doc_version,
+    get_compliance_packs,
     get_doc_meta,
     get_projects_state,
     list_tenant_docs,
+    put_compliance_packs,
     put_doc_meta,
     put_projects_state,
     query_doc_versions,
     update_doc_fields,
 )
+from shared.compliance import resolve_enabled_packs, KNOWN_PACK_IDS
 from shared.logger import get_logger
 from shared.opensearch import get_clause_vector, knn_search
 from shared.s3 import presign_get
@@ -97,6 +102,12 @@ def _route(method: str, path: str, event: dict[str, Any], tenant_id: str) -> dic
     if re.fullmatch(r"/projects/?", path):
         if method == "GET":  return _get_projects(tenant_id)
         if method == "POST": return _save_projects(event, tenant_id)
+        return _err(405, "Method not allowed")
+
+    # Per-tenant compliance-pack selection (which frameworks Sonar grades against).
+    if re.fullmatch(r"/tenant/compliance/?", path):
+        if method == "GET":  return _get_compliance(tenant_id)
+        if method == "POST": return _save_compliance(event, tenant_id)
         return _err(405, "Method not allowed")
 
     # POST /projects/{id}/invite — invite a user (Cognito) to a project
@@ -209,6 +220,36 @@ def _save_projects(event: dict[str, Any], tenant_id: str) -> dict[str, Any]:
         })
     put_projects_state(tenant_id, clean)
     return _ok({"projects": clean})
+
+
+# ---------------------------------------------------------------------------
+# Compliance packs — which regulatory frameworks Sonar grades documents against
+# ---------------------------------------------------------------------------
+
+
+def _get_compliance(tenant_id: str) -> dict[str, Any]:
+    saved = get_compliance_packs(tenant_id)
+    return _ok({
+        "packs":    resolve_enabled_packs(tenant_id),  # effective list (defaults if unset)
+        "explicit": saved is not None,                 # has the tenant chosen, or are these defaults?
+        "known":    KNOWN_PACK_IDS,
+    })
+
+
+def _save_compliance(event: dict[str, Any], tenant_id: str) -> dict[str, Any]:
+    raw_body = event.get("body") or ""
+    try:
+        body = json.loads(raw_body) if raw_body else {}
+    except json.JSONDecodeError:
+        return _err(400, "Invalid JSON body")
+    packs = body.get("packs") if isinstance(body, dict) else None
+    if not isinstance(packs, list):
+        return _err(400, "Body must be {\"packs\": [...] }")
+    # Keep only known ids, in canonical order — a client can't store junk.
+    wanted = {str(p) for p in packs}
+    clean = [pid for pid in KNOWN_PACK_IDS if pid in wanted]
+    put_compliance_packs(tenant_id, clean)
+    return _ok({"packs": clean})
 
 
 # ---------------------------------------------------------------------------

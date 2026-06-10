@@ -34,6 +34,7 @@ from shared.dynamodb import update_status
 from shared.logger import get_logger
 from shared.openai_client import OutputTruncatedError, chat_json
 from shared.playbook import evaluate_clauses
+from shared.compliance import evaluate_compliance
 from shared.s3 import processed_key, put_json
 from shared.text import detect_clause_headers, structural_hash, truncate_to_tokens
 
@@ -144,8 +145,11 @@ _SCHEMA: dict[str, Any] = _obj({
 
     # ── Timeline & milestones ────────────────────────────────────────────
     "timeline": _obj({
-        "startDate":  _nstr(),
-        "endDate":    _nstr(),
+        "startDate":         _nstr(),
+        "endDate":           _nstr(),  # the contract/term END date (expiry)
+        "renewalDate":       _nstr(),  # next renewal/anniversary date, if stated
+        "autoRenews":        _bool(),  # true if the term auto-renews / evergreen
+        "renewalNoticeDays": _nnum(),  # opt-out / non-renewal notice window, in days
         "phases":     _arr(_obj({"name": _str(), "start": _nstr(), "end": _nstr()})),
         "milestones": _arr(_obj({
             "name": _str(), "date": _nstr(), "payment": _nnum(), "source": _nstr(),
@@ -266,8 +270,17 @@ each party's dependencies.
 DELIVERABLES — one object each: name, description, due date, acceptance criteria,
 owner, and any associated value/milestone payment (number or null).
 
-TIMELINE — project start/end, phase breakdown with dates, and milestones (many
-are tied to payments — capture the payment amount and a verbatim source quote).
+TIMELINE — project/contract start and END (expiry) date, phase breakdown with
+dates, and milestones (many are tied to payments — capture the payment amount and
+a verbatim source quote). Also capture the renewal terms, which drive the
+obligations view:
+- endDate: the date the term/contract ENDS or expires (ISO 8601), or null.
+- renewalDate: the next renewal/anniversary date if one is stated or derivable
+  from the term (ISO 8601), else null.
+- autoRenews: true if the term automatically renews / is evergreen ("shall
+  automatically renew for successive periods unless…"), else false.
+- renewalNoticeDays: the non-renewal / opt-out notice window in days (convert
+  months → days), or null if not stated.
 
 COMMERCIALS — this drives every financial insight, extract it richly and precisely:
 - currency (USD/EUR/…), pricingModel (fixed / time_and_materials / milestone /
@@ -442,7 +455,9 @@ def _apply_defaults(result: dict[str, Any]) -> None:
     result.setdefault("personnel", [])
     result.setdefault("identification", {})
     result.setdefault("scope", {"inScope": [], "outOfScope": [], "assumptions": [], "dependencies": []})
-    result.setdefault("timeline", {"startDate": None, "endDate": None, "phases": [], "milestones": []})
+    result.setdefault("timeline", {"startDate": None, "endDate": None, "renewalDate": None,
+                                   "autoRenews": False, "renewalNoticeDays": None,
+                                   "phases": [], "milestones": []})
     result.setdefault("governance", {"cadence": None, "escalationPath": None, "reporting": None})
     result.setdefault("commercials", {})
     result.setdefault("amendment", {"amendmentType": "none", "changes": []})
@@ -502,6 +517,11 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
     # existing read API exposes it. (No separate Step Functions stage required.)
     result["playbook"] = evaluate_clauses(result["clauses"], tenant_id)
 
+    # ── Compliance packs — grade the document against the tenant's enabled
+    # frameworks (GDPR/HIPAA/SOC2/…). Deterministic: coverage is computed from the
+    # extracted clause categories + the playbook result above.
+    result["compliance"] = evaluate_compliance(result["clauses"], result["playbook"], tenant_id=tenant_id)
+
     result["structuralHash"] = structural_hash(result["clauses"])
 
     out_key = processed_key(tenant_id, doc_id, "classification.json")
@@ -512,7 +532,9 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
              findings=len(result["keyFindings"]),
              tcv=result.get("commercials", {}).get("totalContractValue"),
              reconciled=result["validation"].get("reconciled"),
-             playbookDeviations=result["playbook"].get("deviationCount"))
+             playbookDeviations=result["playbook"].get("deviationCount"),
+             complianceCoverage=result["compliance"].get("overallCoveragePct"),
+             complianceGaps=result["compliance"].get("totalGaps"))
 
     event["classification"] = result
     return event

@@ -74,6 +74,10 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
     validation     = classification.get("validation") or {}
     identification = classification.get("identification") or {}
     playbook       = classification.get("playbook") or {}
+    compliance     = classification.get("compliance") or {}
+    # The classification's own timeline block carries term/renewal dates (distinct
+    # from the timeline STAGE output, which is the key-date event list).
+    cls_timeline   = classification.get("timeline") or {}
 
     put_doc_meta({
         "docId":           doc_id,
@@ -84,6 +88,12 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
         "status":          ProcessingStatus.READY.value,
         "parties":         classification.get("parties", []),
         "effectiveDate":   classification.get("effectiveDate"),
+        # Term / renewal dates — power the obligations & renewals view without
+        # fetching each document's classification.json.
+        "termEndDate":       cls_timeline.get("endDate"),
+        "renewalDate":       cls_timeline.get("renewalDate"),
+        "autoRenews":        bool(cls_timeline.get("autoRenews", False)),
+        "renewalNoticeDays": cls_timeline.get("renewalNoticeDays"),
         "parentDocId":     lineage.get("parentDocId"),
         "rawKey":          raw_key,
         "processedPrefix": f"{tenant_id}/{doc_id}/",
@@ -111,6 +121,10 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
         "playbookDeviations":     playbook.get("deviationCount", 0),
         "playbookReviewCount":    playbook.get("reviewCount", 0),
         "playbookSeverity":       playbook.get("overallSeverity", "none"),
+        # Compliance-pack coverage aggregates (cheap to read in list/dashboard views)
+        "complianceCoveragePct":  compliance.get("overallCoveragePct"),
+        "complianceGaps":         compliance.get("totalGaps"),
+        "complianceFrameworks":   compliance.get("evaluated", []),
     })
 
     put_version({

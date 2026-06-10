@@ -290,6 +290,40 @@ def put_projects_state(tenant_id: str, projects: list[dict[str, Any]]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Compliance packs — per-tenant set of enabled regulatory frameworks. One item
+# per tenant (SK=COMPLIANCE); read by the classify stage to grade documents and
+# by the API so the settings UI is authoritative across browsers.
+# ---------------------------------------------------------------------------
+
+
+def get_compliance_packs(tenant_id: str) -> list[str] | None:
+    """Return the tenant's enabled compliance-pack ids, or None if never set.
+
+    None (no row) means "use system defaults"; an empty list means the tenant has
+    explicitly disabled every pack.
+    """
+    resp = _table().get_item(Key={"PK": f"TENANT#{tenant_id}", "SK": "COMPLIANCE"})
+    item = resp.get("Item")
+    if not item:
+        return None
+    packs = item.get("packs")
+    return [str(p) for p in packs] if isinstance(packs, list) else None
+
+
+def put_compliance_packs(tenant_id: str, packs: list[str]) -> None:
+    """Persist the tenant's enabled compliance packs (single per-tenant record)."""
+    _table().put_item(
+        Item={
+            "PK": f"TENANT#{tenant_id}",
+            "SK": "COMPLIANCE",
+            "entityType": "ComplianceConfig",
+            "packs": [str(p) for p in packs],
+            "updatedAt": now_iso(),
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
 # Version management — delete with rollback
 # ---------------------------------------------------------------------------
 
