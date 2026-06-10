@@ -81,5 +81,5 @@ variable "cognito_client_id" {
 variable "allowed_origins" {
   description = "Browser origins permitted by CORS. Add each deployed frontend origin."
   type        = list(string)
-  default     = ["http://localhost:3000"]
+  default     = ["http://localhost:3000", "https://govern.blue-iq.ai"]
 }

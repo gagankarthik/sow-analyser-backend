@@ -61,6 +61,12 @@ def appsync_client() -> Any:
     return session().client("appsync", config=_BOTO_CONFIG)
 
 
+@lru_cache(maxsize=None)
+def cognito_idp_client() -> Any:
+    """Cognito user-pool admin client — used to invite users to a tenant."""
+    return session().client("cognito-idp", config=_BOTO_CONFIG)
+
+
 def get_credentials():
     """Return boto3 frozen credentials (used by SigV4 signers e.g. OpenSearch)."""
     return session().get_credentials()

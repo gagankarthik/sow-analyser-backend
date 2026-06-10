@@ -15,7 +15,7 @@ from shared.config import settings
 from shared.dynamodb import get_cached_embedding, put_cached_embedding, update_status
 from shared.logger import get_logger
 from shared.openai_client import embed_texts
-from shared.opensearch import ensure_indices, index_clause_text, index_clause_vector
+from shared.opensearch import VECTOR_DIM, ensure_indices, index_clause_text, index_clause_vector
 from shared.text import sha256_hex
 
 log = get_logger("blue-iq.embed")
@@ -70,6 +70,15 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
         batch_texts = miss_texts[start : start + batch_size]
         batch_idxs  = miss_idxs[start : start + batch_size]
         vecs        = embed_texts(batch_texts, model=settings.embedding_model)
+        # Fail fast on a dimension mismatch. Otherwise every index_clause_vector
+        # below would fail as a non-fatal per-clause warning, leaving the document
+        # silently unsearchable (empty RAG / no parent matching).
+        if vecs and len(vecs[0]) != VECTOR_DIM:
+            raise ValueError(
+                f"Embedding model {settings.embedding_model} returned dimension "
+                f"{len(vecs[0])}, but the OpenSearch vector index expects {VECTOR_DIM}. "
+                f"Align EMBEDDING_MODEL with the index mapping (or recreate the index)."
+            )
         for idx, vec in zip(batch_idxs, vecs):
             new_vecs[idx] = vec
             h = hashes[idx]

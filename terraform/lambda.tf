@@ -106,6 +106,7 @@ resource "aws_lambda_function" "api" {
       DDB_TABLE_NAME               = aws_dynamodb_table.main.name
       RAW_BUCKET                   = aws_s3_bucket.raw.bucket
       PROCESSED_BUCKET             = aws_s3_bucket.processed.bucket
+      OPENSEARCH_ENDPOINT          = aws_opensearch_domain.main.endpoint
       LOG_LEVEL                    = "INFO"
       POWERTOOLS_SERVICE_NAME      = "${local.prefix}-api"
       POWERTOOLS_METRICS_NAMESPACE = local.prefix
@@ -286,6 +287,16 @@ resource "aws_apigatewayv2_route" "get_timeline" {
   authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
 }
 
+# Top-KNN similar clauses across the tenant's documents.
+resource "aws_apigatewayv2_route" "get_similar" {
+  api_id    = aws_apigatewayv2_api.documents.id
+  route_key = "GET /documents/{docId}/similar"
+  target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
+}
+
 # Presigned URL to the original uploaded file (for the split-screen viewer).
 resource "aws_apigatewayv2_route" "get_file" {
   api_id    = aws_apigatewayv2_api.documents.id
@@ -300,6 +311,25 @@ resource "aws_apigatewayv2_route" "get_file" {
 resource "aws_apigatewayv2_route" "post_reprocess" {
   api_id    = aws_apigatewayv2_api.documents.id
   route_key = "POST /documents/{docId}/reprocess"
+  target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
+}
+
+# Per-tenant project groupings (cloud storage; replaces browser localStorage).
+resource "aws_apigatewayv2_route" "get_projects" {
+  api_id    = aws_apigatewayv2_api.documents.id
+  route_key = "GET /projects"
+  target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
+}
+
+resource "aws_apigatewayv2_route" "save_projects" {
+  api_id    = aws_apigatewayv2_api.documents.id
+  route_key = "POST /projects"
   target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
 
   authorization_type = "JWT"

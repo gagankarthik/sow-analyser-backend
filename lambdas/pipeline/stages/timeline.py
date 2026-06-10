@@ -20,6 +20,11 @@ from shared.s3 import get_json, processed_key, put_json
 
 log = get_logger("blue-iq.timeline")
 
+# Lifecycles that mean the amendment has been executed and is in force — it
+# belongs in `currentState`. Everything else (draft/review/negotiation/approval)
+# is still pending and only contributes to `futureState`.
+_IN_FORCE_LIFECYCLES = {"signed", "active", "renewal", "expired"}
+
 
 # ---------------------------------------------------------------------------
 # Stage entry point
@@ -64,9 +69,9 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
     has_pending   = False
 
     for amd in chain_docs:
-        is_active = (amd.get("lifecycle") or "").lower() == "active"
-        changes   = _changes_for(amd["docId"], doc_id, event)
-        if is_active:
+        in_force = (amd.get("lifecycle") or "").lower() in _IN_FORCE_LIFECYCLES
+        changes  = _changes_for(amd["docId"], doc_id, event)
+        if in_force:
             _apply(current_state, changes)
             _apply(future_state, changes)
         else:

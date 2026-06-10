@@ -19,8 +19,10 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.venv_test/
 venv/
 .python-version
+.pytest_cache/
 
 # Lambda packaging
 lambdas/**/package/

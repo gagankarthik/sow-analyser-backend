@@ -3,10 +3,15 @@
 Only applicable to AMENDMENT documents. For all other types, lineage is skipped
 and the stage exits immediately — the pipeline continues without a parent link.
 
-Matching uses a combined score across three signals:
-  - hybrid (vector + BM25) search in OpenSearch  (weight 0.60)
-  - structural hash prefix match                  (weight 0.25)
-  - title similarity                              (weight 0.15)
+Matching uses a combined score across four signals:
+  - explicit parent reference named in the amendment (weight 0.25)
+  - hybrid (vector + BM25) search in OpenSearch       (weight 0.45)
+  - structural hash prefix match                      (weight 0.18)
+  - title similarity                                  (weight 0.12)
+
+The parent reference (e.g. "pursuant to SOW-2024-001") is the most reliable
+signal when present, so we search for it directly rather than leaning only on
+fuzzy clause similarity.
 """
 from __future__ import annotations
 
@@ -21,9 +26,10 @@ from shared.text import title_similarity
 
 log = get_logger("blue-iq.graph")
 
-_W_HYBRID     = 0.60
-_W_STRUCTURAL = 0.25
-_W_TITLE      = 0.15
+_W_REFERENCE  = 0.25
+_W_HYBRID     = 0.45
+_W_STRUCTURAL = 0.18
+_W_TITLE      = 0.12
 
 
 def run(event: dict[str, Any]) -> dict[str, Any]:
@@ -78,9 +84,11 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
 def _find_parent(
     *, doc_id: str, tenant_id: str, classification: dict[str, Any]
 ) -> tuple[str | None, float, str]:
-    clauses    = classification.get("clauses") or []
-    title      = classification.get("title", "")
-    structural = (classification.get("structuralHash") or "")[:8]
+    clauses        = classification.get("clauses") or []
+    title          = classification.get("title", "")
+    structural     = (classification.get("structuralHash") or "")[:8]
+    identification = classification.get("identification") or {}
+    parent_ref     = (identification.get("parentReference") or "").strip()
 
     if not clauses:
         return None, 0.0, "no clauses to match"
@@ -120,6 +128,24 @@ def _find_parent(
         except Exception as exc:
             log.warning("graph.structural_search_failed", error=str(exc))
 
+    # Explicit parent reference. When the amendment names its parent, search for
+    # that reference directly and normalise the BM25 scores to [0, 1].
+    reference_scores: dict[str, float] = {}
+    if parent_ref:
+        try:
+            ref_hits = bm25_search(
+                text=parent_ref, tenant_id=tenant_id, k=10,
+                doc_types=["SOW", "MSA"], exclude_doc_id=doc_id,
+            )
+            top = max((h.get("_score", 0.0) for h in ref_hits), default=0.0)
+            if top > 0:
+                for h in ref_hits:
+                    if did := h.get("_source", {}).get("docId"):
+                        normed = h.get("_score", 0.0) / top
+                        reference_scores[did] = max(reference_scores.get(did, 0.0), normed)
+        except Exception as exc:
+            log.warning("graph.reference_search_failed", error=str(exc))
+
     # Combine signals.
     candidates: dict[str, dict[str, float]] = {}
     for h in hybrid_hits:
@@ -127,19 +153,29 @@ def _find_parent(
             candidates.setdefault(did, {})["hybrid"] = float(h.get("score", 0.0))
     for did in structural_ids:
         candidates.setdefault(did, {})["structural"] = 1.0
+    for did, ref_score in reference_scores.items():
+        candidates.setdefault(did, {})["reference"] = ref_score
 
     best: tuple[str | None, float, str] = (None, 0.0, "")
     for did, signals in candidates.items():
         meta         = get_doc_meta(did) or {}
         parent_title = meta.get("title", "")
         signals["title"] = title_similarity(title, parent_title) if parent_title else 0.0
+        # Fold a direct reference↔title comparison into the reference signal so a
+        # named parent still scores even if BM25 keyword recall missed it.
+        if parent_ref and parent_title:
+            signals["reference"] = max(
+                signals.get("reference", 0.0), title_similarity(parent_ref, parent_title)
+            )
 
         score = (
-            _W_HYBRID     * signals.get("hybrid", 0.0)
+            _W_REFERENCE  * signals.get("reference", 0.0)
+            + _W_HYBRID     * signals.get("hybrid", 0.0)
             + _W_STRUCTURAL * signals.get("structural", 0.0)
             + _W_TITLE      * signals.get("title", 0.0)
         )
         parts: list[str] = []
+        if signals.get("reference"):   parts.append(f"parent-ref={signals['reference']:.2f}")
         if signals.get("hybrid"):      parts.append(f"hybrid={signals['hybrid']:.2f}")
         if signals.get("structural"):  parts.append("structural-hash")
         if signals.get("title"):       parts.append(f"title-sim={signals['title']:.2f}")

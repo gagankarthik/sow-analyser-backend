@@ -14,6 +14,7 @@ All items carry `entityType` so a GSI on it can power admin queries.
 """
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from typing import Any, Iterable
 
@@ -249,6 +250,43 @@ def list_tenant_docs(tenant_id: str, limit: int = 200) -> list[dict[str, Any]]:
         {k: v for k, v in item.items() if not k.startswith("GSI") and k not in ("PK", "SK", "entityType")}
         for item in items
     ]
+
+
+# ---------------------------------------------------------------------------
+# Projects state — per-tenant project groupings (cloud-stored, replaces the
+# old browser-localStorage projects). One item per tenant. No GSI keys, so it
+# never shows up in `list_tenant_docs`. Stored as a JSON string to sidestep
+# DynamoDB's number/empty-value quirks for the nested project list.
+# ---------------------------------------------------------------------------
+
+
+def get_projects_state(tenant_id: str) -> list[dict[str, Any]]:
+    """Return the tenant's saved projects (list of {id,name,client?,createdAt,docIds})."""
+    resp = _table().get_item(Key={"PK": f"TENANT#{tenant_id}", "SK": "PROJECTS"})
+    item = resp.get("Item")
+    if not item:
+        return []
+    raw = item.get("projects")
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return raw if isinstance(raw, list) else []
+
+
+def put_projects_state(tenant_id: str, projects: list[dict[str, Any]]) -> None:
+    """Persist the tenant's projects (overwrites the single per-tenant record)."""
+    _table().put_item(
+        Item={
+            "PK": f"TENANT#{tenant_id}",
+            "SK": "PROJECTS",
+            "entityType": "ProjectsState",
+            "projects": json.dumps(projects),
+            "updatedAt": now_iso(),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------

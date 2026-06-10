@@ -1,0 +1,17 @@
+# Test-only dependencies (pure-Python subset of the Lambda layer needed to
+# import and unit-test the pipeline stages without AWS / OpenAI network calls).
+#
+#   python -m venv .venv_test
+#   .venv_test\Scripts\python -m pip install -r tests/requirements.txt
+#   .venv_test\Scripts\python -m pytest tests/
+pytest==9.0.3
+orjson
+unidecode
+pydantic>=2.9
+boto3
+httpx
+tenacity
+aws-lambda-powertools
+# Tracer() in the api/pipeline handlers patches AWS X-Ray at import time, so the
+# SDK must be importable to unit-test those modules.
+aws-xray-sdk

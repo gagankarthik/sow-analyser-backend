@@ -1,7 +1,8 @@
-"""Stage 01 — Parse: extract raw text from DOCX or PDF.
+"""Stage 01 — Parse: extract raw text from DOCX, PDF, or plain text.
 
 Strategy:
   DOCX  → python-docx (direct)
+  TXT   → decode bytes (utf-8 with latin-1 fallback)
   PDF   → pdfplumber first (fast, native text)
         → Textract async fallback (scanned / image-only PDFs)
 
@@ -61,6 +62,9 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
     if ftype == "docx":
         extracted = _parse_docx(blob)
         method    = ExtractionMethod.DOCX
+    elif ftype == "txt":
+        extracted = _parse_txt(blob)
+        method    = ExtractionMethod.TEXT
     else:
         extracted = _try_pdfplumber(blob)
         if extracted and _has_content(extracted["pages"]):
@@ -102,6 +106,21 @@ def _parse_docx(data: bytes) -> dict[str, Any]:
             if cells:
                 paragraphs.append(" | ".join(cells))
     full = "\n".join(paragraphs)
+    return {"text": full, "pages": [{"page": 1, "text": full, "char_count": len(full)}]}
+
+
+# ---------------------------------------------------------------------------
+# Plain text
+# ---------------------------------------------------------------------------
+
+
+def _parse_txt(data: bytes) -> dict[str, Any]:
+    # UTF-8 is the common case; fall back to latin-1 (never raises) so a stray
+    # byte can't crash the parse stage on an otherwise-readable document.
+    try:
+        full = data.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        full = data.decode("latin-1", errors="replace").strip()
     return {"text": full, "pages": [{"page": 1, "text": full, "char_count": len(full)}]}
 
 
@@ -206,8 +225,15 @@ def _ids_from_key(raw_key: str, event: dict[str, Any]) -> tuple[str, str]:
 def _detect_type(filename: str, blob: bytes) -> str:
     name = filename.lower()
     head = blob[:8]
-    if name.endswith(".pdf") or head.startswith(_PDF_MAGIC) or _PDF_MAGIC in blob[:1024]:
+    # Magic bytes win over extension — a mislabelled file is classified by content.
+    if head.startswith(_PDF_MAGIC) or _PDF_MAGIC in blob[:1024]:
         return "pdf"
-    if name.endswith(".docx") or head.startswith(_DOCX_MAGIC):
+    if head.startswith(_DOCX_MAGIC):
         return "docx"
-    raise ValueError(f"Unsupported file type: {filename!r}. Supported: pdf, docx")
+    if name.endswith(".pdf"):
+        return "pdf"
+    if name.endswith(".docx"):
+        return "docx"
+    if name.endswith(".txt"):
+        return "txt"
+    raise ValueError(f"Unsupported file type: {filename!r}. Supported: pdf, docx, txt")

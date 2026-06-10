@@ -66,6 +66,12 @@ def client():
 # ---------------------------------------------------------------------------
 
 
+# Dimension of the clause vectors. Must match the output dimension of
+# settings.embedding_model (text-embedding-3-small = 1536). Exported so the
+# embed stage can fail fast if a misconfigured model returns a different size.
+VECTOR_DIM = 1536
+
+
 _VECTOR_MAPPING = {
     "settings": {"index": {"knn": True, "knn.algo_param.ef_search": 100}},
     "mappings": {
@@ -78,7 +84,7 @@ _VECTOR_MAPPING = {
             "text": {"type": "text"},
             "vector": {
                 "type": "knn_vector",
-                "dimension": 1536,
+                "dimension": VECTOR_DIM,
                 "method": {
                     "name": "hnsw",
                     "space_type": "cosinesimil",
@@ -158,6 +164,20 @@ def index_clause_vector(
         refresh=False,
     )
     return cid
+
+
+def get_clause_vector(doc_id: str, clause_number: str) -> list[float] | None:
+    """Fetch a clause's stored embedding vector (used to find similar clauses).
+    Returns None when the clause isn't indexed (older doc, not yet embedded) or
+    OpenSearch is unavailable — callers degrade to an empty result, never error."""
+    cid = _vector_doc_id(doc_id, clause_number)
+    try:
+        resp = client().get(index=settings.clause_vector_index, id=cid)
+    except Exception as exc:  # noqa: BLE001 — missing doc/index is non-fatal
+        log.info("opensearch.get_clause_vector_miss", id=cid, error=str(exc))
+        return None
+    vec = (resp.get("_source") or {}).get("vector")
+    return vec if isinstance(vec, list) and vec else None
 
 
 def index_clause_text(
@@ -365,7 +385,12 @@ def hybrid_search(
             return {}, {}
         scores = [h.get("_score", 0.0) for h in hits]
         lo, hi = min(scores), max(scores)
-        span = (hi - lo) or 1.0
+        span = hi - lo
+        # When every hit shares the same score (a single candidate, or a uniform
+        # result set), min-max scaling would map them all to 0.0 and silently
+        # drop an otherwise strong match. Treat that degenerate case as a tie at
+        # the top of the channel (1.0) instead.
+        degenerate = span <= 1e-9
         norm_scores: dict[str, float] = {}
         best_source: dict[str, dict] = {}
         for h in hits:
@@ -373,7 +398,7 @@ def hybrid_search(
             did = src.get("docId")
             if not did:
                 continue
-            normed = (h.get("_score", 0.0) - lo) / span
+            normed = 1.0 if degenerate else (h.get("_score", 0.0) - lo) / span
             # keep the highest-scoring clause per doc
             if did not in norm_scores or normed > norm_scores[did]:
                 norm_scores[did] = normed

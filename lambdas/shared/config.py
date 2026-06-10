@@ -38,6 +38,11 @@ class Settings:
     openai_api_key: str = field(default_factory=lambda: _env("OPENAI_API_KEY", ""))
     opensearch_endpoint: str = field(default_factory=lambda: _env("OPENSEARCH_ENDPOINT", ""))
 
+    # Cognito user pool — used to invite users to a tenant/project.
+    cognito_user_pool_id: str = field(
+        default_factory=lambda: _env("COGNITO_USER_POOL_ID") or _env("USER_POOL_ID", "")
+    )
+
     embedding_model: str = field(
         default_factory=lambda: _env("EMBEDDING_MODEL", "text-embedding-3-small")
     )
@@ -58,11 +63,29 @@ class Settings:
     classify_max_input_tokens: int = field(
         default_factory=lambda: int(_env("CLASSIFY_MAX_INPUT_TOKENS", "30000"))
     )
+    # Output budget for structured-output (JSON) chat calls. A full contract
+    # extraction with many verbatim clauses is large; too small a cap silently
+    # truncates the JSON and drops trailing clauses. gpt-4.1-mini supports up to
+    # 32k completion tokens — default high so long docs aren't cut off.
+    chat_max_output_tokens: int = field(
+        default_factory=lambda: int(_env("CHAT_MAX_OUTPUT_TOKENS", "16000"))
+    )
+    # Upper output budget used on a one-shot retry when the first extraction
+    # truncated on `length`. gpt-4.1-mini caps completions at 32k tokens.
+    chat_max_output_tokens_max: int = field(
+        default_factory=lambda: int(_env("CHAT_MAX_OUTPUT_TOKENS_MAX", "32000"))
+    )
     diff_impact_call_cap: int = field(
         default_factory=lambda: int(_env("DIFF_IMPACT_CALL_CAP", "10"))
     )
+    # Combined match score floor for linking an amendment to its parent. The four
+    # signal weights (reference 0.25 / hybrid 0.45 / structural 0.18 / title 0.12)
+    # rarely all fire together, so a 0.7 floor rejected legitimate parents (e.g. a
+    # named, title-matching parent with good hybrid recall but a different clause
+    # structure scores ~0.59). 0.5 requires real evidence without demanding
+    # near-universal agreement across every signal.
     parent_match_min_confidence: float = field(
-        default_factory=lambda: float(_env("PARENT_MATCH_MIN_CONFIDENCE", "0.7"))
+        default_factory=lambda: float(_env("PARENT_MATCH_MIN_CONFIDENCE", "0.5"))
     )
 
     log_level: str = field(default_factory=lambda: _env("LOG_LEVEL", "INFO"))

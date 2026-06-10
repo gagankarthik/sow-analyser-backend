@@ -42,6 +42,7 @@ class ExtractionMethod(str, Enum):
     PDFPLUMBER = "pdfplumber"
     TEXTRACT = "textract"
     DOCX = "docx"
+    TEXT = "text"
 
 
 class ProcessingStatus(str, Enum):

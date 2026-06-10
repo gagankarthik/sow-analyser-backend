@@ -125,6 +125,16 @@ def _log_usage(model: str, op: str, usage: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
+class OutputTruncatedError(RuntimeError):
+    """Raised when the model stopped because it hit the output token limit.
+
+    Silently parsing a length-truncated structured response would drop trailing
+    clauses (the document would be analysed with missing content). We raise so
+    the caller can retry with a larger budget instead of persisting a partial
+    extraction.
+    """
+
+
 @_RETRY
 def chat_json(
     *,
@@ -134,16 +144,23 @@ def chat_json(
     schema_name: str = "Output",
     model: str | None = None,
     temperature: float = 0.0,
+    max_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Structured-output chat completion. Returns a parsed dict.
 
     Uses OpenAI's strict JSON schema mode — the model is constrained to
     produce schema-valid output or raise BadRequestError.
+
+    A generous output budget is set so long documents (many clauses) are not
+    silently cut off; if the model still stops on ``length`` we raise
+    ``OutputTruncatedError`` rather than parsing a truncated JSON body and
+    dropping the trailing clauses.
     """
     mdl = model or settings.chat_model
     resp = openai_client().chat.completions.create(
         model=mdl,
         temperature=temperature,
+        max_tokens=max_tokens or settings.chat_max_output_tokens,
         response_format={
             "type": "json_schema",
             "json_schema": {"name": schema_name, "strict": True, "schema": json_schema},
@@ -154,7 +171,13 @@ def chat_json(
         ],
     )
     _log_usage(mdl, "chat.json", getattr(resp, "usage", None))
-    return orjson.loads(resp.choices[0].message.content or "{}")
+    choice = resp.choices[0]
+    if getattr(choice, "finish_reason", None) == "length":
+        raise OutputTruncatedError(
+            f"{schema_name}: model output hit the {max_tokens or settings.chat_max_output_tokens}-token "
+            "limit and was truncated — the result would be missing trailing content."
+        )
+    return orjson.loads(choice.message.content or "{}")
 
 
 @_RETRY

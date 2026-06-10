@@ -32,7 +32,8 @@ from typing import Any
 from shared.config import settings
 from shared.dynamodb import update_status
 from shared.logger import get_logger
-from shared.openai_client import chat_json
+from shared.openai_client import OutputTruncatedError, chat_json
+from shared.playbook import evaluate_clauses
 from shared.s3 import processed_key, put_json
 from shared.text import detect_clause_headers, structural_hash, truncate_to_tokens
 
@@ -47,7 +48,14 @@ _CLAUSE_CATEGORIES = [
     "Termination", "IP", "Liability", "Indemnity", "Warranty", "Confidentiality",
     "DataProtection", "Compliance", "ChangeControl", "Acceptance", "ForceMajeure",
     "DisputeResolution", "GoverningLaw", "Notices", "Assignment", "Subcontracting",
-    "Insurance", "Other",
+    "Insurance",
+    # ── Technology / software licensing ────────────────────────────────────
+    "LicenseGrant", "LicenseScope", "Restrictions", "Royalties", "Sublicensing",
+    "SourceCodeEscrow", "AuditRights", "OpenSource",
+    # ── Compliance / data-protection agreements (DPA / BAA / SOC 2 / VPAT) ─
+    "DataProcessing", "DataResidency", "SubProcessors", "BreachNotification",
+    "DataRetention", "SecurityControls", "Accessibility",
+    "Other",
 ]
 
 _RISK_LEVELS = ["low", "medium", "high", "critical"]
@@ -93,7 +101,7 @@ def _obj(props: dict[str, Any]) -> dict[str, Any]:
 
 _SCHEMA: dict[str, Any] = _obj({
     # ── Header / identification ──────────────────────────────────────────
-    "docType":       {"type": "string", "enum": ["SOW", "MSA", "AMENDMENT", "NDA", "OTHER"]},
+    "docType":       {"type": "string", "enum": ["SOW", "MSA", "AMENDMENT", "NDA", "LICENSE", "DPA", "BAA", "COMPLIANCE", "OTHER"]},
     "title":         _str(),
     "parties":       _arr(_str()),
     "effectiveDate": _nstr(),
@@ -227,7 +235,12 @@ Extract facts EXACTLY as written. NEVER invent, infer, round, or compute a numbe
 that is not in the text — use null when a value is absent.
 
 DOCUMENT-LEVEL
-- docType: SOW, MSA, AMENDMENT, NDA, or OTHER.
+- docType: SOW, MSA, AMENDMENT, NDA, LICENSE, DPA, BAA, COMPLIANCE, or OTHER.
+    · LICENSE — a technology/software licence agreement, EULA, or SaaS terms.
+    · DPA — a Data Processing Agreement (GDPR / data-protection addendum).
+    · BAA — a HIPAA Business Associate Agreement.
+    · COMPLIANCE — a compliance attestation or report (SOC 2, VPAT, ISO,
+      security/accessibility policy). Extract its stated scope and obligations.
 - lifecycle: draft/review/negotiation/approval/signed/active/renewal/expired. If
   unclear use "draft"; if a signature block is signed use "signed"/"active".
 - effectiveDate: ISO 8601 (YYYY-MM-DD) or null.
@@ -286,6 +299,25 @@ CLAUSES — split the document into numbered clauses. Each needs a number (e.g. 
   indemnification (mutual vs one-sided), IP ownership, auto-renewal (trigger +
   opt-out window), termination (convenience + notice), data protection, insurance.
 - summary: one plain-English sentence — what the clause does and why it matters.
+
+LICENSING & COMPLIANCE DOCUMENTS — when the document is a LICENSE, DPA, BAA, or
+COMPLIANCE attestation, extract its clauses using these categories in addition to
+the general ones, and risk-score them from the receiving party's perspective:
+- Licensing: LicenseGrant (what is licensed and on what basis — perpetual vs term,
+  exclusive vs non-exclusive), LicenseScope (territory, field of use, named users,
+  permitted environments), Restrictions (no reverse-engineering, no transfer, use
+  limits — high risk if broad), Royalties (licence fees, usage/true-up, escalation),
+  Sublicensing (whether and how rights may be passed on), SourceCodeEscrow,
+  AuditRights (the licensor's right to inspect usage — note frequency/notice),
+  OpenSource (any open-source components and their obligations).
+- Compliance: DataProcessing (roles as controller/processor, purpose, instructions),
+  DataResidency (where data is stored/processed), SubProcessors (named third
+  parties and approval/notice rights), BreachNotification (the notification window —
+  72 hours is the GDPR standard; longer is higher risk), DataRetention (how long
+  data is kept and deletion on termination), SecurityControls (encryption, access,
+  certifications referenced), Accessibility (WCAG/VPAT conformance level claimed).
+Treat uncapped audit rights, broad use restrictions, vague breach windows, and
+missing deletion/retention terms as elevated risk.
 
 AMENDMENT (fill the `amendment` object; for non-amendments set amendmentType="none",
 number=null, changes=[], everythingElseStays=false):
@@ -438,25 +470,37 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
     log.append_keys(docId=doc_id, tenantId=tenant_id)
     update_status(doc_id, "CLASSIFYING")
 
-    text    = truncate_to_tokens(parsed["text"],
+    full_text = parsed["text"]
+    text    = truncate_to_tokens(full_text,
                                   max_tokens=settings.classify_max_input_tokens,
                                   model=settings.chat_model)
-    headers = detect_clause_headers(parsed["text"])
+    input_truncated = len(text) < len(full_text)
+    headers = detect_clause_headers(full_text)
     hints   = [f"{n} {t}" for n, t, _ in headers[:50]]
 
-    result = chat_json(
-        system=_SYSTEM,
-        user=_user_prompt(text, hints),
-        json_schema=_SCHEMA,
-        schema_name="ContractIntelligence",
-        model=settings.chat_model,
-        temperature=0.0,
-    )
+    result = _classify_document(text, hints)
 
     _apply_defaults(result)
 
+    # If the input had to be truncated to fit the context window, the extraction
+    # may be missing middle-of-document content. Flag it honestly so the UI can
+    # route the document to human review rather than presenting it as complete.
+    if input_truncated:
+        conf = result.setdefault("confidence", {})
+        conf["overall"] = "low"
+        issues = conf.setdefault("issues", [])
+        issues.append(
+            "Document exceeded the analysis window and was truncated; some "
+            "middle-of-document clauses may not have been extracted."
+        )
+
     # ── Validation agent — reconcile the money against the document ──────
     result["validation"] = _validate(text, result)
+
+    # ── Playbook check — surface deviations from the firm's standard positions.
+    # Deterministic, runs server-side, persisted into classification.json so the
+    # existing read API exposes it. (No separate Step Functions stage required.)
+    result["playbook"] = evaluate_clauses(result["clauses"], tenant_id)
 
     result["structuralHash"] = structural_hash(result["clauses"])
 
@@ -467,10 +511,44 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
              clauses=len(result["clauses"]),
              findings=len(result["keyFindings"]),
              tcv=result.get("commercials", {}).get("totalContractValue"),
-             reconciled=result["validation"].get("reconciled"))
+             reconciled=result["validation"].get("reconciled"),
+             playbookDeviations=result["playbook"].get("deviationCount"))
 
     event["classification"] = result
     return event
+
+
+def _classify_document(text: str, hints: list[str]) -> dict[str, Any]:
+    """Run the extraction call, retrying once with a larger output budget if the
+    model truncated its JSON (which would drop trailing clauses).
+
+    A truncated structured response is NOT silently accepted: chat_json raises
+    OutputTruncatedError on finish_reason == "length". We retry once at the
+    model's max completion budget so a long contract with many clauses is fully
+    extracted; if it still truncates we re-raise so the pipeline fails loudly
+    rather than persisting a document that is missing content.
+    """
+    try:
+        return chat_json(
+            system=_SYSTEM,
+            user=_user_prompt(text, hints),
+            json_schema=_SCHEMA,
+            schema_name="ContractIntelligence",
+            model=settings.chat_model,
+            temperature=0.0,
+        )
+    except OutputTruncatedError:
+        log.warning("classify.output_truncated_retry",
+                    retryTokens=settings.chat_max_output_tokens_max)
+        return chat_json(
+            system=_SYSTEM,
+            user=_user_prompt(text, hints),
+            json_schema=_SCHEMA,
+            schema_name="ContractIntelligence",
+            model=settings.chat_model,
+            temperature=0.0,
+            max_tokens=settings.chat_max_output_tokens_max,
+        )
 
 
 def _validate(text: str, result: dict[str, Any]) -> dict[str, Any]:
@@ -510,13 +588,133 @@ def _validate(text: str, result: dict[str, Any]) -> dict[str, Any]:
         amendment["valueDelta"] = v["amendmentDelta"]
     if v.get("newTotalValue") is not None:
         amendment["newTotalValue"] = v["newTotalValue"]
+
+    # Persist provenance: prefer a line-item source for the total; this is the
+    # verbatim quote the dashboard shows so a value never appears without a source.
+    line_items = v.get("lineItems") or []
+    if not commercials.get("valueSource"):
+        src = _source_for_total(line_items, v.get("totalContractValue"))
+        if src:
+            commercials["valueSource"] = src
+
     result["commercials"] = commercials
     result["amendment"] = amendment
 
+    # ── Deterministic arithmetic reconciliation ─────────────────────────────
+    # Do NOT trust the model's `reconciled` flag blindly: re-check in code that
+    # base + Σ(line-item amounts) == stated total (within $1). This is the core
+    # money guarantee — an unreconciled or unverifiable figure is flagged, never
+    # presented as fact.
+    recon = _reconcile(
+        base_value=v.get("baseValue"),
+        total_value=v.get("totalContractValue"),
+        new_total=v.get("newTotalValue"),
+        amendment_delta=v.get("amendmentDelta"),
+        line_items=line_items,
+    )
+    issues = list(v.get("issues") or [])
+    if recon["computed"] and recon["reconciled"] is False:
+        issues.append(recon["explanation"])
+
     return {
-        "validated":   True,
-        "reconciled":  v.get("reconciled"),
-        "lineItems":   v.get("lineItems", []),
-        "issues":      v.get("issues", []),
-        "confidence":  v.get("confidence", "medium"),
+        "validated":         True,
+        # In-code arithmetic wins over the model's self-report when we could
+        # actually compute it; fall back to the model's flag otherwise.
+        "reconciled":        recon["reconciled"] if recon["computed"] else v.get("reconciled"),
+        "reconciledByMath":  recon["reconciled"] if recon["computed"] else None,
+        "reconciliation":    recon,
+        "lineItems":         line_items,
+        "valueSource":       commercials.get("valueSource"),
+        "issues":            issues,
+        "confidence":        v.get("confidence", "medium"),
+    }
+
+
+def _source_for_total(line_items: list[dict[str, Any]], total: float | None) -> str | None:
+    """Pick the verbatim source quote that best evidences the total value."""
+    if not line_items:
+        return None
+    if total is not None:
+        for li in line_items:
+            if li.get("amount") is not None and abs(float(li["amount"]) - float(total)) < 1.0:
+                return li.get("source") or None
+    # Otherwise the largest line item is the most likely headline figure.
+    best = max(
+        (li for li in line_items if li.get("amount") is not None),
+        key=lambda li: float(li["amount"]),
+        default=None,
+    )
+    return (best or {}).get("source") if best else None
+
+
+def _reconcile(
+    *,
+    base_value: float | None,
+    total_value: float | None,
+    new_total: float | None,
+    amendment_delta: float | None,
+    line_items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Recompute base + Σ(deltas) and compare to the stated total, in code.
+
+    Returns {computed, reconciled, expectedTotal, statedTotal, sumOfParts,
+    explanation}. ``computed`` is False when there isn't enough numeric evidence
+    to check (e.g. only a single figure with no parts) — in that case we don't
+    assert reconciliation either way.
+    """
+    stated = new_total if new_total is not None else total_value
+    amounts = [float(li["amount"]) for li in line_items if li.get("amount") is not None]
+
+    # The validator is asked to list the PARTS (original fee + each amendment).
+    # If it also lists the total itself as a line item, summing everything would
+    # double-count and produce a false mismatch — drop a single part that equals
+    # the stated total before summing.
+    if stated is not None:
+        for i, amt in enumerate(amounts):
+            if abs(amt - float(stated)) <= 1.0:
+                amounts.pop(i)
+                break
+
+    # Path A: we have itemised parts — their sum should equal the stated total.
+    if stated is not None and len(amounts) >= 2:
+        sum_parts = round(sum(amounts), 2)
+        reconciled = abs(sum_parts - float(stated)) <= 1.0
+        return {
+            "computed":     True,
+            "reconciled":   reconciled,
+            "expectedTotal": sum_parts,
+            "statedTotal":  float(stated),
+            "sumOfParts":   sum_parts,
+            "explanation":  (
+                "" if reconciled else
+                f"Line items sum to {sum_parts:g} but the stated total is {float(stated):g} "
+                f"(difference {abs(sum_parts - float(stated)):g}). Figures do not reconcile."
+            ),
+        }
+
+    # Path B: base + amendment delta should equal the stated total.
+    if stated is not None and base_value is not None and amendment_delta is not None:
+        expected = round(float(base_value) + float(amendment_delta), 2)
+        reconciled = abs(expected - float(stated)) <= 1.0
+        return {
+            "computed":     True,
+            "reconciled":   reconciled,
+            "expectedTotal": expected,
+            "statedTotal":  float(stated),
+            "sumOfParts":   expected,
+            "explanation":  (
+                "" if reconciled else
+                f"Base {float(base_value):g} + delta {float(amendment_delta):g} = {expected:g}, "
+                f"but the stated total is {float(stated):g}. Figures do not reconcile."
+            ),
+        }
+
+    # Not enough numeric evidence to check arithmetic deterministically.
+    return {
+        "computed":     False,
+        "reconciled":   None,
+        "expectedTotal": None,
+        "statedTotal":  float(stated) if stated is not None else None,
+        "sumOfParts":   None,
+        "explanation":  "",
     }

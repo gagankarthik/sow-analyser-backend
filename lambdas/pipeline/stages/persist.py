@@ -73,6 +73,7 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
     amendment      = classification.get("amendment") or {}
     validation     = classification.get("validation") or {}
     identification = classification.get("identification") or {}
+    playbook       = classification.get("playbook") or {}
 
     put_doc_meta({
         "docId":           doc_id,
@@ -106,6 +107,10 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
         "paymentTerms":    commercials.get("paymentTerms"),
         "reconciled":      validation.get("reconciled"),
         "parentReference": identification.get("parentReference"),
+        # Playbook deviation aggregates (cheap to read in list/dashboard views)
+        "playbookDeviations":     playbook.get("deviationCount", 0),
+        "playbookReviewCount":    playbook.get("reviewCount", 0),
+        "playbookSeverity":       playbook.get("overallSeverity", "none"),
     })
 
     put_version({
