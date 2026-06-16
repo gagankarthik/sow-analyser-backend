@@ -22,6 +22,14 @@ from botocore.awsrequest import AWSRequest
 
 from shared.aws import get_credentials
 from shared.config import settings
+from shared.guardrails import (
+    Redaction,
+    Redactor,
+    StreamRestorer,
+    assert_provider_allowed,
+    audit_send,
+    validate_output,
+)
 from shared.logger import get_logger
 from shared.openai_client import openai_client, embed_texts, chat_text
 from shared.opensearch import hybrid_search, clause_search
@@ -52,6 +60,27 @@ _TOKEN_MUTATION = """
     }
   }
 """
+
+
+def _redact(text: str) -> Redaction:
+    """Pseudonymise PII before the text leaves AWS (no-op if guardrails off)."""
+    if not settings.guardrails_enabled:
+        return Redaction(text=text)
+    return Redactor(classes=settings.redact_class_list()).redact(text)
+
+
+def _audit_rag(red: Redaction, **keys: Any) -> None:
+    """Record the redacted RAG send with per-class counts (best-effort)."""
+    try:
+        audit_send(
+            provider=assert_provider_allowed(settings.ai_provider),
+            op="rag.chat",
+            byte_count=len(red.text.encode("utf-8")),
+            redaction=red,
+            **keys,
+        )
+    except Exception:  # pragma: no cover - auditing must never break a call
+        pass
 
 
 @tracer.capture_lambda_handler
@@ -114,13 +143,20 @@ def _http_handle(event: dict[str, Any]) -> dict[str, Any]:
             "category": src.get("category", ""),
         })
 
+    user_msg = f"<context>\n{chr(10).join(context_blocks)}\n</context>\n\nQuestion: {question}"
+    red = _redact(user_msg)
+    _audit_rag(red, tenantId=tenant_id, docId=doc_id or "all", clauses=len(hits))
+
     answer = chat_text(
         system=_SYSTEM_PROMPT,
-        user=f"<context>\n{chr(10).join(context_blocks)}\n</context>\n\nQuestion: {question}",
+        user=red.text,
         model=settings.chat_model,
         temperature=0.2,
         max_tokens=600,
     )
+    # Restore the real values the provider never saw, then guardrail-check the reply.
+    answer = Redactor.restore(answer, red.mapping)
+    validate_output(answer, red.mapping)
     return _http_resp(200, {"answer": answer, "citations": citations})
 
 
@@ -162,18 +198,23 @@ def _handle(event: dict[str, Any]) -> dict[str, Any]:
     context_str = "\n\n---\n\n".join(context_blocks)
     user_msg    = f"<context>\n{context_str}\n</context>\n\nQuestion: {question}"
 
+    # Pseudonymise PII before the prompt leaves AWS; restore on the way out.
+    red = _redact(user_msg)
+    _audit_rag(red, tenantId=tenant_id, sessionId=session_id, clauses=len(hits))
+
     # Stream response.
     stream = openai_client().chat.completions.create(
         model=settings.chat_model,
         messages=[
             {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user",   "content": user_msg},
+            {"role": "user",   "content": red.text},
         ],
         stream=True,
         temperature=0.2,
         max_tokens=600,
     )
 
+    restorer        = StreamRestorer(red.mapping)
     buf: list[str]  = []
     full: list[str] = []
     last_flush      = time.monotonic()
@@ -182,18 +223,29 @@ def _handle(event: dict[str, Any]) -> dict[str, Any]:
         delta = (chunk.choices[0].delta.content if chunk.choices and chunk.choices[0].delta else None)
         if not delta:
             continue
-        buf.append(delta)
-        full.append(delta)
-        # Flush every ~80 ms or every 4 tokens.
-        if time.monotonic() - last_flush > 0.08 or len(buf) >= 4:
+        # Restore placeholders before they reach the client; holds back any token
+        # straddling a chunk boundary so it is never emitted half-restored.
+        out = restorer.push(delta)
+        if not out:
+            continue
+        buf.append(out)
+        full.append(out)
+        # Flush every ~80 ms or every ~16 restored chars.
+        if time.monotonic() - last_flush > 0.08 or sum(len(x) for x in buf) >= 16:
             _push_token(session_id, "".join(buf), final=False)
             buf, last_flush = [], time.monotonic()
 
+    tail = restorer.flush()
+    if tail:
+        buf.append(tail)
+        full.append(tail)
     if buf:
         _push_token(session_id, "".join(buf), final=False)
     _push_token(session_id, "", final=True)
 
-    return {"sessionId": session_id, "answer": "".join(full)}
+    answer = "".join(full)
+    validate_output(answer, red.mapping)
+    return {"sessionId": session_id, "answer": answer}
 
 
 def _push_token(session_id: str, token: str, *, final: bool) -> None:

@@ -3,10 +3,21 @@
 # The script installs pip deps + copies shared/ into build/shared-layer/python/
 # and zips the result to build/shared-layer.zip.
 
+# The layer zip exceeds Lambda's 70 MB direct-upload limit (base64-inflated),
+# so publish it from S3 instead of inline. The object key embeds the content
+# hash so a changed zip uploads a new object and forces a new layer version.
+resource "aws_s3_object" "shared_layer" {
+  bucket = aws_s3_bucket.processed.id
+  key    = "lambda-layers/shared-layer-${filebase64sha256(var.layer_zip_path)}.zip"
+  source = var.layer_zip_path
+  etag   = filemd5(var.layer_zip_path)
+}
+
 resource "aws_lambda_layer_version" "shared" {
   layer_name               = "${local.prefix}-shared"
   description              = "Shared Python deps: boto3, openai, pdfplumber, aws-lambda-powertools, ..."
-  filename                 = var.layer_zip_path
+  s3_bucket                = aws_s3_object.shared_layer.bucket
+  s3_key                   = aws_s3_object.shared_layer.key
   source_code_hash         = filebase64sha256(var.layer_zip_path)
   compatible_runtimes      = ["python3.12"]
   compatible_architectures = ["arm64"]

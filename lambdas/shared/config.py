@@ -90,6 +90,28 @@ class Settings:
 
     log_level: str = field(default_factory=lambda: _env("LOG_LEVEL", "INFO"))
 
+    # ── Guardrails / data protection ──────────────────────────────────────────
+    # Which AI provider receives client data. Must be on the no-train allowlist
+    # in shared/guardrails.py or the client wrapper fails closed.
+    ai_provider: str = field(default_factory=lambda: _env("AI_PROVIDER", "openai"))
+    # Master switch for PII redaction. The no-train allowlist + audit log are
+    # always enforced regardless of this flag.
+    guardrails_enabled: bool = field(
+        default_factory=lambda: _env("GUARDRAILS_ENABLED", "true").lower()
+        not in ("0", "false", "no", "off")
+    )
+    # Comma-separated entity classes to pseudonymise before text leaves AWS.
+    # MONEY / DATE / PARTY are intentionally excluded by default: the extraction
+    # stage exists to read those very figures, so redacting them there would
+    # break the product. Enable per environment as policy requires.
+    redact_classes: str = field(
+        default_factory=lambda: _env("REDACT_CLASSES", "EMAIL,PHONE,SSN,CREDIT_CARD,IP")
+    )
+
+    def redact_class_list(self) -> tuple[str, ...]:
+        """REDACT_CLASSES parsed into an upper-cased tuple."""
+        return tuple(c.strip().upper() for c in self.redact_classes.split(",") if c.strip())
+
 
 # Module-level singleton.  Tests can mutate fields on this in place.
 settings = Settings()

@@ -68,8 +68,16 @@ def openai_client():
 
     Passing http_client bypasses OpenAI's own httpx.Client construction,
     which is the call that triggers the aws-xray-sdk compatibility error.
+
+    Before any client is built we assert the configured provider is on the
+    no-train allowlist (guardrails). This fails closed: a misconfigured provider
+    can never receive a single byte of client data.
     """
     from openai import OpenAI
+
+    from .guardrails import assert_provider_allowed
+
+    assert_provider_allowed(settings.ai_provider)
 
     transport = httpx.Client(
         timeout=httpx.Timeout(timeout=120.0, connect=10.0),
@@ -102,6 +110,21 @@ _RETRY = retry(
 # ---------------------------------------------------------------------------
 # Usage logging
 # ---------------------------------------------------------------------------
+
+
+def _audit(op: str, *texts: str) -> None:
+    """Record an outbound AI call for compliance evidence (best-effort)."""
+    try:
+        from .guardrails import assert_provider_allowed, audit_send
+
+        provider = assert_provider_allowed(settings.ai_provider)
+        audit_send(
+            provider=provider,
+            op=op,
+            byte_count=sum(len(t.encode("utf-8")) for t in texts if t),
+        )
+    except Exception:  # pragma: no cover - auditing must never break a call
+        pass
 
 
 def _log_usage(model: str, op: str, usage: Any) -> None:
@@ -157,6 +180,7 @@ def chat_json(
     dropping the trailing clauses.
     """
     mdl = model or settings.chat_model
+    _audit("chat.json", system, user)
     resp = openai_client().chat.completions.create(
         model=mdl,
         temperature=temperature,
@@ -201,6 +225,7 @@ def chat_text(
     }
     if max_tokens:
         kwargs["max_tokens"] = max_tokens
+    _audit("chat.text", system, user)
     resp = openai_client().chat.completions.create(**kwargs)
     _log_usage(mdl, "chat.text", getattr(resp, "usage", None))
     return resp.choices[0].message.content or ""
@@ -213,6 +238,7 @@ def embed_texts(texts: Iterable[str], model: str | None = None) -> list[list[flo
     inputs = [t.strip() or " " for t in texts]
     if not inputs:
         return []
+    _audit("embeddings", *inputs)
     resp = openai_client().embeddings.create(model=mdl, input=inputs)
     _log_usage(mdl, "embeddings", getattr(resp, "usage", None))
     return [item.embedding for item in resp.data]
