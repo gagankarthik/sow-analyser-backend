@@ -75,6 +75,25 @@ _PACKS: dict[str, Pack] = {
         ["SecurityControls", "AuditRights", "DataRetention", "BreachNotification"],
         False,
     ),
+    # ── Higher-education packs (Blue-IQ Campus) ──────────────────────────────
+    # Off by default: they only make sense for grant/research and student-data
+    # agreements, so a tenant opts in rather than diluting every contract's grade.
+    "uniform_guidance": Pack(
+        # 2 CFR 200 — the federal "Uniform Guidance" for managing U.S. grant
+        # funds. Required obligations map to the clause categories the pipeline
+        # already extracts from award terms and sub-award flow-downs.
+        "uniform_guidance", "2 CFR 200 (Uniform Guidance)", "United States · Federal Grants",
+        ["Compliance", "AuditRights", "DataRetention", "Subcontracting", "Termination", "IP"],
+        False,
+    ),
+    "ferpa": Pack(
+        # FERPA — protects the privacy of student education records. Maps to the
+        # data-protection categories used for DPA/BAA-style agreements.
+        "ferpa", "FERPA", "United States · Education",
+        ["DataProtection", "DataProcessing", "SubProcessors", "BreachNotification",
+         "DataRetention", "Confidentiality", "AuditRights"],
+        False,
+    ),
 }
 
 _DEFAULT_ENABLED = [p.id for p in _PACKS.values() if p.default_on]

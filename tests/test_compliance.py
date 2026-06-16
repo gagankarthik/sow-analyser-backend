@@ -36,8 +36,38 @@ def test_env_override_drops_unknown_ids(monkeypatch):
     assert compliance.resolve_enabled_packs(None) == ["gdpr"]
 
 
-def test_known_pack_ids_are_the_five_frameworks():
-    assert set(compliance.KNOWN_PACK_IDS) == {"gdpr", "hipaa", "soc2", "ccpa", "iso27001"}
+def test_known_pack_ids_include_base_and_higher_ed_frameworks():
+    assert set(compliance.KNOWN_PACK_IDS) == {
+        "gdpr", "hipaa", "soc2", "ccpa", "iso27001",
+        "uniform_guidance", "ferpa",
+    }
+
+
+def test_higher_ed_packs_are_off_by_default(monkeypatch):
+    # Adding the Campus packs must not change existing tenants' default grading.
+    monkeypatch.delenv("COMPLIANCE_PACKS_JSON", raising=False)
+    enabled = compliance.resolve_enabled_packs(None)
+    assert "uniform_guidance" not in enabled
+    assert "ferpa" not in enabled
+
+
+def test_uniform_guidance_grades_grant_obligations():
+    cats = ["Compliance", "AuditRights", "DataRetention", "Subcontracting", "Termination", "IP"]
+    out = compliance.evaluate_compliance(_clauses(*cats), enabled_ids=["uniform_guidance"])
+    fw = out["frameworks"][0]
+    assert fw["id"] == "uniform_guidance"
+    assert fw["coveragePct"] == 100
+    assert fw["gaps"] == []
+
+
+def test_ferpa_lists_missing_student_data_obligations():
+    out = compliance.evaluate_compliance(
+        _clauses("DataProtection", "Confidentiality"), enabled_ids=["ferpa"]
+    )
+    fw = out["frameworks"][0]
+    assert fw["id"] == "ferpa"
+    assert "BreachNotification" in fw["gaps"]
+    assert "SubProcessors" in fw["gaps"]
 
 
 # ── coverage grading ─────────────────────────────────────────────────────────

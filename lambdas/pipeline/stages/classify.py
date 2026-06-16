@@ -35,6 +35,7 @@ from shared.logger import get_logger
 from shared.openai_client import OutputTruncatedError, chat_json
 from shared.playbook import evaluate_clauses
 from shared.compliance import evaluate_compliance
+from shared.domains import classify_domain
 from shared.s3 import processed_key, put_json
 from shared.text import detect_clause_headers, structural_hash, truncate_to_tokens
 
@@ -522,6 +523,11 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
     # extracted clause categories + the playbook result above.
     result["compliance"] = evaluate_compliance(result["clauses"], result["playbook"], tenant_id=tenant_id)
 
+    # ── Pillar (domain) tagging — Blue-IQ Campus' four entry points. Deterministic:
+    # derived from docType + clause categories + renewal terms + the compliance
+    # gaps above. Persisted into classification.json for the read API.
+    result["domain"] = classify_domain(result)
+
     result["structuralHash"] = structural_hash(result["clauses"])
 
     out_key = processed_key(tenant_id, doc_id, "classification.json")
@@ -534,7 +540,9 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
              reconciled=result["validation"].get("reconciled"),
              playbookDeviations=result["playbook"].get("deviationCount"),
              complianceCoverage=result["compliance"].get("overallCoveragePct"),
-             complianceGaps=result["compliance"].get("totalGaps"))
+             complianceGaps=result["compliance"].get("totalGaps"),
+             pillar=result["domain"].get("pillar"),
+             pillarRiskFlags=len(result["domain"].get("riskFlags", [])))
 
     event["classification"] = result
     return event
