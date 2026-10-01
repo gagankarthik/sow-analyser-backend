@@ -229,11 +229,29 @@ def evaluate_compliance(
             "status": _status_for(pct),
         })
 
-    overall = round(pct_sum / len(frameworks)) if frameworks else 0
+    # No enabled framework → there is no coverage figure to report (null), which
+    # is not the same as 0 % coverage.
+    overall = round(pct_sum / len(frameworks)) if frameworks else None
+
+    # Clause types the packs have no requirement for (custom types, "Other") and
+    # clauses the analysis could not type. They count neither for nor against
+    # coverage — listed so "not assessed" is never mistaken for "compliant".
+    not_assessed: dict[str, dict[str, Any]] = {}
+    untyped = 0
+    for clause in clauses or []:
+        if not clause.get("category") or clause.get("classificationStatus") == "unclassified":
+            untyped += 1
+        elif clause.get("typeIsCustom") and clause.get("specificTypeKey"):
+            row = not_assessed.setdefault(clause["specificTypeKey"], {
+                "key": clause["specificTypeKey"], "label": clause.get("specificType"), "count": 0,
+            })
+            row["count"] += 1
 
     return {
         "evaluated": [f["id"] for f in frameworks],
         "frameworks": frameworks,
         "overallCoveragePct": overall,
         "totalGaps": total_gaps,
+        "typesNotAssessed": sorted(not_assessed.values(), key=lambda r: r["key"]),
+        "unclassifiedClauses": untyped,
     }

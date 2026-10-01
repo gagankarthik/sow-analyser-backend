@@ -1,13 +1,16 @@
 # ─── S3 ────────────────────────────────────────────────────────────────────────
 
+# force_destroy lets `terraform destroy` wipe a bucket that still holds objects.
+# Convenient for dev/staging; in prod it would silently delete every customer
+# contract, so it is off there.
 resource "aws_s3_bucket" "raw" {
   bucket        = "${local.prefix}-raw-${local.account_id}"
-  force_destroy = true
+  force_destroy = var.stage != "prod"
 }
 
 resource "aws_s3_bucket" "processed" {
   bucket        = "${local.prefix}-processed-${local.account_id}"
-  force_destroy = true
+  force_destroy = var.stage != "prod"
 }
 
 resource "aws_s3_bucket_versioning" "raw" {
@@ -49,6 +52,74 @@ resource "aws_s3_bucket_public_access_block" "processed" {
   block_public_policy     = true
   ignore_public_acls      = true
   restrict_public_buckets = true
+}
+
+# Refuse any request that is not over TLS (both buckets hold contract text).
+resource "aws_s3_bucket_policy" "raw_tls_only" {
+  bucket     = aws_s3_bucket.raw.id
+  depends_on = [aws_s3_bucket_public_access_block.raw]
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "DenyInsecureTransport"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "s3:*"
+      Resource  = [aws_s3_bucket.raw.arn, "${aws_s3_bucket.raw.arn}/*"]
+      Condition = { Bool = { "aws:SecureTransport" = "false" } }
+    }]
+  })
+}
+
+resource "aws_s3_bucket_policy" "processed_tls_only" {
+  bucket     = aws_s3_bucket.processed.id
+  depends_on = [aws_s3_bucket_public_access_block.processed]
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "DenyInsecureTransport"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "s3:*"
+      Resource  = [aws_s3_bucket.processed.arn, "${aws_s3_bucket.processed.arn}/*"]
+      Condition = { Bool = { "aws:SecureTransport" = "false" } }
+    }]
+  })
+}
+
+# The raw bucket is versioned, so deleting a document only adds a delete marker:
+# the contract itself stays as a "noncurrent version" forever. Expire those so a
+# deleted (or re-analysed) upload is really gone after 30 days.
+resource "aws_s3_bucket_lifecycle_configuration" "raw" {
+  bucket     = aws_s3_bucket.raw.id
+  depends_on = [aws_s3_bucket_versioning.raw]
+
+  rule {
+    id     = "expire-noncurrent-uploads"
+    status = "Enabled"
+    filter {}
+    noncurrent_version_expiration {
+      noncurrent_days = 30
+    }
+  }
+
+  rule {
+    id     = "remove-orphan-delete-markers"
+    status = "Enabled"
+    filter {}
+    expiration {
+      expired_object_delete_marker = true
+    }
+  }
+
+  rule {
+    id     = "abort-incomplete-multipart"
+    status = "Enabled"
+    filter {}
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
 }
 
 # EventBridge notifications so S3 ObjectCreated → EventBridge → Step Functions.
@@ -113,6 +184,9 @@ resource "aws_dynamodb_table" "main" {
 
   point_in_time_recovery { enabled = true }
 
+  # Block an accidental table delete (console, CLI or `terraform destroy`) in prod.
+  deletion_protection_enabled = var.stage == "prod"
+
   server_side_encryption { enabled = true }
 
   tags = { Name = "${local.prefix}-main" }
@@ -172,9 +246,15 @@ resource "aws_opensearch_domain" "main" {
   access_policies = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect    = "Allow"
-      Principal = { AWS = aws_iam_role.pipeline_base.arn }
-      Action    = "es:*"
+      Effect = "Allow"
+      Principal = { AWS = [
+        aws_iam_role.pipeline_base.arn,
+        aws_iam_role.api.arn,
+        aws_iam_role.rag.arn,
+      ] }
+      # Data-plane HTTP only (was es:*, which also allowed reconfiguring or
+      # deleting the domain). Each role's own IAM policy narrows this further.
+      Action    = "es:ESHttp*"
       Resource  = "arn:aws:es:${local.region}:${local.account_id}:domain/${local.prefix}-search/*"
     }]
   })

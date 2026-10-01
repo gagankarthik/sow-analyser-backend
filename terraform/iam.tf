@@ -126,6 +126,7 @@ resource "aws_iam_role_policy" "graph" {
         Action = [
           "dynamodb:GetItem", "dynamodb:PutItem",
           "dynamodb:UpdateItem", "dynamodb:Query",
+          "dynamodb:BatchGetItem",
         ]
         Resource = [aws_dynamodb_table.main.arn, "${aws_dynamodb_table.main.arn}/index/*"]
       },
@@ -211,9 +212,73 @@ resource "aws_iam_role_policy" "persist" {
   })
 }
 
+# Inter-stage state: the pipeline parks bulky stage output in the processed
+# bucket (Step Functions caps state at 256 KB) and removes it when the run ends.
+# It also discards a run's artefacts when the document was deleted mid-run.
+resource "aws_iam_role_policy" "pipeline_state" {
+  name = "pipeline-state"
+  role = aws_iam_role.pipeline_base.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ProcessedStateObjects"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+        Resource = "${aws_s3_bucket.processed.arn}/*"
+      },
+      {
+        Sid      = "ProcessedList"
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = aws_s3_bucket.processed.arn
+      },
+    ]
+  })
+}
+
+
+# ─── API Lambda role ───────────────────────────────────────────────────────────
+# The API and RAG Lambdas used to run under the pipeline role, so the
+# internet-facing functions also held every pipeline permission (Textract, all
+# stage writes) and vice versa. Each function now has its own role.
+
+resource "aws_iam_role" "api" {
+  name               = "${local.prefix}-api"
+  assume_role_policy = data.aws_iam_policy_document.lambda_trust.json
+}
+
+resource "aws_iam_role_policy_attachment" "api_logs" {
+  role       = aws_iam_role.api.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_iam_role_policy_attachment" "api_xray" {
+  role       = aws_iam_role.api.name
+  policy_arn = "arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess"
+}
+
+
+# ─── RAG Lambda role ───────────────────────────────────────────────────────────
+
+resource "aws_iam_role" "rag" {
+  name               = "${local.prefix}-rag"
+  assume_role_policy = data.aws_iam_policy_document.lambda_trust.json
+}
+
+resource "aws_iam_role_policy_attachment" "rag_logs" {
+  role       = aws_iam_role.rag.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_iam_role_policy_attachment" "rag_xray" {
+  role       = aws_iam_role.rag.name
+  policy_arn = "arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess"
+}
+
 resource "aws_iam_role_policy" "rag" {
   name = "rag"
-  role = aws_iam_role.pipeline_base.id
+  role = aws_iam_role.rag.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -222,6 +287,15 @@ resource "aws_iam_role_policy" "rag" {
         Effect   = "Allow"
         Action   = ["es:ESHttpGet", "es:ESHttpPost"]
         Resource = "${aws_opensearch_domain.main.arn}/*"
+      },
+      {
+        # Read-only: the document's META row, the caller's project memberships
+        # (GSI1) and the projects' document lists — to work out which documents
+        # the caller may read BEFORE anything is searched or answered.
+        Sid      = "DDBReadAccess"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:BatchGetItem"]
+        Resource = [aws_dynamodb_table.main.arn, "${aws_dynamodb_table.main.arn}/index/*"]
       },
       {
         Sid      = "AppSync"
@@ -274,7 +348,7 @@ resource "aws_iam_role_policy" "sfn" {
         Sid      = "PutEvents"
         Effect   = "Allow"
         Action   = ["events:PutEvents"]
-        Resource = "*"
+        Resource = "arn:aws:events:${local.region}:${local.account_id}:event-bus/default"
       },
       {
         Sid      = "CloudWatchLogs"

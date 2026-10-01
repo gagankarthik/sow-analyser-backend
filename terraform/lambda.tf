@@ -46,6 +46,17 @@ locals {
     OPENSEARCH_ENDPOINT          = aws_opensearch_domain.main.endpoint
     EMBEDDING_MODEL              = var.embedding_model
     CHAT_MODEL                   = var.chat_model
+    # Per-task model overrides ("" = inherit CHAT_MODEL) and the tuning knobs
+    # that bound cost/latency. Defaults live in lambdas/shared/config.py.
+    EXTRACTION_MODEL             = var.extraction_model
+    CLAUSE_MODEL                 = var.clause_model
+    VALIDATION_MODEL             = var.validation_model
+    RAG_MODEL                    = var.rag_model
+    EMBEDDING_DIMENSIONS         = tostring(var.embedding_dimensions)
+    EMBEDDING_SEND_DIMENSIONS    = tostring(var.embedding_send_dimensions)
+    LLM_MAX_CONCURRENCY          = tostring(var.llm_max_concurrency)
+    CLASSIFY_MAX_INPUT_TOKENS    = tostring(var.classify_max_input_tokens)
+    OPENAI_TIMEOUT_S             = tostring(var.openai_timeout_seconds)
     LOG_LEVEL                    = "INFO"
     POWERTOOLS_SERVICE_NAME      = "${local.prefix}-pipeline"
     POWERTOOLS_METRICS_NAMESPACE = local.prefix
@@ -100,7 +111,7 @@ resource "aws_cloudwatch_log_group" "api" {
 resource "aws_lambda_function" "api" {
   function_name    = "${local.prefix}-api"
   description      = "Blue-IQ document management API (list, delete, version rollback)"
-  role             = aws_iam_role.pipeline_base.arn
+  role             = aws_iam_role.api.arn
   runtime          = "python3.12"
   architectures    = ["arm64"]
   handler          = "handler.handler"
@@ -118,6 +129,9 @@ resource "aws_lambda_function" "api" {
       RAW_BUCKET                   = aws_s3_bucket.raw.bucket
       PROCESSED_BUCKET             = aws_s3_bucket.processed.bucket
       OPENSEARCH_ENDPOINT          = aws_opensearch_domain.main.endpoint
+      # Pool the invite endpoint creates users in (POST /projects/{id}/invite).
+      COGNITO_USER_POOL_ID         = var.cognito_user_pool_id
+      EMBEDDING_DIMENSIONS         = tostring(var.embedding_dimensions)
       LOG_LEVEL                    = "INFO"
       POWERTOOLS_SERVICE_NAME      = "${local.prefix}-api"
       POWERTOOLS_METRICS_NAMESPACE = local.prefix
@@ -131,7 +145,7 @@ resource "aws_lambda_function" "api" {
 
 resource "aws_iam_role_policy" "api" {
   name = "api"
-  role = aws_iam_role.pipeline_base.id
+  role = aws_iam_role.api.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -141,6 +155,8 @@ resource "aws_iam_role_policy" "api" {
         Action = [
           "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem",
           "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:BatchWriteItem",
+          # Reads the documents / projects a caller may see in one round-trip.
+          "dynamodb:BatchGetItem",
         ]
         Resource = [aws_dynamodb_table.main.arn, "${aws_dynamodb_table.main.arn}/index/*"]
       },
@@ -171,6 +187,22 @@ resource "aws_iam_role_policy" "api" {
         Action   = ["s3:ListBucket"]
         Resource = aws_s3_bucket.processed.arn
       },
+      {
+        # Similar-clause search (GET/POST) and removing a document's vectors on
+        # delete (delete-by-query is a POST).
+        Sid      = "OpenSearch"
+        Effect   = "Allow"
+        Action   = ["es:ESHttpGet", "es:ESHttpPost"]
+        Resource = "${aws_opensearch_domain.main.arn}/*"
+      },
+      {
+        # Project invites: create the invited user / look up an existing one.
+        # Scoped to the one user pool; no update, delete or password actions.
+        Sid      = "CognitoInvite"
+        Effect   = "Allow"
+        Action   = ["cognito-idp:AdminCreateUser", "cognito-idp:AdminGetUser"]
+        Resource = "arn:aws:cognito-idp:${var.aws_region}:${local.account_id}:userpool/${var.cognito_user_pool_id}"
+      },
     ]
   })
 }
@@ -182,9 +214,11 @@ resource "aws_apigatewayv2_api" "documents" {
   cors_configuration {
     # Locked to known frontend origins (was "*"). Add deployed origins via the
     # allowed_origins variable. allow_credentials stays false — the API uses
-    # bearer tokens, not cookies.
+    # bearer tokens, not cookies. x-tenant-id stays in allow_headers only because
+    # the frontend still sends it (dropping it would fail the CORS preflight);
+    # the backend ignores the header — the tenant comes from the verified JWT.
     allow_origins = var.allowed_origins
-    allow_methods = ["GET", "POST", "DELETE", "PATCH", "OPTIONS"]
+    allow_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
     allow_headers = ["Content-Type", "Authorization", "x-tenant-id"]
     max_age       = 300
   }
@@ -347,6 +381,76 @@ resource "aws_apigatewayv2_route" "save_projects" {
   authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
 }
 
+
+# Per-tenant compliance-pack selection and project membership. The Lambda router
+# and the frontend already use these paths, but without a gateway route the HTTP
+# API answered 404 before the Lambda ran. All sit behind the same JWT authorizer.
+
+resource "aws_apigatewayv2_route" "get_compliance" {
+  api_id    = aws_apigatewayv2_api.documents.id
+  route_key = "GET /tenant/compliance"
+  target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
+}
+
+resource "aws_apigatewayv2_route" "save_compliance" {
+  api_id    = aws_apigatewayv2_api.documents.id
+  route_key = "POST /tenant/compliance"
+  target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
+}
+
+resource "aws_apigatewayv2_route" "invite_member" {
+  api_id    = aws_apigatewayv2_api.documents.id
+  route_key = "POST /projects/{projectId}/invite"
+  target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
+}
+
+resource "aws_apigatewayv2_route" "remove_member" {
+  api_id    = aws_apigatewayv2_api.documents.id
+  route_key = "DELETE /projects/{projectId}/members/{email}"
+  target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
+}
+
+# ─── Per-project operations, role changes and the playbook ─────────────────────
+# Access is per project, by membership (lambdas/shared/access.py). These routes
+# let the frontend change ONE project at a time instead of saving the whole
+# list; the legacy whole-list `POST /projects` is still served (as a safe merge).
+
+locals {
+  access_routes = {
+    get_project             = "GET /projects/{projectId}"
+    put_project             = "PUT /projects/{projectId}"
+    delete_project          = "DELETE /projects/{projectId}"
+    add_project_document    = "PUT /projects/{projectId}/documents/{docId}"
+    remove_project_document = "DELETE /projects/{projectId}/documents/{docId}"
+    set_member_role         = "PATCH /projects/{projectId}/members/{email}"
+    get_playbook            = "GET /playbook"
+    put_playbook_rule       = "PUT /playbook/rules/{ruleId}"
+    delete_playbook_rule    = "DELETE /playbook/rules/{ruleId}"
+  }
+}
+
+resource "aws_apigatewayv2_route" "access" {
+  for_each  = local.access_routes
+  api_id    = aws_apigatewayv2_api.documents.id
+  route_key = each.value
+  target    = "integrations/${aws_apigatewayv2_integration.api_lambda.id}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
+}
+
 resource "aws_apigatewayv2_stage" "default" {
   api_id      = aws_apigatewayv2_api.documents.id
   name        = "$default"
@@ -357,6 +461,31 @@ resource "aws_apigatewayv2_stage" "default" {
   default_route_settings {
     throttling_rate_limit  = 50
     throttling_burst_limit = 100
+  }
+
+  # Tighter limits on the routes that cost money or send email per call: each
+  # chat is an LLM call, each reprocess is a full pipeline run (several LLM
+  # calls), each invite sends an email. These are per-route totals across all
+  # callers — HTTP APIs have no per-user throttle.
+  route_settings {
+    route_key              = aws_apigatewayv2_route.post_chat.route_key
+    throttling_rate_limit  = 5
+    throttling_burst_limit = 10
+  }
+  route_settings {
+    route_key              = aws_apigatewayv2_route.post_reprocess.route_key
+    throttling_rate_limit  = 2
+    throttling_burst_limit = 5
+  }
+  route_settings {
+    route_key              = aws_apigatewayv2_route.get_upload_url.route_key
+    throttling_rate_limit  = 10
+    throttling_burst_limit = 20
+  }
+  route_settings {
+    route_key              = aws_apigatewayv2_route.invite_member.route_key
+    throttling_rate_limit  = 1
+    throttling_burst_limit = 3
   }
 
   access_log_settings {
@@ -390,7 +519,7 @@ resource "aws_cloudwatch_log_group" "rag" {
 resource "aws_lambda_function" "rag" {
   function_name    = "${local.prefix}-rag"
   description      = "Blue-IQ RAG resolver — backs AppSync askBluely mutation"
-  role             = aws_iam_role.pipeline_base.arn
+  role             = aws_iam_role.rag.arn
   runtime          = "python3.12"
   architectures    = ["arm64"]
   handler          = "handler.handler"
@@ -404,7 +533,9 @@ resource "aws_lambda_function" "rag" {
     variables = merge(local.pipeline_env, {
       PIPELINE_STAGE           = "08_rag"
       RAG_MAX_CONTEXT_CLAUSES  = "8"
-      RAG_MAX_CLAUSE_CHARS     = "1200"
+      # A retrieval chunk is at most ~1,800 characters; the old 1,200 cap cut the
+      # end off every longer clause before the model saw it.
+      RAG_MAX_CLAUSE_CHARS     = "2400"
       APPSYNC_GRAPHQL_ENDPOINT = ""  # wire in after AppSync API is created
     })
   }

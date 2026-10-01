@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from shared.config import settings
-from shared.dynamodb import get_doc_meta, put_lineage, update_status
+from shared.dynamodb import get_doc_meta, put_lineage, related_doc_ids, update_status
 from shared.logger import get_logger
 from shared.openai_client import embed_texts
 from shared.opensearch import bm25_search, hybrid_search
@@ -41,10 +41,14 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
     log.append_keys(docId=doc_id, tenantId=tenant_id)
     update_status(doc_id, "GRAPHING")
 
+    # status: "not_applicable" (not an amendment) | "linked" | "unmatched" (an
+    # amendment whose parent was not found — it may not be uploaded or analysed
+    # yet; re-analyze the amendment once it is).
     lineage: dict[str, Any] = {
         "parentDocId": None,
         "matchConfidence": 0.0,
         "matchReason": "",
+        "status": "not_applicable",
     }
 
     if doc_type != "AMENDMENT":
@@ -52,8 +56,16 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
         event["lineage"] = lineage
         return event
 
+    # Candidates: the uploader's own workspace, plus every document that shares a
+    # project with this one (a teammate may have uploaded the parent).
+    try:
+        related = related_doc_ids(doc_id)
+    except Exception as exc:
+        log.warning("graph.related_docs_failed", error_type=type(exc).__name__)
+        related = []
+
     parent_id, confidence, reason = _find_parent(
-        doc_id=doc_id, tenant_id=tenant_id, classification=classification
+        doc_id=doc_id, tenant_id=tenant_id, classification=classification, related=related
     )
 
     if parent_id and confidence >= settings.parent_match_min_confidence:
@@ -61,10 +73,12 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
             "parentDocId":      parent_id,
             "matchConfidence":  round(float(confidence), 4),
             "matchReason":      reason,
+            "status":           "linked",
         }
         put_lineage(parent_id=parent_id, child_id=doc_id)
         log.info("graph.parent_linked", parentDocId=parent_id, confidence=confidence)
     else:
+        lineage["status"] = "unmatched"
         lineage["matchConfidence"] = round(float(confidence), 4) if parent_id else 0.0
         lineage["matchReason"] = (
             f"best candidate {parent_id} below threshold ({confidence:.2f})"
@@ -82,7 +96,7 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
 
 
 def _find_parent(
-    *, doc_id: str, tenant_id: str, classification: dict[str, Any]
+    *, doc_id: str, tenant_id: str, classification: dict[str, Any], related: list[str] | None = None,
 ) -> tuple[str | None, float, str]:
     clauses        = classification.get("clauses") or []
     title          = classification.get("title", "")
@@ -94,39 +108,41 @@ def _find_parent(
         return None, 0.0, "no clauses to match"
 
     rep_clause = _representative(clauses)
-    rep_text   = rep_clause["body"][:4000]
+    rep_text   = (rep_clause.get("body") or "")[:4000]
+    # tenant OR shared-project documents; an empty `related` is just the tenant.
+    scope = {"tenant_id": tenant_id, "doc_ids": related or None, "any_of": bool(related)}
 
     # Embed representative clause.
     rep_vec: list[float] = []
     try:
         [rep_vec] = embed_texts([rep_text], model=settings.embedding_model)
     except Exception as exc:
-        log.warning("graph.embed_failed", error=str(exc))
+        log.warning("graph.embed_failed", error_type=type(exc).__name__)
 
     # Hybrid search.
     hybrid_hits: list[dict[str, Any]] = []
     if rep_vec:
         try:
             hybrid_hits = hybrid_search(
-                text=rep_text, vector=rep_vec, tenant_id=tenant_id,
+                text=rep_text, vector=rep_vec, **scope,
                 k=10, doc_types=["SOW", "MSA"], exclude_doc_id=doc_id, alpha=0.6,
             )
         except Exception as exc:
-            log.warning("graph.hybrid_search_failed", error=str(exc))
+            log.warning("graph.hybrid_search_failed", error_type=type(exc).__name__)
 
     # Structural prefix match.
     structural_ids: set[str] = set()
     if structural:
         try:
             for h in bm25_search(
-                text=title or rep_text, tenant_id=tenant_id, k=20,
+                text=title or rep_text, **scope, k=20,
                 doc_types=["SOW", "MSA"], exclude_doc_id=doc_id,
                 structural_hash_prefix=structural,
             ):
                 if did := h.get("_source", {}).get("docId"):
                     structural_ids.add(did)
         except Exception as exc:
-            log.warning("graph.structural_search_failed", error=str(exc))
+            log.warning("graph.structural_search_failed", error_type=type(exc).__name__)
 
     # Explicit parent reference. When the amendment names its parent, search for
     # that reference directly and normalise the BM25 scores to [0, 1].
@@ -134,7 +150,7 @@ def _find_parent(
     if parent_ref:
         try:
             ref_hits = bm25_search(
-                text=parent_ref, tenant_id=tenant_id, k=10,
+                text=parent_ref, **scope, k=10,
                 doc_types=["SOW", "MSA"], exclude_doc_id=doc_id,
             )
             top = max((h.get("_score", 0.0) for h in ref_hits), default=0.0)
@@ -144,7 +160,7 @@ def _find_parent(
                         normed = h.get("_score", 0.0) / top
                         reference_scores[did] = max(reference_scores.get(did, 0.0), normed)
         except Exception as exc:
-            log.warning("graph.reference_search_failed", error=str(exc))
+            log.warning("graph.reference_search_failed", error_type=type(exc).__name__)
 
     # Combine signals.
     candidates: dict[str, dict[str, float]] = {}
@@ -156,9 +172,15 @@ def _find_parent(
     for did, ref_score in reference_scores.items():
         candidates.setdefault(did, {})["reference"] = ref_score
 
+    owner = (get_doc_meta(doc_id) or {}).get("ownerSub") if candidates else None
+    shared = set(related or [])
     best: tuple[str | None, float, str] = (None, 0.0, "")
     for did, signals in candidates.items():
         meta         = get_doc_meta(did) or {}
+        # Same storage tenant is not enough: the parent must be the uploader's own
+        # document or one that shares a project with this one.
+        if did not in shared and owner and meta.get("ownerSub") and meta["ownerSub"] != owner:
+            continue
         parent_title = meta.get("title", "")
         signals["title"] = title_similarity(title, parent_title) if parent_title else 0.0
         # Fold a direct reference↔title comparison into the reference signal so a
@@ -192,4 +214,4 @@ def _representative(clauses: list[dict[str, Any]]) -> dict[str, Any]:
     for c in clauses:
         if c.get("category") in preferred and c.get("body"):
             return c
-    return max(clauses, key=lambda c: len(c.get("body", "")))
+    return max(clauses, key=lambda c: len(c.get("body") or ""))

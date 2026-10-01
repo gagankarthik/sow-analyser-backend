@@ -176,3 +176,99 @@ These materially change scope. Please answer before we go deeper.
 4. Frontend integration: presigned upload, GraphQL client, subscription handlers
 5. Observability: CloudWatch dashboards, X-Ray tracing, structured logs, alarms
 6. CI/CD: GitHub Actions for `cdk deploy` + Lambda packaging
+
+
+## 8. Access control (per project, by membership)
+
+**Rule.** Nobody shares a workspace by default. A signed-in user can reach a *project* only if they own
+it or are a member, and a *document* only if they uploaded it or it is filed in a project they can see.
+Everything else answers `404` (never `403`, so an id cannot be probed). A user who can see something but
+may not change it gets `403` with `code: "forbidden"`. The rule, the roles and the permission matrix are
+defined once, in `lambdas/shared/access.py`.
+
+**Identity.** Only the JWT the API Gateway authorizer verified: `sub` for ownership, and the `email`
+claim — only when `email_verified` is true — for membership. A header, a body field or a client-supplied
+`ownerEmail` is never identity. The "workspace" (`tenantId`) is the `custom:tenantId` claim if present,
+else the private `u-<sub>`; it is a storage namespace (S3 prefix, search field), not a sharing boundary.
+There is no shared or default tenant.
+
+**Roles.**
+
+| | owner | editor | viewer |
+|---|---|---|---|
+| view project, documents, analysis, chat | yes | yes | yes |
+| upload into the project, edit document metadata, re-analyze, add/remove documents | yes | yes | – |
+| file an existing document into a project (shares it with that project's members) — needs this on the *document* | yes | – | – |
+| delete a document or version | yes | – | – |
+| rename / delete the project, invite, remove member, change a role | yes | – | – |
+
+On a document the caller's role is the strongest of: `owner` if they uploaded it, else their role in any
+project that lists it. The uploader of a document keeps `owner` rights on it wherever it is filed.
+
+**Storage** (same single table, nothing scans):
+
+| Item | PK | SK | GSI1PK → GSI1SK |
+|---|---|---|---|
+| Project | `PROJ#<id>` | `META` (name, ownerSub, ownerEmail, `docIds`, `rev`) | – |
+| Owner pointer | `PROJ#<id>` | `OWNER` | `USER#<sub>` → `PROJ#<id>` |
+| Membership | `PROJ#<id>` | `MEMBER#<email>` (role, status, sub) | `MEMBER#<email>` → `PROJ#<id>` |
+| Document | `DOC#<id>` | `META` + `ownerSub`, `ownerEmail`, `projectIds` | `TENANT#<workspace>` → `DOC#<id>` (unchanged) |
+
+* "Which projects can I see?" = two GSI1 partition reads (`USER#<sub>`, `MEMBER#<verified email>`).
+* "May I read document D?" = D's `META` (one `GetItem`); if the caller is not the uploader, the projects in
+  D's `projectIds` that the caller belongs to are fetched (one `BatchGetItem`) and must **list D in
+  `docIds`**. The project record is the source of truth; `projectIds` on the document is only a hint that
+  says where to look, so a stale hint can never grant access.
+* "List my documents" = own uploads (GSI1 `TENANT#<workspace>`, filtered to `ownerSub`) + `BatchGetItem`
+  of the `docIds` of the caller's projects.
+* A document id or project id that is guessed grants nothing: every read goes through the check above.
+* Project `META` is written with optimistic locking on `rev` — two people editing one project cannot
+  overwrite each other.
+
+**Invites across workspaces.** A membership is keyed on the invitee's email. It takes effect whenever a
+user with that *verified* address signs in — whether or not the account existed when they were invited,
+and whatever their own workspace is — and grants that project's documents only. Removing the row ends
+access on the next request (nothing is cached between requests). The Cognito invitation email is
+best-effort; no tenant attribute is written to the user.
+
+**Search and chat.** Retrieval is restricted to the documents the caller may read *inside the OpenSearch
+query* (`filter: terms docId` / `term docId`), never by filtering results afterwards. No permitted
+document → no search and no model call. The timeline and diff of a document are withheld (or reduced)
+when part of the amendment chain is a document the caller cannot see, because those artefacts quote the
+other document's clause text.
+
+**The pipeline.** The persist stage *updates* the analysis fields of the document record instead of
+replacing it, so ownership and project membership set by the API during a run are never undone. An
+amendment's parent is searched in the uploader's workspace plus the documents that share a project with it.
+
+### Migrating existing data (one-off)
+
+Existing documents and projects live under the shared `default` tenant with no owner recorded. After the
+new backend is deployed they are visible to nobody until `scripts/migrate_access.py` has run — nothing is
+lost, it is hidden.
+
+```
+# 1. Any time (read-only): see exactly what would happen
+python scripts/migrate_access.py --table <table> --user-pool-id <pool> --region us-east-2
+
+# 2. Deploy the new backend.
+
+# 3. Straight after the deploy: write the changes
+python scripts/migrate_access.py --table <table> --user-pool-id <pool> --region us-east-2 --apply
+
+# Documents in no project, and projects with no recorded owner, are listed and left alone.
+# To give them to someone (the account must already exist in Cognito):
+python scripts/migrate_access.py --table <table> --user-pool-id <pool> --orphans-to owner@example.com --apply
+```
+
+Keep the gap between steps 2 and 3 short, and ideally have users stay out of the app during it: a
+browser that still holds the pre-deploy project list will re-save it, creating empty projects under the
+person who happens to save first. The script detects these, leaves them untouched and lists them under
+`CONFLICTS` for a manual decision.
+
+The script assigns each project to its recorded `ownerEmail` (resolving the Cognito `sub` when the user
+exists; otherwise the project is theirs by email as soon as they sign up with that verified address),
+carries members over (the legacy `member` role becomes `viewer`), gives each document the owner of the
+project that contains it, and lists it under that owner. It is a dry run unless `--apply` is given, never
+deletes anything (the legacy `TENANT#default / PROJECTS` blob stays), is idempotent, and does not move a
+document's files or search records (`tenantId`, S3 keys and index records are untouched).

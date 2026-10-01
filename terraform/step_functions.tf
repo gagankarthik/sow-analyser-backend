@@ -6,14 +6,34 @@ resource "aws_cloudwatch_log_group" "sfn" {
 }
 
 
-# ─── Express state machine ─────────────────────────────────────────────────────
+# ─── Standard state machine ────────────────────────────────────────────────────
 # Single Lambda handles all seven stages.  Each state injects _stage into the
 # payload via States.JsonMerge; the handler pops it, dispatches, and returns the
 # clean pipeline event for the next stage.
+#
+# STANDARD, not EXPRESS: an Express execution is killed at 5 minutes total, but a
+# single stage may legitimately run up to the Lambda's 600 s (Textract OCR, a long
+# extraction + validation pass). When Express hit its cap the execution just
+# stopped — the Catch never ran, MarkFailed never ran, and the document stayed on
+# "processing" forever. Standard has no such cap, runs each state exactly once
+# (Express is at-least-once, i.e. duplicate LLM spend), and costs ~$0.0002/doc.
 
 locals {
   _fn  = aws_lambda_function.pipeline.arn
   _catch = [{ ErrorEquals = ["States.ALL"], Next = "MarkFailed", ResultPath = "$.error" }]
+
+  # Slightly above the Lambda timeout, so a hung invoke is caught (States.Timeout
+  # → MarkFailed) instead of leaving the execution open.
+  _task_timeout = aws_lambda_function.pipeline.timeout + 30
+
+  # Retry only transient Lambda-service faults. A stage's own error is NOT
+  # retried here — that would repeat the LLM calls it already paid for.
+  _retry = [{
+    ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"]
+    IntervalSeconds = 2
+    MaxAttempts     = 3
+    BackoffRate     = 2
+  }]
 
   sfn_definition = jsonencode({
     Comment = "Blue-IQ document ingestion pipeline"
@@ -26,9 +46,11 @@ locals {
           FunctionName = local._fn
           "Payload.$"  = "States.JsonMerge($, States.StringToJson('{\"_stage\":\"01_parse\"}'), false)"
         }
-        OutputPath = "$.Payload"
-        Catch      = local._catch
-        Next       = "Classify"
+        OutputPath     = "$.Payload"
+        TimeoutSeconds = local._task_timeout
+        Retry          = local._retry
+        Catch          = local._catch
+        Next           = "Classify"
       }
       Classify = {
         Type     = "Task"
@@ -37,9 +59,11 @@ locals {
           FunctionName = local._fn
           "Payload.$"  = "States.JsonMerge($, States.StringToJson('{\"_stage\":\"02_classify\"}'), false)"
         }
-        OutputPath = "$.Payload"
-        Catch      = local._catch
-        Next       = "Embed"
+        OutputPath     = "$.Payload"
+        TimeoutSeconds = local._task_timeout
+        Retry          = local._retry
+        Catch          = local._catch
+        Next           = "Embed"
       }
       Embed = {
         Type     = "Task"
@@ -48,9 +72,11 @@ locals {
           FunctionName = local._fn
           "Payload.$"  = "States.JsonMerge($, States.StringToJson('{\"_stage\":\"03_embed\"}'), false)"
         }
-        OutputPath = "$.Payload"
-        Catch      = local._catch
-        Next       = "Graph"
+        OutputPath     = "$.Payload"
+        TimeoutSeconds = local._task_timeout
+        Retry          = local._retry
+        Catch          = local._catch
+        Next           = "Graph"
       }
       Graph = {
         Type     = "Task"
@@ -59,9 +85,11 @@ locals {
           FunctionName = local._fn
           "Payload.$"  = "States.JsonMerge($, States.StringToJson('{\"_stage\":\"04_graph\"}'), false)"
         }
-        OutputPath = "$.Payload"
-        Catch      = local._catch
-        Next       = "Diff"
+        OutputPath     = "$.Payload"
+        TimeoutSeconds = local._task_timeout
+        Retry          = local._retry
+        Catch          = local._catch
+        Next           = "Diff"
       }
       Diff = {
         Type     = "Task"
@@ -70,9 +98,11 @@ locals {
           FunctionName = local._fn
           "Payload.$"  = "States.JsonMerge($, States.StringToJson('{\"_stage\":\"05_diff\"}'), false)"
         }
-        OutputPath = "$.Payload"
-        Catch      = local._catch
-        Next       = "Timeline"
+        OutputPath     = "$.Payload"
+        TimeoutSeconds = local._task_timeout
+        Retry          = local._retry
+        Catch          = local._catch
+        Next           = "Timeline"
       }
       Timeline = {
         Type     = "Task"
@@ -81,9 +111,11 @@ locals {
           FunctionName = local._fn
           "Payload.$"  = "States.JsonMerge($, States.StringToJson('{\"_stage\":\"06_timeline\"}'), false)"
         }
-        OutputPath = "$.Payload"
-        Catch      = local._catch
-        Next       = "Persist"
+        OutputPath     = "$.Payload"
+        TimeoutSeconds = local._task_timeout
+        Retry          = local._retry
+        Catch          = local._catch
+        Next           = "Persist"
       }
       Persist = {
         Type     = "Task"
@@ -92,9 +124,11 @@ locals {
           FunctionName = local._fn
           "Payload.$"  = "States.JsonMerge($, States.StringToJson('{\"_stage\":\"07_persist\"}'), false)"
         }
-        OutputPath = "$.Payload"
-        Catch      = local._catch
-        Next       = "DocumentReady"
+        OutputPath     = "$.Payload"
+        TimeoutSeconds = local._task_timeout
+        Retry          = local._retry
+        Catch          = local._catch
+        Next           = "DocumentReady"
       }
       DocumentReady = {
         Type     = "Task"
@@ -123,7 +157,10 @@ locals {
             PK = { "S.$" = "States.Format('DOC#{}', States.ArrayGetItem(States.StringSplit($.rawKey, '/'), 3))" }
             SK = { S = "META" }
           }
-          UpdateExpression          = "SET #st = :failed, updatedAt = :ts, errorMessage = :err"
+          UpdateExpression = "SET #st = :failed, updatedAt = :ts, errorMessage = :err"
+          # updateItem upserts: without this, a failure for a document that was
+          # deleted mid-run would recreate a tenant-less ghost row.
+          ConditionExpression       = "attribute_exists(PK)"
           ExpressionAttributeNames  = { "#st" = "status" }
           ExpressionAttributeValues = {
             ":failed" = { S = "FAILED" }
@@ -138,20 +175,24 @@ locals {
 }
 
 resource "aws_sfn_state_machine" "pipeline" {
-  name       = "${local.prefix}-pipeline"
-  type       = "EXPRESS"
+  # Renamed from "-pipeline": changing the type replaces the state machine, and
+  # re-creating one under the name of a machine that is still being deleted fails.
+  name       = "${local.prefix}-ingest"
+  type       = "STANDARD"
   role_arn   = aws_iam_role.sfn.arn
   definition = local.sfn_definition
 
   tracing_configuration { enabled = true }
 
   logging_configuration {
-    log_destination        = "${aws_cloudwatch_log_group.sfn.arn}:*"
-    include_execution_data = true
-    level                  = "ALL"
+    log_destination = "${aws_cloudwatch_log_group.sfn.arn}:*"
+    # Errors only, and never the state input/output: execution data is the
+    # pipeline payload, which must not be copied into CloudWatch.
+    include_execution_data = false
+    level                  = "ERROR"
   }
 
-  tags = { Name = "${local.prefix}-pipeline" }
+  tags = { Name = "${local.prefix}-ingest" }
 }
 
 

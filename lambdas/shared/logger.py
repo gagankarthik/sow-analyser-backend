@@ -41,6 +41,30 @@ def get_logger(name: str = "blue-iq", **default_keys: Any) -> PowertoolsLogger:
     return log
 
 
+def safe_trace(exc: BaseException, limit: int = 12) -> list[str]:
+    """Where an exception came from — WITHOUT what it said.
+
+    An exception message can carry anything: an SDK echoing the prompt, a parser
+    quoting the line it choked on. Logging it (``log.exception`` does) can put
+    contract text into CloudWatch. This returns only ``Type @ file:line in
+    function`` for the exception and each exception it was raised from, which is
+    enough to find the bug and contains no runtime values.
+    """
+    import traceback
+
+    out: list[str] = []
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen and len(out) < limit * 2:
+        seen.add(id(cur))
+        frames = traceback.extract_tb(cur.__traceback__)[-limit:]
+        where = " < ".join(f"{f.filename.replace(chr(92), '/').rsplit('/', 1)[-1]}:{f.lineno} in {f.name}"
+                           for f in reversed(frames))
+        out.append(f"{type(cur).__name__} @ {where or 'unknown'}")
+        cur = cur.__cause__ or cur.__context__
+    return out
+
+
 def get_structlog():
     """Lazy import of structlog for use outside Lambda runtime."""
     import structlog

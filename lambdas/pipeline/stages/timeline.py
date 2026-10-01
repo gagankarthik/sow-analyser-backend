@@ -60,6 +60,10 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
             "lifecycle":     d.get("lifecycle"),
             "effectiveDate": d.get("effectiveDate"),
             "title":         d.get("title"),
+            # Signed change in contract value (negative = reduction); null if the
+            # amendment does not change the value or it is not known.
+            "valueDelta":    d.get("valueDelta"),
+            "inForce":       (d.get("lifecycle") or "").lower() in _IN_FORCE_LIFECYCLES,
         }
         for d in chain_docs
     ]
@@ -83,6 +87,9 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
         "currentState":   current_state,
         "amendmentChain": amendment_chain,
         "futureState":    future_state if has_pending else None,
+        # Every dated event / obligation of THIS document (see shared/keydates.py).
+        # No "past / upcoming" status is stored — the reader derives it from today.
+        "keyDates":       classification.get("keyDates") or [],
     }
     put_json(processed_bucket, processed_key(tenant_id, doc_id, "timeline.json"), timeline)
     log.info("timeline.done", amendments=len(amendment_chain), pending=has_pending)
@@ -132,22 +139,34 @@ def _gather_chain(
             cls = event.get("classification") or {}
             rows.append({
                 "docId":         did,
-                "docType":       cls.get("docType", "AMENDMENT"),
-                "lifecycle":     cls.get("lifecycle", "draft"),
+                "docType":       cls.get("docType"),
+                "lifecycle":     cls.get("lifecycle"),
                 "effectiveDate": cls.get("effectiveDate"),
-                "title":         cls.get("title", ""),
+                "title":         cls.get("title"),
+                "valueDelta":    (cls.get("amendment") or {}).get("valueDelta"),
+                "createdAt":     "",
             })
         else:
-            meta = get_doc_meta(did) or {}
+            meta = get_doc_meta(did)
+            if not meta:
+                continue            # deleted since it was linked: not part of the chain
+            delta = meta.get("valueDelta")
             rows.append({
                 "docId":         did,
-                "docType":       meta.get("docType", "AMENDMENT"),
-                "lifecycle":     meta.get("lifecycle", "draft"),
+                # What the record says — never a made-up type or lifecycle. A
+                # document with no lifecycle is simply not "in force".
+                "docType":       meta.get("docType"),
+                "lifecycle":     meta.get("lifecycle"),
                 "effectiveDate": meta.get("effectiveDate"),
-                "title":         meta.get("title", ""),
+                "title":         meta.get("title"),
+                "valueDelta":    float(delta) if delta is not None else None,
+                "createdAt":     meta.get("createdAt") or "",
             })
 
-    rows.sort(key=lambda r: (r.get("effectiveDate") or "", r["docId"]))
+    # Deterministic order: effective date, then upload time, then id. Undated
+    # amendments sort last (they cannot be placed before a dated one).
+    rows.sort(key=lambda r: (r.get("effectiveDate") is None, str(r.get("effectiveDate") or ""),
+                             r.get("createdAt") or "~", r["docId"]))
     return rows
 
 
@@ -162,7 +181,7 @@ def _state_from_clauses(clauses: list[dict[str, Any]]) -> dict[str, dict[str, An
             "number":   c.get("number", ""),
             "title":    c.get("title", ""),
             "body":     c.get("body", ""),
-            "category": c.get("category", "Other"),
+            "category": c.get("category") or "Other",
         }
         for c in clauses
     }
@@ -208,7 +227,7 @@ def _load_classification(
     try:
         return get_json(bucket, processed_key(tenant, doc_id, "classification.json"))
     except Exception as exc:
-        log.warning("timeline.classification_load_failed", docId=doc_id, error=str(exc))
+        log.warning("timeline.classification_load_failed", docId=doc_id, error_type=type(exc).__name__)
         return {"clauses": []}
 
 
@@ -217,4 +236,17 @@ def _changes_for(
 ) -> list[dict[str, Any]]:
     if amd_doc_id == current_doc_id:
         return (event.get("diffs") or {}).get("changes") or []
-    return query_doc_changes(amd_doc_id) or []
+    return latest_version_changes(query_doc_changes(amd_doc_id) or [])
+
+
+def latest_version_changes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Only the changes written by the amendment's most recent analysis.
+
+    Every re-analysis writes a fresh set of change rows (new ids) and the old
+    ones stay in the table, so replaying ALL rows would apply an amendment's
+    changes once per time it was analysed — stale wording included.
+    """
+    if not rows:
+        return []
+    latest = max(int(r.get("versionNumber") or 0) for r in rows)
+    return [r for r in rows if int(r.get("versionNumber") or 0) == latest]

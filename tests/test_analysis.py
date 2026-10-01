@@ -14,13 +14,16 @@ def test_overall_risk_picks_highest_present():
     assert persist._overall_risk({"low": 0, "medium": 0, "high": 0, "critical": 0}) == "low"
 
 
-def test_risk_counts_are_case_insensitive_and_default_low():
+def test_risk_counts_are_case_insensitive_and_unrated_is_not_low():
     clauses = [
         {"riskLevel": "HIGH"}, {"riskLevel": "high"}, {"riskLevel": None}, {},
         {"riskLevel": "critical"},
     ]
     counts = persist._risk_counts(clauses)
-    assert counts == {"low": 2, "medium": 0, "high": 2, "critical": 1}
+    # The two clauses with no assessment used to be counted as "low" — a risk
+    # rating nobody gave. They are reported separately instead.
+    assert counts == {"low": 0, "medium": 0, "high": 2, "critical": 1, "unrated": 2}
+    assert persist._unrated_count(clauses) == 2
 
 
 # ── hybrid search min-max normalisation (degenerate span) ───────────────────
@@ -81,9 +84,14 @@ def test_apply_defaults_fills_missing_blocks():
     assert result["scope"] == {"inScope": [], "outOfScope": [], "assumptions": [], "dependencies": []}
     assert result["amendment"]["amendmentType"] == "none"
     assert result["commercials"] == {}
-    # Clause defaults applied.
-    assert result["clauses"][0]["riskLevel"] == "low"
+    # Clause defaults applied — but an unrated clause stays unrated (null); it is
+    # never given a made-up "low" risk.
+    assert result["clauses"][0]["riskLevel"] is None
     assert result["clauses"][0]["summary"] == ""
+    # No invented document facts either.
+    assert result["parties"] == [] and result["effectiveDate"] is None
+    assert result["timeline"]["autoRenews"] is None
+    assert "currency" not in result["commercials"]
 
 
 def test_validate_writeback_updates_commercials(monkeypatch):

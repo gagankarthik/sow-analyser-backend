@@ -24,8 +24,11 @@ an empty diff — this is the happy path for first-version documents.
 """
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Any
+
+from shared.concurrency import bounded_map
 
 from shared.config import settings
 from shared.dynamodb import get_doc_meta, query_doc_versions, update_status
@@ -68,44 +71,81 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
     doc_id           = event["docId"]
     tenant_id        = event["tenantId"]
     processed_bucket = event["processedBucket"]
-    parent_id        = (event.get("lineage") or {}).get("parentDocId")
+    lineage          = event.get("lineage") or {}
+    parent_id        = lineage.get("parentDocId")
+    classification   = event.get("classification") or {}
+    amendment        = classification.get("amendment") or {}
+    is_amendment     = classification.get("docType") == "AMENDMENT"
 
     log.append_keys(docId=doc_id, tenantId=tenant_id)
     update_status(doc_id, "DIFFING")
 
+    # The signed value change travels with the diff so every reader gets the same
+    # number: negative for a reduction, positive for an increase, null if none.
+    value = {
+        "valueDelta":    amendment.get("valueDelta") if is_amendment else None,
+        "newTotalValue": amendment.get("newTotalValue") if is_amendment else None,
+    }
+
     if not parent_id:
-        log.info("diff.skipped", reason="no parent document")
-        event["diffs"] = {"changes": [], "impactSummary": "First version — no diff."}
+        log.info("diff.skipped", reason="no parent document", amendment=is_amendment)
+        event["diffs"] = {
+            "changes": [],
+            "impactSummary": (
+                "No parent document was matched for this amendment, so its changes could not be "
+                "compared. Upload or re-analyze the parent, then re-analyze this amendment."
+                if is_amendment else "First version — no diff."
+            ),
+            "parentStatus": "unmatched" if is_amendment else "not_applicable",
+            **value,
+        }
         return event
 
-    classification  = event.get("classification") or {}
     current_clauses = classification.get("clauses") or []
     parent_clauses  = _load_parent_clauses(processed_bucket, tenant_id, parent_id)
 
     if not parent_clauses:
-        log.warning("diff.parent_unavailable", parentDocId=parent_id)
-        event["diffs"] = {"changes": [], "impactSummary": "Parent classification unavailable."}
+        # The parent exists but has no analysis yet (still processing, or failed).
+        parent_status = (get_doc_meta(parent_id) or {}).get("status")
+        pending = parent_status not in (None, "READY", "FAILED")
+        log.warning("diff.parent_unavailable", parentDocId=parent_id, parentStatus=parent_status)
+        event["diffs"] = {
+            "changes": [],
+            "impactSummary": (
+                "The parent document is still being analysed. Re-analyze this amendment once it is ready."
+                if pending else
+                "The parent document has no analysis to compare against. Re-analyze the parent, "
+                "then this amendment."
+            ),
+            "parentStatus": "pending" if pending else "unavailable",
+            **value,
+        }
         return event
 
-    amendment = classification.get("amendment") or {}
-    is_delta  = (
-        classification.get("docType") == "AMENDMENT"
-        and (amendment.get("amendmentType") or "none") != "none"
-        and amendment.get("changes")
-    )
+    declared = amendment.get("changes") or []
+    is_delta = is_amendment and (amendment.get("amendmentType") or "none") != "none" and bool(declared)
     if is_delta:
         # Delta document: drive the diff from the amendment's declared changes so
         # we don't fabricate deletions for every parent clause the amendment
         # simply leaves untouched.
-        changes = _diff_amendment(amendment.get("changes") or [], parent_clauses)
-    else:
+        changes = _diff_amendment(declared, parent_clauses)
+    elif len(current_clauses) >= max(3, len(parent_clauses) // 2):
+        # A full restatement of the parent: a clause-by-clause comparison is valid.
         changes = _diff(current_clauses, parent_clauses)
+    else:
+        # A short amendment with no itemised changes. Comparing its few clauses to
+        # the parent by number would invent changes ("clause 1 changed") that the
+        # amendment never made — report nothing rather than something false.
+        changes = []
     _score_impacts(changes, current_clauses)
 
-    summary = _summarise(changes)
-    payload = {"changes": changes, "impactSummary": summary}
+    summary = _summarise(changes) if changes or is_delta else (
+        "This amendment's changes could not be itemised automatically; review it against the parent."
+    )
+    payload = {"changes": changes, "impactSummary": summary, "parentStatus": "compared", **value}
     put_json(processed_bucket, processed_key(tenant_id, doc_id, "diff.json"), payload)
-    log.info("diff.done", changes=len(changes), summary=summary)
+    log.info("diff.done", changes=len(changes),
+             high=sum(1 for c in changes if c["impactScore"] >= 70), mode="delta" if is_delta else "full")
 
     event["diffs"] = payload
     return event
@@ -200,10 +240,12 @@ def _match_parent_clause(
 ) -> dict[str, Any] | None:
     if not target:
         return None
-    # Exact clause-number match (e.g. targetSection "Section 4.2").
-    key = _norm_num(target)
-    if key and key in parent_by_num:
-        return parent_by_num[key]
+    # Exact clause-number match. "Section 4.2", "Clause 7(a)", "§ 3.1 (Fees)" and
+    # "Schedule B" all name a clause by its number — pull the number out rather
+    # than comparing the whole phrase (which never matched "4.2").
+    for key in _target_numbers(target):
+        if key in parent_by_num:
+            return parent_by_num[key]
     # Best title-similarity match above a confidence floor.
     best, best_sim = None, 0.0
     for c in parent:
@@ -246,13 +288,37 @@ def _norm_num(num: str) -> str:
     return "".join(ch for ch in (num or "").lower() if ch.isalnum() or ch == ".")
 
 
+_TARGET_NUM_RE = re.compile(r"\d{1,3}(?:\.\d{1,3})*")
+_TARGET_SCHEDULE_RE = re.compile(
+    r"\b(schedule|exhibit|annexure|annex|appendix|attachment)\s+([A-Za-z]{1,2}|\d{1,2}|[IVX]{1,5})\b",
+    re.IGNORECASE,
+)
+
+
+def _target_numbers(target: str) -> list[str]:
+    """Normalised clause-number keys a target phrase could refer to, most
+    specific first: the whole phrase, a schedule-qualified number, the number."""
+    keys = [_norm_num(target)]
+    sched = _TARGET_SCHEDULE_RE.search(target)
+    nums = _TARGET_NUM_RE.findall(target[sched.end():] if sched else target)
+    if sched:
+        label = f"{sched.group(1)} {sched.group(2)}"
+        keys.extend(_norm_num(f"{label} {n}") for n in nums[:1])
+        keys.append(_norm_num(label))
+    elif nums:
+        keys.append(nums[0])
+        if "." in nums[0]:
+            keys.append(nums[0].rsplit(".", 1)[0])       # "4.2.1" lives inside clause 4.2
+    return [k for k in dict.fromkeys(keys) if k]
+
+
 # ---------------------------------------------------------------------------
 # Impact scoring
 # ---------------------------------------------------------------------------
 
 
 def _score_impacts(changes: list[dict[str, Any]], current: list[dict[str, Any]]) -> None:
-    cat_map = {_norm_num(c.get("number", "")): c.get("category", "Other") for c in current}
+    cat_map = {_norm_num(c.get("number", "")): c.get("category") or "Other" for c in current}
 
     for ch in changes:
         # Amendment-mode changes pre-set `_cat` from the matched parent clause;
@@ -267,27 +333,33 @@ def _score_impacts(changes: list[dict[str, Any]], current: list[dict[str, Any]])
             f"Heuristic: {cat}, field={ch['field']}, Δ={ch['_deltaPct']:.0f}%"
         )
 
-    # LLM refinement for top-N most-changed clauses.
+    # LLM refinement for top-N most-changed clauses, in bounded parallel. Each
+    # call is independent; a failed one leaves that change on its heuristic score.
     top = sorted(changes, key=lambda c: c["_deltaPct"], reverse=True)[:settings.diff_impact_call_cap]
-    for ch in top:
-        try:
-            result = chat_json(
-                system=_IMPACT_SYSTEM,
-                user=(
-                    f"Category: {ch['_cat']}\nField: {ch['field']}\n"
-                    f"BEFORE:\n{(ch['before'] or '')[:3000]}\n\n"
-                    f"AFTER:\n{(ch['after'] or '')[:3000]}"
-                ),
-                json_schema=_IMPACT_SCHEMA,
-                schema_name="ImpactScore",
-                temperature=0.0,
-            )
-            # Clamp defensively to the documented [1, 100] range.
-            ch["impactScore"]     = max(1, min(100, int(result["score"])))
-            ch["impactRationale"] = result["rationale"]
-        except Exception as exc:
-            log.warning("diff.impact_llm_failed",
-                        changeId=ch.get("changeId"), error=str(exc))
+
+    def refine(ch: dict[str, Any]) -> dict[str, Any]:
+        return chat_json(
+            system=_IMPACT_SYSTEM,
+            user=(
+                f"Category: {ch['_cat']}\nField: {ch['field']}\n"
+                f"BEFORE:\n{(ch['before'] or '')[:3000]}\n\n"
+                f"AFTER:\n{(ch['after'] or '')[:3000]}"
+            ),
+            json_schema=_IMPACT_SCHEMA,
+            schema_name="ImpactScore",
+            model=settings.model_for("clause"),
+            temperature=0.0,
+            max_tokens=300,
+        )
+
+    for ch, (result, error) in zip(top, bounded_map(refine, top, settings.llm_max_concurrency)):
+        if error is not None or not isinstance(result, dict) or result.get("score") is None:
+            log.warning("diff.impact_llm_failed", changeId=ch.get("changeId"),
+                        error_type=type(error).__name__ if error else "empty")
+            continue
+        # Clamp defensively to the documented [1, 100] range.
+        ch["impactScore"]     = max(1, min(100, int(result["score"])))
+        ch["impactRationale"] = result.get("rationale") or ch["impactRationale"]
 
     for ch in changes:
         ch.pop("_deltaPct", None)
@@ -322,7 +394,7 @@ def _load_parent_clauses(
             try:
                 return get_json(bucket, key).get("clauses", [])
             except Exception as exc:
-                log.warning("diff.parent_version_load_failed", key=key, error=str(exc))
+                log.warning("diff.parent_version_load_failed", key=key, error_type=type(exc).__name__)
                 break
 
     meta   = get_doc_meta(parent_id) or {}
@@ -330,5 +402,5 @@ def _load_parent_clauses(
     try:
         return get_json(bucket, processed_key(tenant, parent_id, "classification.json")).get("clauses", [])
     except Exception as exc:
-        log.warning("diff.parent_fallback_failed", parentDocId=parent_id, error=str(exc))
+        log.warning("diff.parent_fallback_failed", parentDocId=parent_id, error_type=type(exc).__name__)
         return []

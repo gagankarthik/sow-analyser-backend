@@ -154,5 +154,6 @@ def test_classify_defaults_include_renewal_fields():
     classify._apply_defaults(result)
     tl = result["timeline"]
     assert tl["renewalDate"] is None
-    assert tl["autoRenews"] is False
+    # Not answered ≠ "does not auto-renew": the default is null, not False.
+    assert tl["autoRenews"] is None
     assert "renewalNoticeDays" in tl

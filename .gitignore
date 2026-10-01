@@ -1,5 +1,9 @@
 # Terraform
 .terraform/
+# Saved plans embed every variable in plaintext — including the OpenAI key.
+tfplan
+tfplan.*
+*.tfplan
 *.tfstate
 *.tfstate.*
 .terraform.lock.hcl
