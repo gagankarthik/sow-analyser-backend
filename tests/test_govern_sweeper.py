@@ -86,3 +86,20 @@ def test_a_failing_tenant_does_not_stop_the_others(gov, ddb, monkeypatch):
     with pytest.raises(RuntimeError, match="1 tenant"):
         sweeper.sweep(datetime.now(timezone.utc))
     assert capture.get_reconcile_state("t-good")["lastReconciledAt"]
+
+
+def test_signed_agreements_move_to_renewal_then_expire_from_the_term_end(gov, ddb, monkeypatch):
+    install_analysis(monkeypatch, ddb)
+    seed_doc(ddb, "lic-1")
+    intake.handle_event(analysed_event("lic-1"))
+    now = datetime.now(timezone.utc)
+    end = (now + timedelta(days=200)).date().isoformat()
+    store.contracts.mutate("lic-1", lambda c: c.update(state="active", stage="active", termEndDate=end))
+    assert sweeper.sweep(now)["termMoves"] == 0                                   # 200 days out
+    assert sweeper.sweep(now + timedelta(days=120))["termMoves"] == 1              # 80 days out
+    assert store.contracts.get("lic-1")["stage"] == "renewal"
+    assert sweeper.sweep(now + timedelta(days=121))["termMoves"] == 0              # already there
+    assert sweeper.sweep(now + timedelta(days=202))["termMoves"] == 1              # past the end
+    c = store.contracts.get("lic-1")
+    assert (c["state"], c["stage"]) == ("closed", "expired")
+    assert gov.actions("lic-1")[-2:] == ["renewal_due", "close"]

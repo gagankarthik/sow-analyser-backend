@@ -50,7 +50,7 @@ STATES = ("intake", "in_review", "sent_back", "escalated", "ready_to_sign",
 DIRECTIONS = ("incoming", "outgoing")
 REJECT_REASONS = ("unacceptable_terms", "sponsor_withdrew", "pi_withdrew", "duplicate", "out_of_scope", "other")
 OBLIGATION_KINDS = ("sponsor_report", "milestone_payment", "royalty_report", "diligence_milestone",
-                    "publication_review", "term_end", "closeout", "other")
+                    "publication_review", "term_end", "closeout", "renewal_notice", "data_return", "other")
 INCOME_KINDS = ("upfront", "milestone", "royalty", "equity", "sublicense", "sponsor_funding", "subaward", "other")
 TIERS = ("within", "fallback", "deviates", "unacceptable", "review", "missing")
 RISK_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
@@ -264,10 +264,14 @@ def money(amount: Any, currency: str | None = None) -> str:
 def counterparty_noun(c: dict[str, Any]) -> str:
     """Plain word for the other side: sponsor, licensee, or other party."""
     t = c.get("agreementType")
-    if t in ("sponsored_research", "grant"):
+    if t in ("sponsored_research", "grant", "clinical_trial"):
         return "sponsor"
     if t in ("license", "option"):
         return "licensee"
+    if t == "software":
+        return "vendor"
+    if t == "data_use":
+        return "data provider"
     if t == "collaboration":
         return "collaborator"
     return "other party"
@@ -277,12 +281,17 @@ def _plural(n: int, word: str, plural: str | None = None) -> str:
     return f"{n} {word if n == 1 else (plural or word + 's')}"
 
 
-def fiscal_year(value: Any) -> int | None:
-    """fiscal year: FY2027 runs 1 July 2026 – 30 June 2027."""
+def fiscal_year(value: Any, start_month: int = 7) -> int | None:
+    """Fiscal year, named by the calendar year it ends in. With the default
+    July start, FY2027 runs 1 July 2026 – 30 June 2027; a January start makes
+    it the calendar year. ``start_month`` is the organization's setting."""
     dt = parse_iso(value) if not isinstance(value, datetime) else value
     if dt is None:
         return None
-    return dt.year + 1 if dt.month >= 7 else dt.year
+    start = start_month if isinstance(start_month, int) and 1 <= start_month <= 12 else 7
+    if start == 1:
+        return dt.year
+    return dt.year + 1 if dt.month >= start else dt.year
 
 
 def _whole_days(start: Any, end: datetime) -> int:
@@ -318,7 +327,7 @@ def default_settings() -> dict[str, Any]:
                                      "overdue": True, "escalated": True}},
         "teamsWebhookConfigured": False,
         # The organisation, set during organisation setup (Settings → Overview).
-        "organization": {"name": None, "defaultCurrency": "USD", "fiscalYearStartMonth": 1,
+        "organization": {"name": None, "defaultCurrency": "USD", "fiscalYearStartMonth": 7,
                          "confirmedSteps": [], "setupCompletedAt": None,
                          # Requirement 7: which edition this customer sees (None = deployment default).
                          "edition": None},
@@ -845,7 +854,7 @@ def to_api(c: dict[str, Any], now: datetime | None = None, cfg: dict[str, Any] |
         "manualValue": c.get("manualValue"),
         "expectedValue": c.get("expectedValue"),
         "currency": c.get("currency"),
-        "fiscalYear": fiscal_year(fy_basis),
+        "fiscalYear": fiscal_year(fy_basis, ((cfg.get("organization") or {}).get("fiscalYearStartMonth")) or 7),
         "requestedDate": c.get("requestedDate"),
         "valueBucket": value_bucket(c),
         "matrix": ({"version": matrix.get("version"), "reviewedAt": matrix.get("reviewedAt"),
@@ -870,11 +879,13 @@ def to_api(c: dict[str, Any], now: datetime | None = None, cfg: dict[str, Any] |
         "allowedActions": allowed_actions(c, viewer, cfg) if viewer else [],
         "effectiveDate": c.get("effectiveDate"),
         "termEndDate": c.get("termEndDate"),
+        "parentContractId": c.get("parentContractId"),
+        "amendmentIds": list(c.get("amendmentIds") or []),
         "rev": int(c.get("rev") or 0),
     }
 
 
-_RESEARCH_TYPES = frozenset({"sponsored_research", "grant"})
+_RESEARCH_TYPES = frozenset({"sponsored_research", "clinical_trial", "grant"})
 _SIGNED_STAGES = frozenset({"signed", "active", "renewal", "expired"})
 _APPROVAL_ONWARD = frozenset({"approval"}) | _SIGNED_STAGES
 CAPTURE_GAPS = ("value", "counterparty", "sponsor", "piName", "department", "requestedDate",
@@ -1496,6 +1507,8 @@ def perform_action(contract_id: str, action: str, body: dict[str, Any], actor: d
     stored, _ = _commit(contract_id, change)
     if action == "mark_signed" and stored.get("state") == "signed":
         _replace_sonar_obligations(stored, extra.get("obligations") or [])
+        if stored.get("parentContractId"):
+            _apply_signed_amendment(stored, iso(_now(None)))
     return stored
 
 
@@ -1926,10 +1939,16 @@ def infer_fields(meta: dict[str, Any], classification: dict[str, Any] | None,
     if not college:
         mc = _COLLEGE_PROSE_RE.search(prose)
         college = f"College of {mc.group(1).strip()}" if mc else None
-    sponsor = header.get("sponsor") or (counterparty if agreement_type in ("sponsored_research", "grant", "collaboration") else None)
-    value = meta.get("contractValue")
-    if value is None:
-        value = meta.get("newTotalValue")
+    sponsor = header.get("sponsor") or (counterparty if agreement_type in ("sponsored_research", "clinical_trial", "grant", "collaboration") else None)
+    is_amendment = str(meta.get("docType") or "").upper() == "AMENDMENT" and bool(meta.get("parentDocId"))
+    if is_amendment:
+        # An amendment adds to (or takes from) its parent agreement. Counting
+        # its restated total as its own value would count the money twice.
+        value = meta.get("valueDelta")
+    else:
+        value = meta.get("contractValue")
+        if value is None:
+            value = meta.get("newTotalValue")
     return {
         "title": meta.get("title") or "",
         "docType": meta.get("docType") or "OTHER",
@@ -1948,6 +1967,9 @@ def infer_fields(meta: dict[str, Any], classification: dict[str, Any] | None,
         "overallRisk": meta.get("overallRisk"),
         "huronRecordId": header.get("huronRecordId") or (huron.group(1) if huron else None),
         "workdayRef": header.get("workdayRef") or (workday.group(1) if workday else None),
+        "parentContractId": str(meta["parentDocId"]) if is_amendment else None,
+        "amendsToValue": (float(meta["newTotalValue"]) if is_amendment and isinstance(meta.get("newTotalValue"), (int, float))
+                          and not isinstance(meta.get("newTotalValue"), bool) else None),
     }
 
 
@@ -2032,8 +2054,74 @@ def create_from_document(meta: dict[str, Any], actor: dict[str, Any] | None, *, 
     mirror_lifecycle(c)
     if c.get("huronRecordId") or c.get("workdayRef"):
         sync_external_ids(c)
+    _link_amendment(c, now_s)
     c["rev"] = 1
     return c, True
+
+
+def _link_amendment(c: dict[str, Any], now_s: str) -> None:
+    """Record an amendment on the agreement it amends, so the contract page
+    shows the family and the history stays in one place."""
+    parent_id = c.get("parentContractId")
+    if not parent_id or parent_id == c["contractId"]:
+        return
+
+    def change(p: dict[str, Any], entries: list[dict[str, Any]]) -> Any:
+        if p.get("tenantId") != c.get("tenantId"):
+            return False
+        ids = list(p.get("amendmentIds") or [])
+        if c["contractId"] in ids:
+            return False
+        p["amendmentIds"] = ids + [c["contractId"]]
+        entries.append(_entry("amendment_added", None, f"An amendment arrived: {_clip(c.get('title') or 'Untitled', 120)}.",
+                              at=now_s, detail={"amendmentId": c["contractId"]}))
+        return None
+
+    try:
+        _commit(parent_id, change)
+    except NotFound:
+        c["parentContractId"] = None
+
+
+def _apply_signed_amendment(amendment: dict[str, Any], now_s: str) -> None:
+    """A signed amendment changes its parent: the parent's value becomes the
+    amendment's restated total (or the parent plus the change), and a later
+    term end extends the parent. A value a person entered is never replaced."""
+    parent_id = amendment.get("parentContractId")
+    if not parent_id:
+        return
+
+    def change(p: dict[str, Any], entries: list[dict[str, Any]]) -> Any:
+        if p.get("tenantId") != amendment.get("tenantId"):
+            return False
+        notes = []
+        if "manualValue" not in (p.get("userFields") or []) and p.get("manualValue") is None:
+            new_total = amendment.get("amendsToValue")
+            delta = amendment.get("extractedValue")
+            before = p.get("extractedValue")
+            if isinstance(new_total, (int, float)):
+                p["extractedValue"] = float(new_total)
+            elif isinstance(delta, (int, float)) and isinstance(before, (int, float)):
+                p["extractedValue"] = float(before) + float(delta)
+            if p.get("extractedValue") != before and p.get("extractedValue") is not None:
+                notes.append(f"value now {p['extractedValue']:,.0f}")
+        new_end = amendment.get("termEndDate")
+        if new_end and (not p.get("termEndDate") or str(new_end) > str(p.get("termEndDate"))) \
+                and "termEndDate" not in (p.get("userFields") or []):
+            p["termEndDate"] = new_end
+            notes.append(f"term now ends {str(new_end)[:10]}")
+        if not notes:
+            return False
+        p["updatedAt"] = now_s
+        entries.append(_entry("amendment_signed", None,
+                              f"Amendment signed ({_clip(amendment.get('title') or '', 80)}): {', '.join(notes)}.",
+                              at=now_s, detail={"amendmentId": amendment["contractId"]}))
+        return None
+
+    try:
+        _commit(parent_id, change)
+    except NotFound:
+        pass
 
 
 def _norm_blockers(raw: list[dict[str, Any]], now_s: str) -> list[dict[str, Any]]:
@@ -2290,6 +2378,50 @@ def mark_overdue(contract_id: str, *, now: datetime | None = None, cfg: dict[str
     except NotFound:
         return False
     return bool(entries)
+
+
+RENEWAL_WINDOW_DAYS = 90
+
+
+def advance_term(contract_id: str, *, now: datetime | None = None) -> str | None:
+    """Move a signed agreement along its term, from its term end date: into
+    "Up for renewal" ``RENEWAL_WINDOW_DAYS`` before the end, and to "Expired"
+    (closed) once the end has passed. Returns the new stage, or None when
+    nothing changed. Nobody sets these by hand."""
+    now_dt = _now(now)
+    now_s = iso(now_dt)
+    today = now_dt.date()
+
+    def change(c: dict[str, Any], entries: list[dict[str, Any]]) -> Any:
+        if c.get("state") not in ("signed", "active"):
+            return False
+        end = parse_iso(c.get("termEndDate"))
+        if end is None:
+            return False
+        end_d = end.date()
+        if end_d < today:
+            from_stage, to_stage = _enter_state(c, "closed", now_s)
+            entries.append(_entry("close", None, f"The term ended on {end_d.isoformat()}, so the agreement has expired.",
+                                  from_stage=from_stage, to_stage=to_stage, at=now_s,
+                                  detail={"reason": "term_ended", "termEndDate": end_d.isoformat()}))
+            return None
+        if (end_d - today).days <= RENEWAL_WINDOW_DAYS and c.get("stage") != "renewal":
+            from_stage = c.get("stage")
+            c["stage"] = "renewal"
+            c["stageEnteredAt"] = now_s
+            c["updatedAt"] = now_s
+            entries.append(_entry("renewal_due", None,
+                                  f"The term ends on {end_d.isoformat()}: decide whether to renew, renegotiate or let it end.",
+                                  from_stage=from_stage, to_stage="renewal", at=now_s,
+                                  detail={"termEndDate": end_d.isoformat()}))
+            return None
+        return False
+
+    try:
+        c, entries = _commit(contract_id, change)
+    except NotFound:
+        return None
+    return c.get("stage") if entries else None
 
 
 def note_obligation(c: dict[str, Any], obligation: dict[str, Any], kind: str, now: datetime | None = None) -> None:

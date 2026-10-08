@@ -84,21 +84,26 @@ from ..playbook import rule_id_for_clause, valid_rule_id
 # ---------------------------------------------------------------------------
 
 AGREEMENT_TYPES: list[str] = [
-    "sponsored_research", "grant", "license", "option", "mta", "nda", "collaboration", "other",
+    "sponsored_research", "clinical_trial", "grant", "license", "option", "mta", "data_use", "nda",
+    "collaboration", "software", "other",
 ]
 AGREEMENT_TYPE_LABELS: dict[str, str] = {
     "sponsored_research": "Sponsored research",
+    "clinical_trial": "Clinical trial",
     "grant": "Grant / subaward",
     "license": "License",
     "option": "Option",
     "mta": "Material transfer (MTA)",
+    "data_use": "Data use (DUA)",
     "nda": "Non-disclosure (NDA / CDA)",
     "collaboration": "Collaboration",
+    "software": "Software or SaaS (purchase)",
     "other": "Other",
 }
 
 OFFICES: list[str] = [
     "legal_affairs", "tech_commercialization", "sponsored_programs", "export_control", "risk_management",
+    "procurement", "it_security", "accessibility",
 ]
 OFFICE_LABELS: dict[str, str] = {
     "legal_affairs": "Legal Affairs",
@@ -106,6 +111,9 @@ OFFICE_LABELS: dict[str, str] = {
     "sponsored_programs": "Sponsored Programs",
     "export_control": "Export Control",
     "risk_management": "Risk Management",
+    "procurement": "Procurement",
+    "it_security": "IT Security",
+    "accessibility": "Digital Accessibility",
 }
 
 # The ten research / licensing clause types the built-in checks cover.
@@ -238,7 +246,10 @@ def _th(thresholds: dict[str, Any], key: str) -> float:
     value = thresholds.get(key)
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
-    return float(_THRESHOLD_DEFAULTS.get(key, 0))
+    if key in _THRESHOLD_DEFAULTS:
+        return float(_THRESHOLD_DEFAULTS[key])
+    from . import software  # buyer-side thresholds (software purchases)
+    return float(software.THRESHOLD_DEFAULTS.get(key, 0))
 
 
 # "Our" party in a research or licensing agreement.
@@ -853,8 +864,12 @@ _ESCALATE_KEY = "escalateOnDeviation"
 _THRESHOLD_DEFAULTS: dict[str, float] = {k: v for t in _THRESHOLDS.values() for k, v in t.items()}
 
 
-def thresholds_for(clause_type: str) -> dict[str, float]:
-    """The thresholds a clause type's built-in check reads, with their defaults."""
+def thresholds_for(clause_type: str, agreement_type: str | None = None) -> dict[str, float]:
+    """The thresholds a clause type's built-in check reads, with their defaults.
+    A software purchase uses the buyer-side checks, which read their own."""
+    if agreement_type == "software":
+        from . import software
+        return dict(software.THRESHOLDS.get(clause_type, {}))
     return dict(_THRESHOLDS.get(clause_type, {}))
 
 
@@ -1252,10 +1267,23 @@ def default_matrix() -> dict[str, Any]:
         _clause("Termination", "Either party may terminate on written notice, with a cure period for breach.",
                 None, [], [], "legal_affairs", _LANG["termination"], None, False),
     ]
+    # Clinical trials follow sponsored research, with the sponsor covering
+    # subject injury; data use agreements protect data and the right to publish.
+    clinical_trial_clauses = copy.deepcopy(research_clauses)
+    data_use_clauses = [
+        _data_rights(),
+        _pub("legal_affairs"),
+        _confidentiality(True),
+        _indemnity(),
+        _law(),
+        _export(required=False),
+    ]
+    from . import software
     by_type = {
-        "sponsored_research": research_clauses, "grant": grant_clauses, "license": license_clauses,
-        "option": option_clauses, "mta": mta_clauses, "nda": nda_clauses,
-        "collaboration": collaboration_clauses, "other": other_clauses,
+        "sponsored_research": research_clauses, "clinical_trial": clinical_trial_clauses,
+        "grant": grant_clauses, "license": license_clauses, "option": option_clauses, "mta": mta_clauses,
+        "data_use": data_use_clauses, "nda": nda_clauses, "collaboration": collaboration_clauses,
+        "software": software.default_clauses(), "other": other_clauses,
     }
     return {
         "version": 1,
@@ -1314,7 +1342,7 @@ def _clean_phrases(value: Any) -> list[str] | None:
     return out if len(out) <= _MAX_PHRASES else None
 
 
-def _validate_clause(raw: Any, where: str) -> tuple[dict[str, Any] | None, str | None]:
+def _validate_clause(raw: Any, where: str, agreement_type: str | None = None) -> tuple[dict[str, Any] | None, str | None]:
     if not isinstance(raw, dict):
         return None, f"{where}: each clause must be an object"
     unknown = set(raw) - _CLAUSE_FIELDS
@@ -1339,7 +1367,7 @@ def _validate_clause(raw: Any, where: str) -> tuple[dict[str, Any] | None, str |
     thresholds = raw.get("thresholds") or {}
     if not isinstance(thresholds, dict):
         return None, f"{where} ({clause_type}): thresholds must be an object"
-    known = set(thresholds_for(clause_type)) | {_ESCALATE_KEY}
+    known = set(thresholds_for(clause_type, agreement_type)) | {_ESCALATE_KEY}
     clean_th: dict[str, float] = {}
     for key, value in thresholds.items():
         if key not in known:
@@ -1395,7 +1423,7 @@ def validate_matrix(playbooks: Any) -> tuple[dict[str, Any] | None, str | None]:
         clean: list[dict[str, Any]] = []
         seen: set[str] = set()
         for i, raw in enumerate(clauses):
-            item, err = _validate_clause(raw, f"{agreement_type} clause {i + 1}")
+            item, err = _validate_clause(raw, f"{agreement_type} clause {i + 1}", agreement_type)
             if err:
                 return None, err
             if item["clauseType"] in seen:
@@ -1455,6 +1483,9 @@ _CLAUSE_KEYWORDS: list[tuple[str, str]] = [
 ]
 
 _AGREEMENT_SYNONYMS: list[tuple[str, str]] = [
+    (r"clinical|\bcta\b", "clinical_trial"),
+    (r"data\s+use|\bdua\b|data\s+sharing", "data_use"),
+    (r"software|saas|subscription|eula|cloud", "software"),
     (r"sponsored|\bsra\b|research\s+agreement", "sponsored_research"),
     (r"grant|award|subaward|sub-award", "grant"),
     (r"option", "option"),
@@ -1629,10 +1660,10 @@ def parse_import(agreement_type: str, rows: list[dict[str, Any]] | None = None,
             "beneficial": row.get("beneficial"),
             "escalationOffice": office,
             "suggestedLanguage": row.get("suggestedLanguage"),
-            "thresholds": {**thresholds_for(clause_type), **thresholds},
+            "thresholds": {**thresholds_for(clause_type, agreement_type), **thresholds},
             "required": _parse_bool(row.get("required")),
         }
-        item, err = _validate_clause(candidate, f"row {index}")
+        item, err = _validate_clause(candidate, f"row {index}", agreement_type)
         if err:
             skipped.append({"row": index, "reason": err.split(": ", 1)[-1]})
             continue
@@ -1695,6 +1726,8 @@ _ALIASES: dict[str, list[str]] = {
     "SponsorReporting": ["Compliance"],
     "Indemnity": ["Insurance"],
     "Diligence": [],
+    "DataProcessing": ["DataProtection", "BreachNotification", "DataRetention", "SubProcessors"],
+    "Fees": ["Payment", "Royalties"],
 }
 # Wording that marks a clause as being about a matrix clause type (heading first,
 # then the body) — the last resort before "missing".
@@ -1710,6 +1743,12 @@ _SIGNALS: dict[str, str] = {
     "SponsorReporting": r"\breports?\b|flow[- ]?down",
     "Diligence": r"diligen",
     "Confidentiality": r"confidential",
+    "type.service-levels": r"service\s+levels?|\bsla\b|uptime|availability",
+    "Accessibility": r"accessib|wcag|section\s+508",
+    "SecurityControls": r"\bsecurity\b|safeguards",
+    "Term": r"\bterm\b|renewal",
+    "AuditRights": r"\baudit",
+    "DataProcessing": r"data\s+(?:protection|privacy|security)|privacy|ferpa|hipaa",
 }
 
 
@@ -1762,12 +1801,20 @@ def home_state(value: Any) -> str | None:
     return match
 
 
-def _grade(mclause: dict[str, Any], text: str, home: str | None = None) -> _Check:
+def _grade(mclause: dict[str, Any], text: str, home: str | None = None,
+           agreement_type: str | None = None) -> _Check:
     """Built-in check, then the phrase lists; the more serious tier wins.
-    ``home`` is the matrix's home state, read by the governing-law check."""
+    ``home`` is the matrix's home state, read by the governing-law check. A
+    software purchase is graded by the buyer-side checks (``software.py``):
+    there the university is the customer and the vendor the other party."""
     clause_type = mclause["clauseType"]
-    thresholds = {**thresholds_for(clause_type), **(mclause.get("thresholds") or {}), "homeState": home}
-    check = _CHECKS.get(clause_type)
+    if agreement_type == "software":
+        from . import software
+        thresholds = {**software.THRESHOLDS.get(clause_type, {}), **(mclause.get("thresholds") or {}), "homeState": home}
+        check = software.CHECKS.get(clause_type)
+    else:
+        thresholds = {**thresholds_for(clause_type), **(mclause.get("thresholds") or {}), "homeState": home}
+        check = _CHECKS.get(clause_type)
     result: _Check | None = check(text, thresholds) if check else None
     hit = _phrase_hit(text, mclause.get("unacceptable") or [])
     if hit and not (result and result.tier == "unacceptable"):
@@ -1810,7 +1857,11 @@ def review_document(clauses: list[dict[str, Any]], agreement_type: str, matrix: 
     ``escalateOnDeviation`` = 1)."""
     playbooks = (matrix or {}).get("playbooks") or {}
     home = home_state((matrix or {}).get("homeState"))
-    book = playbooks.get(agreement_type) or playbooks.get("other") or {"clauses": []}
+    # A matrix saved before an agreement type existed has no playbook for it:
+    # use the built-in one rather than grading it as "other".
+    book = (playbooks.get(agreement_type)
+            or (default_matrix()["playbooks"].get(agreement_type) if agreement_type != "other" else None)
+            or playbooks.get("other") or {"clauses": []})
     mclauses = [c for c in book.get("clauses") or [] if isinstance(c, dict) and c.get("clauseType")]
     graded_types = {c["clauseType"] for c in mclauses}
     typed = [(rule_id_for_clause(c), c) for c in clauses or [] if isinstance(c, dict)]
@@ -1839,12 +1890,12 @@ def review_document(clauses: list[dict[str, Any]], agreement_type: str, matrix: 
                             "found": None, "quote": None})
             continue
         text = "\n\n".join(str(c.get("body") or "") for c in matched)
-        graded = _grade(mclause, text, home)
+        graded = _grade(mclause, text, home, agreement_type)
         # Point at the clause whose own text carries the outcome.
         anchor = matched[0]
         if len(matched) > 1:
             for c in matched:
-                if _grade(mclause, str(c.get("body") or ""), home).tier == graded.tier:
+                if _grade(mclause, str(c.get("body") or ""), home, agreement_type).tier == graded.tier:
                     anchor = c
                     break
         counts[graded.tier] += 1
@@ -1940,12 +1991,17 @@ def infer_agreement_type(doc_meta: dict[str, Any] | None, classification: dict[s
     rules: list[tuple[str, str]] = [
         (r"\boption\b", "option"),
         (r"material\s+transfer|\bmta\b", "mta"),
+        (r"clinical\s+(?:trial|study)|\bcta\b", "clinical_trial"),
+        (r"data\s+use|\bdua\b|data\s+sharing|data\s+transfer\s+agreement", "data_use"),
         (r"sponsored\s+research|research\s+agreement|clinical\s+research|\bsra\b", "sponsored_research"),
         (r"\bsub-?awards?\b|\bgrant\s+agreement\b|\bgrant\b|\baward\b|cooperative\s+agreement", "grant"),
         (r"collaborat", "collaboration"),
         (r"non-?\s?disclosure|confidential\s+disclosure|confidentiality\s+agreement|\bnda\b|\bcda\b", "nda"),
         (r"licen[cs]e\s+agreement|\blicen[cs]e\b", "license"),
     ]
+    from . import software
+    if software.looks_like_software_purchase(title, rest + " " + _all_text(classification).lower(), doc_type):
+        return "software"
     for pattern, kind in rules:
         if re.search(pattern, title):
             if kind == "option" and not (doc_type == "LICENSE" or re.search(r"licen[cs]|agreement", title)):
@@ -1954,6 +2010,8 @@ def infer_agreement_type(doc_meta: dict[str, Any] | None, classification: dict[s
     summary_rules: list[tuple[str, str]] = [
         (r"\boption\s+agreement\b|exclusive\s+option", "option"),
         (r"material\s+transfer", "mta"),
+        (r"clinical\s+trial|clinical\s+study\s+agreement|investigational\s+(?:drug|product|device)", "clinical_trial"),
+        (r"data\s+use\s+agreement|data\s+sharing\s+agreement|limited\s+data\s+set", "data_use"),
         (r"sponsored\s+research|research\s+agreement", "sponsored_research"),
         (r"\bsub-?award\b|grant\s+agreement|federal\s+award|prime\s+award|cooperative\s+agreement", "grant"),
         (r"collaboration\s+agreement|research\s+collaboration", "collaboration"),
@@ -1981,6 +2039,8 @@ def infer_direction(agreement_type: str, classification: dict[str, Any] | None) 
     subawards, vendor spend). License, option, sponsored research and grants are
     incoming unless the text shows your organization paying — your organization as pass-through entity or
     "Organization shall pay / reimburse" the other party."""
+    if agreement_type == "software":
+        return "outgoing"
     low = _all_text(classification).lower()
     ours_pays = re.search(
         rf"pass-?through\s+entity|{_US}\s+(?:shall|will|agrees\s+to)\s+(?:pay|reimburse)\b"
@@ -2026,6 +2086,23 @@ def _term_end(classification: dict[str, Any] | None) -> str | None:
     end = (cls.get("timeline") or {}).get("endDate")
     if isinstance(end, str) and re.match(r"^\d{4}-\d{2}-\d{2}", end):
         return end[:10]
+    return None
+
+
+def _notice_days(timeline: dict[str, Any], classification: dict[str, Any]) -> int | None:
+    """Days of notice needed to stop an automatic renewal: the extracted
+    ``timeline.renewalNoticeDays``, else read from a renewal sentence."""
+    value = timeline.get("renewalNoticeDays")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= 400:
+        return int(value)
+    for clause, sentences in _clause_sentences(classification):
+        for sentence in sentences:
+            low = sentence.lower()
+            if re.search(r"automatic(?:ally)?\s+renew|auto[- ]?renew|renew\s+automatically", low) or \
+                    (re.search(r"non[- ]?renew", low) and "notice" in low):
+                days = [d for d, unit, _p in _durations(sentence) if unit in ("day", "week", "month") and d <= 400]
+                if days and "notice" in low:
+                    return max(days)
     return None
 
 
@@ -2114,12 +2191,12 @@ def extract_income(classification: dict[str, Any] | None, agreement_type: str) -
                     add("equity", f"Equity of {_fmt(pct)}%", None, pct)
             if any(kind != "other" for kind, _pct in shares):
                 continue
-            if agreement_type in ("sponsored_research", "grant", "collaboration") and amounts and re.search(
+            if agreement_type in ("sponsored_research", "clinical_trial", "grant", "collaboration") and amounts and re.search(
                     r"total|not\s+to\s+exceed|budget|fixed\s+price|amount\s+of|funding|support", low):
                 biggest = max(amounts)
                 if funding is None or biggest > funding[0]:
                     funding = (biggest, _short(s))
-    if agreement_type in ("sponsored_research", "grant", "collaboration"):
+    if agreement_type in ("sponsored_research", "clinical_trial", "grant", "collaboration"):
         if funding is None:
             total = (cls.get("commercials") or {}).get("totalContractValue")
             if isinstance(total, (int, float)) and not isinstance(total, bool) and total > 0:
@@ -2198,7 +2275,7 @@ def extract_obligations(classification: dict[str, Any] | None, agreement_type: s
                 freq = _report_frequency(s)
                 if "final" in low:
                     due = add_offset(term_end, int(within.group(1)), "days") if (within and term_end) else None
-                    add("sponsor_report" if agreement_type in ("sponsored_research", "grant", "collaboration")
+                    add("sponsor_report" if agreement_type in ("sponsored_research", "clinical_trial", "grant", "collaboration")
                         else "closeout", "Final report" + (f" (within {within.group(1)} days of the end of the term)"
                                                            if within else ""), due)
                 if freq:
@@ -2228,6 +2305,16 @@ def extract_obligations(classification: dict[str, Any] | None, agreement_type: s
                 durs = [d for d, unit, _p in _durations(s) if unit != "year"]
                 if durs and re.search(r"review|comment|submit|prior\s+to", low):
                     add("publication_review", f"Publication review window ({max(durs)} days per manuscript)")
+    # Auto-renewal: the last day to stop the renewal is the deadline that costs
+    # money when missed (a whole extra term), so it is tracked like any other.
+    timeline = cls.get("timeline") or {}
+    notice_days = _notice_days(timeline, cls)
+    renews = bool(timeline.get("autoRenews")) or notice_days is not None
+    if term_end and renews and notice_days:
+        add("renewal_notice", f"Last day to give notice to stop the automatic renewal ({notice_days} days before the term ends)",
+            add_offset(term_end, notice_days, "days", direction=-1))
+    if agreement_type == "software" and term_end:
+        add("data_return", "Export and retrieve your data before the subscription ends", term_end)
     if term_end:
         add("term_end", "Agreement term ends", term_end)
     for n, o in enumerate(out, start=1):

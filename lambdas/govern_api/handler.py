@@ -70,6 +70,7 @@ _ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _NOT_FOUND = "Contract not found"
 _FORBIDDEN = "You do not have permission to do that on this contract"
 _ADMIN_ONLY = "Only a Govern admin can do that"
+_LEADER_READ_ONLY = "Leaders can view, comment and approve; ask a reviewer to change this contract"
 # Documents turned into contracts by one GET /contracts (the rest follow on
 # the next call; intake and the hourly reconciliation also create them).
 _MAX_LAZY_CREATES = 100
@@ -190,6 +191,10 @@ def _contract_for(contract_id: str, user: GovernUser, capability: str) -> tuple[
         raise workflow.NotFound(_NOT_FOUND)
     if not can(role, capability):
         raise _Forbidden(_FORBIDDEN)
+    # Leaders view, comment and approve for their office; changing a
+    # contract's details, open items, money or obligations is reviewers' work.
+    if capability == "edit" and user.is_leader:
+        raise _Forbidden(_LEADER_READ_ONLY)
     return c, role
 
 

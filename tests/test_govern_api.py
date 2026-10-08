@@ -389,7 +389,7 @@ def test_portfolio_obligations_list(world):
 
 def test_organization_settings(world):
     org = call("GET", "/workflow/settings", OWNER)[1]["settings"]["organization"]
-    assert org == {"name": None, "defaultCurrency": "USD", "fiscalYearStartMonth": 1, "confirmedSteps": [],
+    assert org == {"name": None, "defaultCurrency": "USD", "fiscalYearStartMonth": 7, "confirmedSteps": [],
                    "setupCompletedAt": None, "edition": None}
     assert call("PUT", "/workflow/settings", OWNER, {"organization": {"edition": "workforce"}})[1]["settings"]["organization"]["edition"] == "workforce"
     assert call("PUT", "/workflow/settings", OWNER, {"organization": {"edition": "enterprise"}})[0] == 400
@@ -425,3 +425,15 @@ def test_obligation_verification(world):
     assert call("PATCH", f"/contracts/lic-1/obligations/{oid}", OWNER, {"verified": "yes"})[0] == 400
     listed = call("GET", "/obligations", OWNER)[1]["obligations"][0]
     assert listed["verified"] is True
+
+
+def test_a_leader_who_edits_the_workspace_still_cannot_change_a_contract(world):
+    # OWNER owns the workspace (full edit rights) but signs in as a leader.
+    status, body = call("PATCH", "/contracts/lic-1", OWNER, {"department": "Physics"}, groups=["govern-leader"])
+    assert status == 403 and "Leaders" in body["error"]
+    status, _ = call("POST", "/contracts/lic-1/blockers", OWNER, {"text": "Check the indemnity"}, groups=["govern-leader"])
+    assert status == 403
+    # Commenting is still theirs.
+    status, _ = call("POST", "/contracts/lic-1/actions", OWNER, {"action": "comment", "text": "Looks fine"},
+                     groups=["govern-leader"])
+    assert status == 200

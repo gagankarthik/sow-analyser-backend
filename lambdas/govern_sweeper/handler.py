@@ -46,7 +46,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
 
 def sweep(now: datetime) -> dict[str, Any]:
-    totals = {"tenants": 0, "overdue": 0, "obligations": 0, "requeued": 0, "missed": 0, "failedTenants": 0}
+    totals = {"tenants": 0, "overdue": 0, "termMoves": 0, "obligations": 0, "requeued": 0, "missed": 0, "failedTenants": 0}
     for tenant_id in store.config.tenants():
         totals["tenants"] += 1
         try:
@@ -55,7 +55,7 @@ def sweep(now: datetime) -> dict[str, Any]:
             log.exception("govern_sweeper.tenant_failed", tenantId=tenant_id, error_type=type(exc).__name__)
             totals["failedTenants"] += 1
             continue
-        for k in ("overdue", "obligations", "requeued", "missed"):
+        for k in ("overdue", "termMoves", "obligations", "requeued", "missed"):
             totals[k] += result[k]
     log.info("govern_sweeper.done", **totals)
     if totals["failedTenants"]:
@@ -72,9 +72,14 @@ def sweep_tenant(tenant_id: str, now: datetime) -> dict[str, int]:
             continue
         if workflow.sla(c, cfg, now)["slaStatus"] in ("amber", "red"):
             overdue += int(workflow.mark_overdue(c["contractId"], now=now, cfg=cfg))
+    # Signed agreements move to "Up for renewal" and then "Expired" from their term end date.
+    term_moves = 0
+    for c in contracts:
+        if c.get("state") in ("signed", "active") and c.get("termEndDate"):
+            term_moves += int(workflow.advance_term(c["contractId"], now=now) is not None)
     obligations = _sweep_obligations(tenant_id, now)
     requeued, missed = reconcile(tenant_id, contracts, now)
-    return {"overdue": overdue, "obligations": obligations, "requeued": requeued, "missed": missed}
+    return {"overdue": overdue, "termMoves": term_moves, "obligations": obligations, "requeued": requeued, "missed": missed}
 
 
 def _sweep_obligations(tenant_id: str, now: datetime) -> int:

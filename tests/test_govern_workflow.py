@@ -413,3 +413,10 @@ def test_user_set_fields_survive_reanalysis(lic, ddb):
     assert lic.actions("lic-1")[-1] == "rescored"
     with pytest.raises(workflow.BadRequest):
         workflow.clean_fields({"termEndDate": "soon"})
+
+
+def test_fiscal_year_follows_the_organization_start_month():
+    assert workflow.fiscal_year("2026-03-15", 1) == 2026      # calendar year
+    assert workflow.fiscal_year("2026-03-15", 10) == 2026     # Oct start: Mar 2026 is in FY2026
+    assert workflow.fiscal_year("2026-10-01", 10) == 2027
+    assert workflow.fiscal_year("2026-07-01") == 2027         # default July start
