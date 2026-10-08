@@ -75,6 +75,13 @@ _CATEGORY_WEIGHTS: dict[str, dict[str, float]] = {
     "IP":               {"ip_venture": 1},
     "Subcontracting":   {"grants": 1},
     "Compliance":       {"grants": 1},
+    # Research & licensing types (OSU matrix): tech-transfer vs sponsored research.
+    "Diligence":         {"ip_venture": 2},
+    "BackgroundIP":      {"ip_venture": 1, "grants": 1},
+    "PublicationRights": {"grants": 2},
+    "SponsorReporting":  {"grants": 2},
+    "ExportControl":     {"grants": 1},
+    "DataRights":        {"grants": 1},
 }
 
 # docType nudges.

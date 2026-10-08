@@ -166,6 +166,30 @@ class Caller:
                 best = stronger(best, roles.get(project["projectId"]))
         return best
 
+    def visible_documents(self) -> dict[str, dict[str, Any]]:
+        """{docId: META row + ``_role``} for every document this caller may
+        read: their own uploads (owner) plus the contents of every project they
+        belong to (their strongest role there). One tenant listing, one
+        projects batch read and one documents batch read — no per-document
+        lookups."""
+        docs: dict[str, dict[str, Any]] = {}
+        for d in dynamodb.list_tenant_docs(self.tenant_id):
+            if d.get("docId") and self.owns(d):
+                docs[d["docId"]] = dict(d, _role="owner")
+        roles = self.project_roles()
+        if roles:
+            wanted: dict[str, str] = {}
+            for project in dynamodb.get_projects(list(roles)):
+                role = roles[project["projectId"]]
+                for doc_id in project.get("docIds") or []:
+                    if doc_id not in docs and stronger(wanted.get(doc_id), role) == role:
+                        wanted[doc_id] = role
+            for meta in dynamodb.get_docs(list(wanted)):
+                doc_id = meta.get("docId")
+                if doc_id:
+                    docs[doc_id] = dict(meta, _role=wanted[doc_id])
+        return docs
+
     def visible_doc_ids(self) -> list[str]:
         """Every document id this caller may read: their own uploads plus the
         contents of every project they can see. Used to scope search."""

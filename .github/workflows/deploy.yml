@@ -109,30 +109,64 @@ jobs:
       - name: Terraform plan
         working-directory: terraform
         env:
-          TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          # The OpenAI key is NOT passed to Terraform (it would land in state):
+          # it is written to Secrets Manager by the step after apply.
           TF_VAR_chat_model:     ${{ secrets.CHAT_MODEL }}
           TF_VAR_aws_region:     ${{ secrets.AWS_REGION }}
           TF_VAR_stage:          ${{ github.event.inputs.stage || 'dev' }}
           TF_VAR_project_name:   blue-iq-sow
+          TF_VAR_ai_provider:    ${{ vars.AI_PROVIDER || 'openai' }}
+          TF_VAR_notify_from_email: ${{ vars.NOTIFY_FROM_EMAIL }}
+          # Sandbox only; Terraform ignores it outside the dev stage too.
+          TF_VAR_govern_open_admin: ${{ (github.event.inputs.stage || 'dev') == 'dev' }}
         run: terraform plan -out=tfplan
 
       - name: Terraform apply
         working-directory: terraform
         env:
-          TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          # The OpenAI key is NOT passed to Terraform (it would land in state):
+          # it is written to Secrets Manager by the step after apply.
           TF_VAR_chat_model:     ${{ secrets.CHAT_MODEL }}
           TF_VAR_aws_region:     ${{ secrets.AWS_REGION }}
           TF_VAR_stage:          ${{ github.event.inputs.stage || 'dev' }}
           TF_VAR_project_name:   blue-iq-sow
+          TF_VAR_ai_provider:    ${{ vars.AI_PROVIDER || 'openai' }}
+          TF_VAR_notify_from_email: ${{ vars.NOTIFY_FROM_EMAIL }}
+          # Sandbox only; Terraform ignores it outside the dev stage too.
+          TF_VAR_govern_open_admin: ${{ (github.event.inputs.stage || 'dev') == 'dev' }}
         run: terraform apply -auto-approve tfplan
+
+      # Write the OpenAI key into its Secrets Manager secret (out of Terraform
+      # state). Skipped when the GitHub secret is not set, e.g. the key is
+      # managed in the AWS console instead.
+      - name: Store the OpenAI key in Secrets Manager
+        working-directory: terraform
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "${OPENAI_API_KEY}" ]; then
+            aws secretsmanager put-secret-value \
+              --secret-id "$(terraform output -raw openai_secret_arn)" \
+              --secret-string "${OPENAI_API_KEY}" > /dev/null
+            echo "OpenAI key stored in Secrets Manager."
+          else
+            echo "OPENAI_API_KEY GitHub secret not set; leaving the Secrets Manager value as is."
+          fi
 
       - name: Print API URL
         working-directory: terraform
         env:
-          TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          # The OpenAI key is NOT passed to Terraform (it would land in state):
+          # it is written to Secrets Manager by the step after apply.
           TF_VAR_chat_model:     ${{ secrets.CHAT_MODEL }}
           TF_VAR_aws_region:     ${{ secrets.AWS_REGION }}
           TF_VAR_stage:          ${{ github.event.inputs.stage || 'dev' }}
           TF_VAR_project_name:   blue-iq-sow
+          TF_VAR_ai_provider:    ${{ vars.AI_PROVIDER || 'openai' }}
+          TF_VAR_notify_from_email: ${{ vars.NOTIFY_FROM_EMAIL }}
+          # Sandbox only; Terraform ignores it outside the dev stage too.
+          TF_VAR_govern_open_admin: ${{ (github.event.inputs.stage || 'dev') == 'dev' }}
         run: |
           echo "Documents API: $(terraform output -raw documents_api_url)"
+          echo "DocuSign Connect URL: $(terraform output -raw docusign_webhook_url)"
+          echo "Govern tables: $(terraform output -json govern_table_names)"

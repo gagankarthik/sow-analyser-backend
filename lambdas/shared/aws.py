@@ -11,6 +11,9 @@ from typing import Any
 import boto3
 from botocore.config import Config
 
+# Outbound calls from the Govern side-effect Lambdas must not hang an invocation.
+_SHORT_TIMEOUTS = Config(connect_timeout=5, read_timeout=15)
+
 from .config import settings
 
 
@@ -65,6 +68,25 @@ def appsync_client() -> Any:
 def cognito_idp_client() -> Any:
     """Cognito user-pool admin client — used to invite users to a tenant."""
     return session().client("cognito-idp", config=_BOTO_CONFIG)
+
+
+@lru_cache(maxsize=None)
+def events_client() -> Any:
+    """EventBridge — Govern domain events and the pipeline's Document Analysed."""
+    return session().client("events", config=_BOTO_CONFIG.merge(_SHORT_TIMEOUTS))
+
+
+@lru_cache(maxsize=None)
+def sqs_client() -> Any:
+    """SQS — the sweeper re-enqueues missed documents to the intake queue."""
+    return session().client("sqs", config=_BOTO_CONFIG.merge(_SHORT_TIMEOUTS))
+
+
+@lru_cache(maxsize=None)
+def ses_client() -> Any:
+    """SES v2 for alert email (its region may differ from the stack's)."""
+    return session().client("sesv2", region_name=settings.ses_region or settings.aws_region,
+                            config=_BOTO_CONFIG.merge(_SHORT_TIMEOUTS))
 
 
 def get_credentials():

@@ -196,7 +196,8 @@ def test_a_document_goes_from_upload_to_ready_with_nothing_lost(world):
 
     doc_id = "doc-sow-0001"
     final = world["run"](world["upload"](doc_id, SOW))
-    assert final == {"status": "READY", "docId": doc_id}
+    # The terminal result is the detail of the "Document Analysed" event.
+    assert final == {"status": "READY", "docId": doc_id, "tenantId": TENANT, "docType": "SOW", "revisionOf": None}
 
     meta = world["ddb"].doc(doc_id)
     cls = world["processed"][f"{TENANT}/{doc_id}/classification.json"]

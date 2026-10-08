@@ -153,9 +153,9 @@ resource "aws_iam_role_policy" "diff" {
         Resource = "${aws_s3_bucket.processed.arn}/*"
       },
       {
-        Sid    = "DDBRead"
-        Effect = "Allow"
-        Action = ["dynamodb:GetItem", "dynamodb:Query"]
+        Sid      = "DDBRead"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:Query"]
         Resource = [aws_dynamodb_table.main.arn, "${aws_dynamodb_table.main.arn}/index/*"]
       },
     ]
@@ -345,15 +345,16 @@ resource "aws_iam_role_policy" "sfn" {
         Resource = aws_dynamodb_table.main.arn
       },
       {
+        # "Document Analysed" → the platform bus (govern-intake subscribes).
         Sid      = "PutEvents"
         Effect   = "Allow"
         Action   = ["events:PutEvents"]
-        Resource = "arn:aws:events:${local.region}:${local.account_id}:event-bus/default"
+        Resource = aws_cloudwatch_event_bus.platform.arn
       },
       {
-        Sid      = "CloudWatchLogs"
-        Effect   = "Allow"
-        Action   = [
+        Sid    = "CloudWatchLogs"
+        Effect = "Allow"
+        Action = [
           "logs:CreateLogDelivery", "logs:GetLogDelivery", "logs:UpdateLogDelivery",
           "logs:DeleteLogDelivery", "logs:ListLogDeliveries",
           "logs:PutResourcePolicy", "logs:DescribeResourcePolicies",
@@ -400,5 +401,21 @@ resource "aws_iam_role_policy" "events_to_sfn" {
       Action   = ["states:StartExecution"]
       Resource = aws_sfn_state_machine.pipeline.arn
     }]
+  })
+}
+
+
+# ─── OpenAI key from Secrets Manager (pipeline + RAG) ─────────────────────────
+
+resource "aws_iam_role_policy" "openai_secret" {
+  for_each = { pipeline = aws_iam_role.pipeline_base.id, rag = aws_iam_role.rag.id }
+  name     = "openai-secret"
+  role     = each.value
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      { Sid = "ReadOpenAIKey", Effect = "Allow", Action = ["secretsmanager:GetSecretValue"], Resource = aws_secretsmanager_secret.openai.arn },
+      { Sid = "DecryptOpenAIKey", Effect = "Allow", Action = ["kms:Decrypt"], Resource = aws_kms_key.govern.arn },
+    ]
   })
 }

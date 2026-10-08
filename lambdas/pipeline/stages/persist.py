@@ -18,7 +18,10 @@ Nothing is written that the document did not state: a missing title stays
 empty, a missing date stays null. Fields a user edited by hand (title,
 lifecycle, type) are not overwritten by a re-analysis.
 
-This is the terminal stage — status is set to READY on success.
+This is the terminal stage — status is set to READY on success. META fields
+this stage does not own (``revisionOf`` from a Govern revision upload,
+ownership, projects) are left untouched because the row is updated, not
+replaced.
 """
 from __future__ import annotations
 
@@ -174,7 +177,9 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
         "keyDates":          key_dates,
         "keyDateCount":      len(classification.get("keyDates") or []),
         "keyDatesTruncated": key_dates_truncated,
-        "parentDocId":     lineage.get("parentDocId"),
+        # A Govern revision upload names its contract (revisionOf); keep that
+        # link when the graph stage found no parent of its own.
+        "parentDocId":     lineage.get("parentDocId") or existing_meta.get("revisionOf"),
         "lineageStatus":   lineage.get("status"),
         "rawKey":          raw_key or existing_meta.get("rawKey"),
         "processedPrefix": f"{tenant_id}/{doc_id}/",
@@ -233,7 +238,15 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
              clauses=clause_count, highRisk=high_risk, overallRisk=overall_risk,
              unrated=unrated, keyDates=len(key_dates), keyDatesTruncated=key_dates_truncated,
              needsReview=bool(classification.get("needsReview")))
-    return {"status": ProcessingStatus.READY.value, "docId": doc_id}
+    # This result is the detail of the "Document Analysed" event the state
+    # machine publishes next (govern-intake consumes it).
+    return {
+        "status":     ProcessingStatus.READY.value,
+        "docId":      doc_id,
+        "tenantId":   tenant_id,
+        "docType":    keep_or("docType", classification.get("docType") or existing_meta.get("docType") or "OTHER"),
+        "revisionOf": existing_meta.get("revisionOf"),
+    }
 
 
 def _next_version(existing_versions: list[dict[str, Any]]) -> int:

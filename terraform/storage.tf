@@ -254,8 +254,8 @@ resource "aws_opensearch_domain" "main" {
       ] }
       # Data-plane HTTP only (was es:*, which also allowed reconfiguring or
       # deleting the domain). Each role's own IAM policy narrows this further.
-      Action    = "es:ESHttp*"
-      Resource  = "arn:aws:es:${local.region}:${local.account_id}:domain/${local.prefix}-search/*"
+      Action   = "es:ESHttp*"
+      Resource = "arn:aws:es:${local.region}:${local.account_id}:domain/${local.prefix}-search/*"
     }]
   })
 

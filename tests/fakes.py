@@ -44,6 +44,18 @@ def _eval(cond: Any, item: dict[str, Any]) -> bool:
         return item.get(name) == values[1]
     if op == "begins_with":
         return str(item.get(name, "")).startswith(values[1])
+    if name not in item:
+        return False
+    if op == "<=":
+        return item[name] <= values[1]
+    if op == "<":
+        return item[name] < values[1]
+    if op == ">=":
+        return item[name] >= values[1]
+    if op == ">":
+        return item[name] > values[1]
+    if op == "BETWEEN":
+        return values[1] <= item[name] <= values[2]
     raise NotImplementedError(op)
 
 
@@ -112,21 +124,31 @@ class FakeTable:
         assert_storable(values)
         assert len(UpdateExpression.encode()) <= 4096, "UpdateExpression exceeds DynamoDB's 4 KB limit"
         set_part, _, remove_part = UpdateExpression.partition(" REMOVE ")
+        if set_part.startswith("ADD "):
+            set_part, add_part = "", set_part[4:]
+        else:
+            set_part, _, add_part = set_part.partition(" ADD ")
         for assignment in set_part.replace("SET ", "", 1).split(", "):
             if not assignment.strip():
                 continue
             left, right = [x.strip() for x in assignment.split(" = ")]
             item[names.get(left, left)] = copy.deepcopy(values[right])
+        for addition in [a.strip() for a in add_part.split(",") if a.strip()]:
+            left, right = addition.split()
+            attr = names.get(left, left)
+            item[attr] = item.get(attr, 0) + values[right]
         for name in [n.strip() for n in remove_part.split(",") if n.strip()]:
             item.pop(names.get(name, name), None)
         self.items[key] = item
         return {}
 
     def query(self, KeyConditionExpression: Any, IndexName: str | None = None,
-              ExclusiveStartKey: Any = None, Limit: int | None = None, **_: Any) -> dict[str, Any]:
+              ExclusiveStartKey: Any = None, Limit: int | None = None, ScanIndexForward: bool = True,
+              **_: Any) -> dict[str, Any]:
         self.calls.append(("query", IndexName))
         rows = [copy.deepcopy(i) for i in self.items.values() if _eval(KeyConditionExpression, i)]
-        rows.sort(key=lambda i: (str(i.get("GSI1SK" if IndexName else "SK", ""))))
+        sort_key = f"{IndexName}SK" if IndexName else "SK"
+        rows.sort(key=lambda i: str(i.get(sort_key, "")), reverse=not ScanIndexForward)
         return {"Items": rows[:Limit] if Limit else rows}
 
     def batch_writer(self, **_: Any) -> Any:
@@ -160,18 +182,22 @@ class FakeResource:
 
     def __init__(self, table: FakeTable, name: str = "test-table") -> None:
         self.table, self.name = table, name
+        # More tables by name (the Govern tables — see install_fake_govern).
+        self.tables: dict[str, FakeTable] = {name: table}
 
-    def Table(self, _name: str) -> FakeTable:  # noqa: N802 — boto3 naming
-        return self.table
+    def Table(self, name: str) -> FakeTable:  # noqa: N802 — boto3 naming
+        return self.tables.get(name, self.table)
 
     def batch_get_item(self, RequestItems: dict[str, Any]) -> dict[str, Any]:
-        out = []
-        for spec in RequestItems.values():
+        responses: dict[str, list[dict[str, Any]]] = {}
+        for table_name, spec in RequestItems.items():
+            table = self.tables.get(table_name, self.table)
+            out = responses.setdefault(table_name, [])
             for key in spec["Keys"]:
-                item = self.table.items.get((key["PK"], key["SK"]))
+                item = table.items.get((key["PK"], key["SK"]))
                 if item:
                     out.append(copy.deepcopy(item))
-        return {"Responses": {self.name: out}, "UnprocessedKeys": {}}
+        return {"Responses": responses, "UnprocessedKeys": {}}
 
 
 def install_fake_dynamodb(monkeypatch: Any) -> FakeTable:
@@ -187,6 +213,93 @@ def install_fake_dynamodb(monkeypatch: Any) -> FakeTable:
     monkeypatch.setattr(dynamodb, "dynamodb_resource", lambda: resource)
     monkeypatch.setattr(shared_aws, "dynamodb_resource", lambda: resource)
     return table
+
+
+# ---------------------------------------------------------------------------
+# Govern: second and third table, EventBridge, SES, Secrets Manager, SQS
+# ---------------------------------------------------------------------------
+
+
+GOVERN_TABLES = ("contracts", "activity", "config", "sync", "metrics")
+
+
+class GovernFakes:
+    """In-memory Govern infrastructure: the five Govern tables (beside the
+    documents table) and one object that plays every client the Govern code
+    builds (events / sesv2 / secretsmanager / sqs), recording what was sent."""
+
+    def __init__(self, docs: FakeTable, tables: dict[str, FakeTable]) -> None:
+        self.docs = docs
+        self.tables = tables
+        self.contracts, self.activity = tables["contracts"], tables["activity"]
+        self.config, self.sync, self.metrics = tables["config"], tables["sync"], tables["metrics"]
+        self.events: list[dict[str, Any]] = []
+        self.emails: list[dict[str, Any]] = []
+        self.secrets: dict[str, str] = {}
+        self.sqs_messages: list[dict[str, Any]] = []
+        self.fail_events = False
+
+    def put_events(self, Entries: list[dict[str, Any]]) -> dict[str, Any]:
+        if self.fail_events:
+            return {"FailedEntryCount": len(Entries),
+                    "Entries": [{"ErrorCode": "InternalFailure", "ErrorMessage": "x"} for _ in Entries]}
+        self.events.extend(copy.deepcopy(Entries))
+        return {"FailedEntryCount": 0, "Entries": [{"EventId": str(i)} for i, _ in enumerate(Entries)]}
+
+    def send_email(self, **kwargs: Any) -> dict[str, Any]:
+        self.emails.append(kwargs)
+        return {"MessageId": f"m{len(self.emails)}"}
+
+    def get_secret_value(self, SecretId: str) -> dict[str, Any]:
+        if SecretId not in self.secrets:
+            raise ClientError({"Error": {"Code": "ResourceNotFoundException", "Message": "no"}}, "GetSecretValue")
+        return {"SecretString": self.secrets[SecretId]}
+
+    def put_secret_value(self, SecretId: str, SecretString: str) -> dict[str, Any]:
+        self.secrets[SecretId] = SecretString
+        return {}
+
+    def send_message(self, QueueUrl: str, MessageBody: str, **_: Any) -> dict[str, Any]:
+        self.sqs_messages.append({"QueueUrl": QueueUrl, "MessageBody": MessageBody})
+        return {"MessageId": str(len(self.sqs_messages))}
+
+    # -- convenience for tests ---------------------------------------------
+    def contract(self, contract_id: str) -> dict[str, Any] | None:
+        return self.contracts.items.get((f"CON#{contract_id}", "META"))
+
+    def activity_for(self, contract_id: str) -> list[dict[str, Any]]:
+        rows = [i for (pk, _), i in self.activity.items.items() if pk == f"CON#{contract_id}"]
+        return sorted(rows, key=lambda i: i["SK"])
+
+    def actions(self, contract_id: str) -> list[str]:
+        return [a["action"] for a in self.activity_for(contract_id)]
+
+
+def install_fake_govern(monkeypatch: Any, docs: FakeTable) -> GovernFakes:
+    """Add the five Govern tables beside the documents table that
+    ``install_fake_dynamodb`` installed, and fake EventBridge / SES / Secrets
+    Manager / SQS."""
+    from shared import aws as shared_aws
+    from shared import dynamodb
+    from shared.config import settings
+    from shared.govern import secrets, store
+
+    resource = dynamodb.dynamodb_resource()
+    tables = {name: FakeTable() for name in GOVERN_TABLES}
+    for name, table in tables.items():
+        resource.tables[f"{name}-table"] = table
+        monkeypatch.setattr(settings, f"{name}_table", f"{name}-table")
+    monkeypatch.setattr(settings, "event_bus_name", "platform-bus")
+    # The dev-stage sandbox: users in no Govern group are admins (tests that
+    # need the production default switch it off).
+    monkeypatch.setattr(settings, "govern_open_admin", True)
+    monkeypatch.setattr(settings, "processed_bucket", "processed")
+    monkeypatch.setattr(store, "_resource", lambda: resource)
+    fakes = GovernFakes(docs, tables)
+    for factory in ("events_client", "ses_client", "secrets_client", "sqs_client"):
+        monkeypatch.setattr(shared_aws, factory, lambda _f=fakes: _f, raising=False)
+    secrets.clear_cache()
+    return fakes
 
 
 # ---------------------------------------------------------------------------

@@ -46,6 +46,32 @@ def _bool(name: str, default: bool) -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+# Govern features that are built but not part of this release ("Later" scope).
+# snake_case setting name → camelCase API name (GET /govern/me → features).
+# The frontend mirrors this list in lib/govern/features.ts.
+GOVERN_FEATURES: dict[str, str] = {
+    "routing_rules": "routingRules",
+    "docusign": "docusign",
+    "notifications": "notifications",
+    "obligations": "obligations",
+    "exports": "exports",
+    "integrations": "integrations",
+}
+
+
+def _normalise_feature(name: str) -> str:
+    """"routing_rules", "routingRules" and "Routing-Rules" all name the same feature."""
+    return "".join(ch for ch in name.lower() if ch.isalpha())
+
+
+_KNOWN_FEATURES = frozenset(_normalise_feature(k) for k in GOVERN_FEATURES)
+
+
+def parse_govern_features(raw: str) -> frozenset[str]:
+    """GOVERN_FEATURES env → the (normalised) features switched on; unknown names are ignored."""
+    return frozenset(n for n in (_normalise_feature(part) for part in (raw or "").split(",")) if n in _KNOWN_FEATURES)
+
+
 @dataclass
 class Settings:
     aws_region: str = field(default_factory=lambda: _env("AWS_REGION", "us-east-2"))
@@ -168,6 +194,44 @@ class Settings:
         default_factory=lambda: float(_env("PARENT_MATCH_MIN_CONFIDENCE", "0.5"))
     )
 
+    # ── Govern (contract workflow — see docs/GOVERN_ARCHITECTURE.md) ─────────
+    # One table per access pattern (shared/govern/store.py): the contract
+    # aggregate, the append-only activity log, per-tenant configuration,
+    # connector sync runs + external ids, and trend counters + markers.
+    contracts_table: str = field(default_factory=lambda: _env("CONTRACTS_TABLE", ""))
+    activity_table: str = field(default_factory=lambda: _env("ACTIVITY_TABLE", ""))
+    config_table: str = field(default_factory=lambda: _env("CONFIG_TABLE", ""))
+    sync_table: str = field(default_factory=lambda: _env("SYNC_TABLE", ""))
+    metrics_table: str = field(default_factory=lambda: _env("METRICS_TABLE", ""))
+    # Intake queue the sweeper re-enqueues missed documents to.
+    intake_queue_url: str = field(default_factory=lambda: _env("INTAKE_QUEUE_URL", ""))
+    # Custom EventBridge bus that carries "Document Analysed" and Govern.* events.
+    event_bus_name: str = field(default_factory=lambda: _env("EVENT_BUS_NAME", ""))
+    # Verified SES identity alerts are sent from; empty = email alerts disabled.
+    notify_from_email: str = field(default_factory=lambda: _env("NOTIFY_FROM_EMAIL", ""))
+    # SES may live in another region than the stack (sandbox / verified identity).
+    ses_region: str = field(default_factory=lambda: _env("SES_REGION", "") or _env("AWS_REGION", "us-east-2"))
+    # Secrets Manager secrets (values set out-of-band; see docs/GOVERN_RUNBOOK.md).
+    teams_secret_arn: str = field(default_factory=lambda: _env("TEAMS_SECRET_ARN", ""))
+    docusign_secret_arn: str = field(default_factory=lambda: _env("DOCUSIGN_SECRET_ARN", ""))
+    huron_secret_arn: str = field(default_factory=lambda: _env("HURON_SECRET_ARN", ""))
+    workday_secret_arn: str = field(default_factory=lambda: _env("WORKDAY_SECRET_ARN", ""))
+    m365_secret_arn: str = field(default_factory=lambda: _env("M365_SECRET_ARN", ""))
+    # Sandbox only: a signed-in user in no Govern group is a Govern admin.
+    # Off by default (staging / prod require the govern-admin / -reviewer /
+    # -leader Cognito groups); Terraform turns it on for the dev stage only.
+    govern_open_admin: bool = field(default_factory=lambda: _bool("GOVERN_OPEN_ADMIN", False))
+    # Link to the web app used in alert emails / Teams cards ("Open in Govern").
+    app_base_url: str = field(default_factory=lambda: _env("APP_BASE_URL", "https://govern.blue-iq.ai"))
+    # DocuSign Connect: reject webhook deliveries older than this (replay guard).
+    webhook_max_age_s: int = field(default_factory=lambda: _int("WEBHOOK_MAX_AGE_S", 300))
+    # Govern "Later" features switched on for this deployment (comma list, e.g.
+    # "exports,docusign"; snake_case or camelCase). Empty = all of them off.
+    # See GOVERN_FEATURES below and feature_enabled().
+    govern_features: frozenset[str] = field(
+        default_factory=lambda: parse_govern_features(_env("GOVERN_FEATURES", ""))
+    )
+
     log_level: str = field(default_factory=lambda: _env("LOG_LEVEL", "INFO"))
 
     # ── Guardrails / data protection ──────────────────────────────────────────
@@ -187,6 +251,14 @@ class Settings:
     redact_classes: str = field(
         default_factory=lambda: _env("REDACT_CLASSES", "EMAIL,PHONE,SSN,CREDIT_CARD,IP")
     )
+
+    def feature_enabled(self, feature: str) -> bool:
+        """Is a Govern "Later" feature (one of GOVERN_FEATURES) on for this deployment?"""
+        return _normalise_feature(feature) in self.govern_features
+
+    def govern_feature_flags(self) -> dict[str, bool]:
+        """Every Later feature as the API reports it: ``{"routingRules": False, ...}``."""
+        return {camel: self.feature_enabled(snake) for snake, camel in GOVERN_FEATURES.items()}
 
     def redact_class_list(self) -> tuple[str, ...]:
         """REDACT_CLASSES parsed into an upper-cased tuple."""

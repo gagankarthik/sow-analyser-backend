@@ -57,9 +57,28 @@ def _offline(monkeypatch):
     openai_client.set_deadline(None)
 
 
+@pytest.fixture(autouse=True)
+def _govern_features(monkeypatch):
+    """Every Govern "Later" feature ON, so the existing tests exercise the full
+    behaviour. Tests of the switched-off paths override it (see
+    test_govern_features.py)."""
+    from shared.config import GOVERN_FEATURES, parse_govern_features, settings
+
+    monkeypatch.setattr(settings, "govern_features", parse_govern_features(",".join(GOVERN_FEATURES)))
+
+
 @pytest.fixture
 def ddb(monkeypatch):
     """One in-memory DynamoDB table behind every data-access function."""
     from fakes import install_fake_dynamodb
 
     return install_fake_dynamodb(monkeypatch)
+
+
+@pytest.fixture
+def gov(monkeypatch, ddb):
+    """The five Govern tables (beside the documents table) plus fake
+    EventBridge / SES / Secrets Manager / SQS — see tests/fakes.py."""
+    from fakes import install_fake_govern
+
+    return install_fake_govern(monkeypatch, ddb)

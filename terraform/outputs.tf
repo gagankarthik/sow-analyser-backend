@@ -52,3 +52,51 @@ output "api_lambda_arn" {
   description = "Document API Lambda ARN."
   value       = aws_lambda_function.api.arn
 }
+
+# ─── Govern ────────────────────────────────────────────────────────────────────
+
+output "govern_table_names" {
+  description = "The five Govern DynamoDB tables."
+  value = {
+    contracts = aws_dynamodb_table.govern_contracts.name
+    activity  = aws_dynamodb_table.govern_activity.name
+    config    = aws_dynamodb_table.govern_config.name
+    sync      = aws_dynamodb_table.govern_sync.name
+    metrics   = aws_dynamodb_table.govern_metrics.name
+  }
+}
+
+output "platform_event_bus_name" {
+  description = "EventBridge bus carrying Document Analysed and Govern.* events."
+  value       = aws_cloudwatch_event_bus.platform.name
+}
+
+output "govern_queue_urls" {
+  description = "Govern SQS queues (intake, notify, connectors)."
+  value       = { for k, q in aws_sqs_queue.govern : k => q.url }
+}
+
+output "govern_dlq_urls" {
+  description = "Govern dead-letter queues (alarmed)."
+  value       = { for k, q in aws_sqs_queue.govern_dlq : k => q.url }
+}
+
+output "govern_secret_arns" {
+  description = "Secrets to fill out-of-band (see docs/GOVERN_RUNBOOK.md)."
+  value       = { for k, s in aws_secretsmanager_secret.govern : k => s.arn }
+}
+
+output "openai_secret_arn" {
+  description = "Secrets Manager secret holding the OpenAI API key."
+  value       = aws_secretsmanager_secret.openai.arn
+}
+
+output "govern_kms_key_arn" {
+  description = "Customer-managed key for the Govern tables and secrets."
+  value       = aws_kms_key.govern.arn
+}
+
+output "docusign_webhook_url" {
+  description = "URL to configure in DocuSign Connect."
+  value       = "${aws_apigatewayv2_api.documents.api_endpoint}/webhooks/docusign"
+}

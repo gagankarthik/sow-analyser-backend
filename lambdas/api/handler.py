@@ -79,6 +79,7 @@ from shared.logger import get_logger
 from shared.opensearch import get_clause_vector, knn_search
 from shared.s3 import presign_get
 from shared.schema import now_iso
+from shared.uploads import clean_upload_filename, pending_document_meta, upload_key
 
 log = get_logger("blue-iq.api")
 tracer = Tracer(service="blue-iq.api")
@@ -290,22 +291,7 @@ def _project_for(project_id: str, caller: Caller, capability: str) -> tuple[dict
 
 def _list_documents(caller: Caller) -> dict[str, Any]:
     """The caller's own uploads plus every document in a project they belong to."""
-    docs: dict[str, dict[str, Any]] = {}
-    for d in ddb.list_tenant_docs(caller.tenant_id):
-        if d.get("docId") and caller.owns(d):
-            docs[d["docId"]] = dict(d, _role="owner")
-    roles = caller.project_roles()
-    if roles:
-        wanted: dict[str, str] = {}
-        for project in ddb.get_projects(list(roles)):
-            for doc_id in project.get("docIds") or []:
-                role = roles[project["projectId"]]
-                if doc_id not in docs and _stronger(wanted.get(doc_id), role) == role:
-                    wanted[doc_id] = role
-        for meta in ddb.get_docs(list(wanted)):
-            doc_id = meta.get("docId")
-            if doc_id:
-                docs[doc_id] = dict(meta, _role=wanted[doc_id])
+    docs = caller.visible_documents()
     out = [_list_view(_clean(d, caller)) for d in docs.values()]
     return _ok({"documents": out, "count": len(out)})
 
@@ -324,11 +310,6 @@ def _list_view(doc: dict[str, Any]) -> dict[str, Any]:
         doc["keyDates"] = [{k: kd.get(k) for k in _LIST_KEY_DATE_FIELDS}
                            for kd in doc["keyDates"] if isinstance(kd, dict)]
     return doc
-
-
-def _stronger(a: str | None, b: str | None) -> str | None:
-    from shared.access import stronger
-    return stronger(a, b)
 
 
 # ---------------------------------------------------------------------------
@@ -897,19 +878,11 @@ def _get_similar_clauses(doc_id: str, event: dict[str, Any], caller: Caller) -> 
 
 
 def _get_upload_url(event: dict[str, Any], caller: Caller) -> dict[str, Any]:
-    qs           = event.get("queryStringParameters") or {}
-    raw_filename = qs.get("filename", "").strip()
-    if not raw_filename:
-        return _err(400, "Missing required query parameter: filename", "bad_request")
-
-    # Sanitize: collapse path separators, restrict to a safe character set.
-    filename = os.path.basename(raw_filename.replace("\\", "/"))
-    if filename in ("", ".", "..") or not re.fullmatch(r"[A-Za-z0-9._ -]{1,200}", filename):
-        return _err(400, "Invalid filename", "bad_request")
-    # Only formats the parse stage can actually extract. Legacy binary .doc has
-    # no parser in the Lambda layer, so we don't advertise it.
-    if not re.search(r"\.(pdf|docx|txt)$", filename, re.IGNORECASE):
-        return _err(400, "Unsupported file type. Allowed: pdf, docx, txt", "bad_request")
+    qs = event.get("queryStringParameters") or {}
+    # Sanitised name of a format the parse stage can extract (shared/uploads.py).
+    filename, problem = clean_upload_filename(qs.get("filename"))
+    if problem:
+        return _err(400, problem, "bad_request")
 
     doc_type = qs.get("docType", "OTHER").strip().upper()
     if doc_type not in _VALID_DOC_TYPES:
@@ -930,7 +903,7 @@ def _get_upload_url(event: dict[str, Any], caller: Caller) -> dict[str, Any]:
         return _err(500, "Server misconfiguration: RAW_BUCKET not set", "internal")
 
     doc_id = str(uuid.uuid4())
-    key    = f"tenants/{caller.tenant_id}/uploads/{doc_id}/{filename}"
+    key    = upload_key(caller.tenant_id, doc_id, filename)
 
     # ContentType is intentionally NOT signed — the browser can send the real
     # MIME type without breaking the signature (SignedHeaders = "host" only).
@@ -943,27 +916,11 @@ def _get_upload_url(event: dict[str, Any], caller: Caller) -> dict[str, Any]:
     # Write a PENDING row immediately so the document appears in the UI during
     # processing. The persist stage later fills in the analysis fields. The owner
     # is the token's user — it is what makes the document visible to them.
-    title = filename.rsplit(".", 1)[0] or filename
     try:
-        put_doc_meta({
-            "docId":           doc_id,
-            "tenantId":        caller.tenant_id,
-            "ownerSub":        caller.sub,
-            "ownerEmail":      caller.email,
-            "projectIds":      [project_id] if project_id else [],
-            "title":           title,
-            "docType":         doc_type,
-            "lifecycle":       "draft",
-            "status":          "PENDING",
-            "parties":         [],
-            "effectiveDate":   None,
-            "parentDocId":     None,
-            "rawKey":          key,
-            "processedPrefix": "",
-            "structuralHash":  "",
-            "checksum":        "",
-            "latestVersion":   0,
-        })
+        put_doc_meta(pending_document_meta(
+            doc_id=doc_id, tenant_id=caller.tenant_id, owner_sub=caller.sub, owner_email=caller.email,
+            filename=filename, doc_type=doc_type, project_ids=[project_id] if project_id else [],
+        ))
     except Exception:
         # The pipeline only processes uploads that have a META row owned by the
         # key's tenant, so handing out a URL without one would lose the upload.

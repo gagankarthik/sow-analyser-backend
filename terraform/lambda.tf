@@ -37,15 +37,19 @@ data "archive_file" "pipeline" {
 
 locals {
   pipeline_env = {
-    PROJECT_NAME                 = var.project_name
-    STAGE                        = var.stage
-    DDB_TABLE_NAME               = aws_dynamodb_table.main.name
-    RAW_BUCKET                   = aws_s3_bucket.raw.bucket
-    PROCESSED_BUCKET             = aws_s3_bucket.processed.bucket
-    OPENAI_API_KEY               = var.openai_api_key
-    OPENSEARCH_ENDPOINT          = aws_opensearch_domain.main.endpoint
-    EMBEDDING_MODEL              = var.embedding_model
-    CHAT_MODEL                   = var.chat_model
+    PROJECT_NAME     = var.project_name
+    STAGE            = var.stage
+    DDB_TABLE_NAME   = aws_dynamodb_table.main.name
+    RAW_BUCKET       = aws_s3_bucket.raw.bucket
+    PROCESSED_BUCKET = aws_s3_bucket.processed.bucket
+    # The key is read from Secrets Manager; OPENAI_API_KEY is only a legacy
+    # override (empty unless var.openai_api_key is still set).
+    OPENAI_SECRET_ARN   = aws_secretsmanager_secret.openai.arn
+    OPENAI_API_KEY      = var.openai_api_key
+    AI_PROVIDER         = var.ai_provider
+    OPENSEARCH_ENDPOINT = aws_opensearch_domain.main.endpoint
+    EMBEDDING_MODEL     = var.embedding_model
+    CHAT_MODEL          = var.chat_model
     # Per-task model overrides ("" = inherit CHAT_MODEL) and the tuning knobs
     # that bound cost/latency. Defaults live in lambdas/shared/config.py.
     EXTRACTION_MODEL             = var.extraction_model
@@ -123,12 +127,12 @@ resource "aws_lambda_function" "api" {
 
   environment {
     variables = {
-      PROJECT_NAME                 = var.project_name
-      STAGE                        = var.stage
-      DDB_TABLE_NAME               = aws_dynamodb_table.main.name
-      RAW_BUCKET                   = aws_s3_bucket.raw.bucket
-      PROCESSED_BUCKET             = aws_s3_bucket.processed.bucket
-      OPENSEARCH_ENDPOINT          = aws_opensearch_domain.main.endpoint
+      PROJECT_NAME        = var.project_name
+      STAGE               = var.stage
+      DDB_TABLE_NAME      = aws_dynamodb_table.main.name
+      RAW_BUCKET          = aws_s3_bucket.raw.bucket
+      PROCESSED_BUCKET    = aws_s3_bucket.processed.bucket
+      OPENSEARCH_ENDPOINT = aws_opensearch_domain.main.endpoint
       # Pool the invite endpoint creates users in (POST /projects/{id}/invite).
       COGNITO_USER_POOL_ID         = var.cognito_user_pool_id
       EMBEDDING_DIMENSIONS         = tostring(var.embedding_dimensions)
@@ -205,6 +209,11 @@ resource "aws_iam_role_policy" "api" {
       },
     ]
   })
+}
+
+resource "aws_cloudwatch_log_group" "api_access" {
+  name              = "/aws/apigateway/${local.prefix}-docs-api"
+  retention_in_days = var.govern_log_retention_days
 }
 
 # HTTP API Gateway (v2) — lightweight, no usage plans needed for v1.
@@ -487,10 +496,27 @@ resource "aws_apigatewayv2_stage" "default" {
     throttling_rate_limit  = 1
     throttling_burst_limit = 3
   }
+  # Unauthenticated (HMAC-verified) webhooks, and the per-call matrix rescore.
+  route_settings {
+    route_key              = aws_apigatewayv2_route.govern_webhooks.route_key
+    throttling_rate_limit  = 10
+    throttling_burst_limit = 20
+  }
+  route_settings {
+    route_key              = aws_apigatewayv2_route.govern["POST /contracts/{id}/rescore"].route_key
+    throttling_rate_limit  = 5
+    throttling_burst_limit = 10
+  }
 
+  # One JSON line per request with who called (the verified JWT sub), kept
+  # for var.govern_log_retention_days as audit evidence.
   access_log_settings {
-    destination_arn = aws_cloudwatch_log_group.api.arn
-    format          = "$context.requestId $context.status $context.routeKey $context.integrationErrorMessage"
+    destination_arn = aws_cloudwatch_log_group.api_access.arn
+    format = jsonencode({
+      requestId = "$context.requestId", time = "$context.requestTime", routeKey = "$context.routeKey",
+      status    = "$context.status", sub = "$context.authorizer.claims.sub", sourceIp = "$context.identity.sourceIp",
+      latencyMs = "$context.responseLatency", integrationError = "$context.integrationErrorMessage"
+    })
   }
 }
 
@@ -531,12 +557,12 @@ resource "aws_lambda_function" "rag" {
 
   environment {
     variables = merge(local.pipeline_env, {
-      PIPELINE_STAGE           = "08_rag"
-      RAG_MAX_CONTEXT_CLAUSES  = "8"
+      PIPELINE_STAGE          = "08_rag"
+      RAG_MAX_CONTEXT_CLAUSES = "8"
       # A retrieval chunk is at most ~1,800 characters; the old 1,200 cap cut the
       # end off every longer clause before the model saw it.
       RAG_MAX_CLAUSE_CHARS     = "2400"
-      APPSYNC_GRAPHQL_ENDPOINT = ""  # wire in after AppSync API is created
+      APPSYNC_GRAPHQL_ENDPOINT = "" # wire in after AppSync API is created
     })
   }
 

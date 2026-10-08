@@ -1,0 +1,62 @@
+EXCLUSIVE OPTION AGREEMENT
+
+Huron Agreement No. AGR00012388
+Workday Ref: WD-CC-104291
+OSU Technology Commercialization Office Reference: T2026-142 ("Adaptive Gripper Control Software")
+
+This Exclusive Option Agreement (the "Agreement") is entered into as of October 5, 2026 (the "Effective Date") by and between The Ohio State University, an instrumentality of the State of Ohio, acting through its Technology Commercialization Office ("University"), and Scioto Robotics LLC, an Ohio limited liability company with offices at 400 West Nationwide Boulevard, Columbus, Ohio 43215 ("Optionee").
+
+University owns software and a patent application for adaptive force control of soft robotic grippers developed in the laboratory of Dr. James Okafor, Department of Mechanical and Aerospace Engineering (the "Technology"). Optionee wishes to evaluate the Technology and to obtain an option to negotiate an exclusive license.
+
+1. OPTION GRANT
+
+1.1 University grants Optionee an exclusive option to negotiate an exclusive license under the Technology in the field of automated agricultural harvesting equipment (the "Field of Use"). During the Option Period University grants Optionee a non-exclusive, non-transferable license to use the Technology solely for internal evaluation and research, and not for any commercial purpose.
+
+1.2 University reserves the right to use and practise the Technology for research, teaching and educational purposes and to permit other non-profit research institutions to do so.
+
+2. OPTION PERIOD
+
+2.1 The option period begins on the Effective Date and expires fifteen (15) months after the Effective Date (the "Option Period"), unless Optionee exercises the option earlier by written notice to University.
+
+3. OPTION FEE AND LICENSE TERMS
+
+3.1 Optionee shall pay University a non-refundable option fee of Fifteen Thousand Dollars ($15,000) within thirty (30) days after the Effective Date.
+
+3.2 Any license granted on exercise of the option shall include a running royalty of not less than three percent (3%) of Net Sales of licensed products and a payment to University of not less than twenty-five percent (25%) of all Sublicense Income, together with diligence milestones and University's standard reserved rights.
+
+3.3 Optionee shall reimburse University for patent costs incurred during the Option Period within thirty (30) days of invoice.
+
+4. OWNERSHIP
+
+4.1 Title to the Technology remains with University. Nothing in this Agreement assigns or transfers any University intellectual property to Optionee. Results of Optionee's evaluation shall be shared with University and do not give Optionee rights in University inventions.
+
+5. USE OF NAMES
+
+5.1 Optionee shall not use the name, marks or logos of The Ohio State University in any advertising or publicity without University's prior written consent.
+
+6. CONFIDENTIALITY
+
+6.1 Optionee shall keep the Technology and University's Confidential Information confidential and use it only to evaluate the Technology. These obligations shall survive for three (3) years after the end of the Option Period.
+
+7. WARRANTIES
+
+7.1 THE TECHNOLOGY IS PROVIDED "AS IS". UNIVERSITY MAKES NO REPRESENTATIONS OR WARRANTIES OF ANY KIND, EXPRESS OR IMPLIED.
+
+8. INDEMNIFICATION
+
+8.1 Optionee shall indemnify, defend and hold harmless University, its trustees, officers, employees and students from all claims arising from Optionee's evaluation or use of the Technology.
+
+9. GOVERNING LAW
+
+9.1 This Agreement shall be governed by the laws of the State of Ohio. Nothing in this Agreement shall be construed as a waiver of the sovereign immunity of University or the State of Ohio.
+
+10. GENERAL
+
+10.1 This Agreement is the entire agreement of the parties regarding its subject matter and may be amended only in writing signed by both parties.
+
+IN WITNESS WHEREOF, the parties have executed this Agreement as of the Effective Date.
+
+THE OHIO STATE UNIVERSITY                     SCIOTO ROBOTICS LLC
+By: ______________________                   By: ______________________
+Title: Associate Vice President              Name: Priyanka Desai
+Date: ____________                           Title: Managing Member

@@ -1,0 +1,42 @@
+MUTUAL CONFIDENTIAL DISCLOSURE AGREEMENT
+
+Huron Agreement No. AGR00012433
+Workday Ref: WD-NF-000327 (no funds)
+
+This Mutual Confidential Disclosure Agreement (the "Agreement") is entered into as of October 9, 2026 (the "Effective Date") by and between The Ohio State University, an instrumentality of the State of Ohio ("University"), and Lumen Photonics, Inc., a Colorado corporation with offices at 1800 Pearl Street, Boulder, Colorado 80302 ("Company").
+
+The parties wish to exchange confidential information to evaluate a possible research collaboration on silicon photonic sensors with Dr. Marco Bianchi, Department of Electrical and Computer Engineering (the "Purpose").
+
+1. CONFIDENTIAL INFORMATION
+
+1.1 "Confidential Information" means non-public information disclosed by one party to the other for the Purpose that is marked confidential when disclosed in writing, or identified as confidential at the time of an oral disclosure and summarised in writing within thirty (30) days.
+
+1.2 Confidential Information excludes information that is publicly available, already known to the recipient, independently developed by the recipient, or lawfully received from a third party without restriction.
+
+2. CONFIDENTIALITY OBLIGATIONS
+
+2.1 The recipient shall use the discloser's Confidential Information only for the Purpose and shall protect it with reasonable care. The recipient's confidentiality obligations shall survive for ten (10) years after the date of each disclosure.
+
+2.2 University may disclose Confidential Information as required by the Ohio Public Records Act after giving Company notice where permitted.
+
+3. EXPORT CONTROL
+
+3.1 Company shall not disclose to University any information subject to the Export Administration Regulations or the International Traffic in Arms Regulations without first giving University written notice and receiving University's written consent.
+
+4. USE OF NAMES
+
+4.1 Neither party shall use the name, marks or logos of the other party in any publicity without the other party's prior written consent.
+
+5. TERM
+
+5.1 This Agreement covers disclosures made during two (2) years after the Effective Date.
+
+6. GOVERNING LAW
+
+6.1 This Agreement shall be governed by the laws of the State of Ohio. Nothing in this Agreement shall be construed as a waiver of the sovereign immunity of University.
+
+IN WITNESS WHEREOF, the parties have executed this Agreement as of the Effective Date.
+
+THE OHIO STATE UNIVERSITY                     LUMEN PHOTONICS, INC.
+By: ______________________                   By: ______________________
+Title: Associate Director, Industry Contracts Name: Rachel Kim, General Counsel

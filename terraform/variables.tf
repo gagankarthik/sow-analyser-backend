@@ -17,9 +17,10 @@ variable "aws_region" {
 }
 
 variable "openai_api_key" {
-  description = "OpenAI API key injected into Lambda environment. Set via TF_VAR_openai_api_key or GitHub Actions secret."
+  description = "DEPRECATED (kept for backward compatibility): a key here lands in Terraform state and the Lambda environment. Leave it empty and put the key in the Secrets Manager secret (output openai_secret_arn); the Lambdas read it from there via OPENAI_SECRET_ARN."
   type        = string
   sensitive   = true
+  default     = ""
 }
 
 variable "opensearch_instance_type" {
@@ -146,4 +147,65 @@ variable "openai_timeout_seconds" {
   description = "Per-request timeout for chat/extraction calls."
   type        = number
   default     = 180
+}
+
+# ─── AI provider ──────────────────────────────────────────────────────────────
+
+variable "ai_provider" {
+  description = "AI provider the guardrails allow (shared/guardrails.py): \"openai\", or \"openai-zdr\" once Zero Data Retention is approved for the account."
+  type        = string
+  default     = "openai"
+  validation {
+    condition     = contains(["openai", "openai-zdr"], var.ai_provider)
+    error_message = "The ai_provider must be openai or openai-zdr."
+  }
+}
+
+# ─── Govern ────────────────────────────────────────────────────────────────────
+
+variable "govern_open_admin" {
+  description = "Sandbox only: treat signed-in users in no Govern Cognito group as Govern admins. Honoured ONLY when stage = dev; staging / prod always require the govern-admin / govern-reviewer / govern-leader groups."
+  type        = bool
+  default     = false
+}
+
+variable "govern_features" {
+  description = "Govern \"Later\" features switched on for this deployment, as a comma list: routing_rules, docusign, notifications, obligations, exports, integrations (e.g. \"exports,docusign\"). Empty = all of them off. Reported to the web app by GET /govern/me."
+  type        = string
+  default     = ""
+  validation {
+    condition = alltrue([
+      for f in compact([for s in split(",", var.govern_features) : trimspace(s)]) :
+      contains(["routing_rules", "docusign", "notifications", "obligations", "exports", "integrations"], f)
+    ])
+    error_message = "The govern_features list may only name routing_rules, docusign, notifications, obligations, exports and integrations."
+  }
+}
+
+variable "notify_from_email" {
+  description = "Verified SES sender for Govern alert email (an SES identity is created when set). Empty = email alerts off."
+  type        = string
+  default     = ""
+}
+
+variable "app_base_url" {
+  description = "Web app base URL used in alert links."
+  type        = string
+  default     = "https://govern.blue-iq.ai"
+}
+
+variable "govern_log_retention_days" {
+  description = "CloudWatch retention for Govern Lambda and API access logs (audit evidence; at least 365)."
+  type        = number
+  default     = 365
+  validation {
+    condition     = var.govern_log_retention_days >= 365
+    error_message = "Govern logs are kept for at least 365 days."
+  }
+}
+
+variable "alarm_sns_topic_arn" {
+  description = "Optional SNS topic for Govern DLQ / error alarms. Empty = alarms without notifications."
+  type        = string
+  default     = ""
 }

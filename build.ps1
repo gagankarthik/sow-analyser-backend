@@ -34,6 +34,12 @@ pip install `
 Write-Host "→ Copying shared/ module..."
 Copy-Item -Path "$Root\lambdas\shared\*" -Destination "$PythonDir\shared\" -Recurse -Force -Exclude "__pycache__"
 
+# The Govern package (shared/govern/*) must be in the layer: every Govern Lambda imports it.
+if (-not (Test-Path "$PythonDir\shared\govern\workflow.py") -or -not (Test-Path "$PythonDir\shared\govern\matrix.py")) {
+  throw "shared/govern missing from the layer"
+}
+Get-ChildItem -Path $PythonDir -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
+
 Write-Host "→ Zipping → build\shared-layer.zip"
 $ZipPath = "$BuildDir\shared-layer.zip"
 if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }

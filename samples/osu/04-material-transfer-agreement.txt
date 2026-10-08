@@ -1,0 +1,49 @@
+MATERIAL TRANSFER AGREEMENT (INCOMING)
+
+Huron Agreement No. AGR00012417
+Workday Ref: WD-NF-000318 (no funds)
+
+This Material Transfer Agreement (the "Agreement") is entered into as of October 12, 2026 (the "Effective Date") by and between Great Lakes Cell Therapeutics, Inc., a Pennsylvania corporation ("Provider"), and The Ohio State University, an instrumentality of the State of Ohio ("University"), for the benefit of Dr. Hannah Lee, Department of Microbial Infection and Immunity, College of Medicine (the "Recipient Scientist").
+
+1. MATERIAL
+
+1.1 Provider shall provide University with the GLC-17 engineered T-cell line and related protocols (the "Material") for use in the research project described in Attachment 1 (the "Project").
+
+2. USE OF MATERIAL
+
+2.1 University shall use the Material only for non-commercial research in the Recipient Scientist's laboratory, shall not use the Material in human subjects, and shall not transfer the Material to any third party without Provider's written consent.
+
+3. OWNERSHIP AND INVENTIONS
+
+3.1 Provider retains ownership of the Material. University owns all inventions, data and results made by University employees using the Material, other than the Material itself and unmodified derivatives. Provider shall have a right of first negotiation for a license to University inventions that incorporate the Material.
+
+4. PUBLICATION
+
+4.1 University may publish the results of the Project. University shall give Provider a copy of each proposed publication thirty (30) days before submission so that Provider may identify its Confidential Information, which University will remove.
+
+5. CONFIDENTIALITY AND USE OF NAMES
+
+5.1 University shall keep Provider's Confidential Information confidential for five (5) years after disclosure. Neither party shall use the name of the other party in any publicity without its prior written consent.
+
+6. WARRANTIES
+
+6.1 THE MATERIAL IS EXPERIMENTAL AND IS PROVIDED "AS IS". PROVIDER MAKES NO WARRANTIES OF ANY KIND, AND UNIVERSITY MAKES NO WARRANTIES REGARDING ITS USE OF THE MATERIAL.
+
+7. LIABILITY AND INDEMNIFICATION
+
+7.1 Each party shall be responsible for its own acts and omissions. University shall indemnify Provider for claims arising from University's use of the Material only to the extent permitted by the laws of the State of Ohio.
+
+8. GOVERNING LAW
+
+8.1 This Agreement shall be interpreted in accordance with applicable law. Nothing in this Agreement shall be construed as a waiver of the sovereign immunity of University.
+
+9. TERM
+
+9.1 This Agreement ends two (2) years after the Effective Date or on completion of the Project, whichever is earlier. On termination University shall return or destroy any remaining Material.
+
+IN WITNESS WHEREOF, the parties have executed this Agreement as of the Effective Date.
+
+GREAT LAKES CELL THERAPEUTICS, INC.           THE OHIO STATE UNIVERSITY
+By: ______________________                   By: ______________________
+Name: Andrea Kowalski                         Title: Director, Technology Commercialization
+Read and understood: Dr. Hannah Lee, Recipient Scientist

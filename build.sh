@@ -28,6 +28,9 @@ pip install \
 
 echo "→ Copying shared/ module..."
 cp -r "$ROOT/lambdas/shared/." "$PYTHON_DIR/shared/"
+# The Govern package (shared/govern/*) must be in the layer: every Govern Lambda imports it.
+test -f "$PYTHON_DIR/shared/govern/workflow.py" && test -f "$PYTHON_DIR/shared/govern/matrix.py" \
+  || { echo "✗ shared/govern missing from the layer" >&2; exit 1; }
 # Remove __pycache__ to keep the zip clean.
 find "$PYTHON_DIR" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 

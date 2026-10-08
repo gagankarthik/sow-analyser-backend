@@ -51,17 +51,55 @@ Enterprise contract-intelligence backend that ingests Statements of Work, Master
 
 See `docs/ARCHITECTURE.md` for the full analysis, alternatives, and open questions.
 
+## Govern: contract workflow (OSU)
+
+Govern moves a contract between people: matrix review, owner, days in stage, waiting on,
+approve / send back / escalate / reject, signature, obligations, value and trends. It is its own
+bounded context on top of the pipeline (`docs/GOVERN_ARCHITECTURE.md`; REST contract
+`docs/GOVERN_API.md`; operations `docs/GOVERN_RUNBOOK.md`).
+
+```
+Step Functions ── Persist ──► PutEvents "Document Analysed" ──► platform bus
+platform bus ─► SQS ─► govern-intake     (contract, matrix review, revisions, auto-assign)
+             ─► SQS ─► govern-notifier   (SES email, Teams card)
+             ─► SQS ─► govern-connectors (Huron push-back; daily Huron / Workday pulls)
+govern-activity stream ─► govern-stream  (Govern.* events + trend aggregates)
+Scheduler hourly ─► govern-sweeper       (SLA overdue, obligations due, capture reconciliation)
+API Gateway ─► govern-api  (JWT)  ·  POST /webhooks/{provider} ─► govern-webhooks (HMAC, no JWT)
+
+DynamoDB: govern-contracts · govern-activity (append-only, stream) · govern-config ·
+          govern-sync · govern-metrics       (KMS CMK; PITR on contracts / activity / config)
+```
+
+Every state change goes through `lambdas/shared/govern/workflow.py` (one module for the API, intake,
+webhooks and the sweeper); storage is one repository per table in `shared/govern/store.py`; the matrix
+grading is deterministic (`shared/govern/matrix.py`, no model call).
+
+| Routes (all JWT except webhooks) | |
+|---|---|
+| `GET /govern/me` | caller's Govern role |
+| `GET·POST /contracts`, `GET·PATCH /contracts/{id}` | board, intake at upload, detail, fields |
+| `POST /contracts/{id}/actions` · `/rescore` · `/blockers` · `/obligations`; `PATCH …/blockers/{id}` · `…/obligations/{id}`; `PUT …/income`; `GET …/revision-upload-url` | workflow |
+| `GET·PUT /matrix`, `POST /matrix/import`, `GET /matrix/versions/{n}` | review matrix (admin writes) |
+| `GET·PUT /workflow/settings` | SLA targets, reviewers, assignment and routing rules, alerts (admin writes) |
+| `GET /integrations`, `PUT /integrations/{id}`, `POST /integrations/{id}/sync`, `GET /integrations/sync-log`, `GET /integrations/unmatched` | connectors (admin) |
+| `GET /reports/trends`, `GET /reports/capture` | write-time trend aggregates; capture gaps and missed documents |
+| `POST /webhooks/docusign` | DocuSign Connect (HMAC-SHA256, 5-minute replay window) |
+
 ## Layout
 
 ```
 terraform/            All infrastructure (API Gateway, Lambdas, Step Functions, DynamoDB, S3, IAM)
 lambdas/
   api/                HTTP API handler (documents, projects, team, playbook)
+  govern_*/           Govern Lambdas: api, intake, stream, notifier, sweeper, connectors, webhooks
   rag/                Sonar chat (retrieval + answer, access-filtered)
   pipeline/           Step Functions entry point and the stages:
     stages/           parse, classify, embed, graph, diff, timeline, persist
   shared/             Access control, segmentation, dates, money, playbook, clients
-scripts/              One-off operational scripts (migrate_access.py)
+    govern/           Govern: workflow, store (5 repositories), matrix, connectors, aggregates, capture
+samples/osu/          OSU-style sample agreements and review matrix (demo + tests)
+scripts/              Operational scripts (migrate_access.py, backfill_govern_aggregates.py)
 docs/                 ARCHITECTURE.md, ENGINE_AUDIT.md, COSTS.md, security overview
 tests/                Offline unit and regression tests (AWS and OpenAI are faked)
 ```

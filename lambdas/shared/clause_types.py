@@ -36,6 +36,10 @@ KNOWN_CATEGORIES: list[str] = [
     # Compliance / data-protection agreements
     "DataProcessing", "DataResidency", "SubProcessors", "BreachNotification",
     "DataRetention", "SecurityControls", "Accessibility",
+    # Research / university licensing agreements (sponsored research, grants,
+    # MTAs, option and licence agreements) — graded by shared/govern/matrix.py
+    "PublicationRights", "BackgroundIP", "ExportControl", "DataRights",
+    "SponsorReporting", "Diligence",
     "Other",
 ]
 
@@ -43,7 +47,7 @@ _LABELS: dict[str, str] = {
     "ScopeOfWork": "Scope of work", "IP": "Intellectual property", "ForceMajeure": "Force majeure",
     "DisputeResolution": "Dispute resolution", "GoverningLaw": "Governing law",
     "DataProtection": "Data protection", "ChangeControl": "Change control",
-    "LicenseGrant": "License grant", "LicenseScope": "License scope",
+    "LicenseGrant": "License grant", "LicenseScope": "License grant scope",
     "SourceCodeEscrow": "Source-code escrow", "AuditRights": "Audit rights",
     "OpenSource": "Open source", "DataProcessing": "Data processing",
     "DataResidency": "Data residency", "SubProcessors": "Sub-processors",
@@ -51,6 +55,13 @@ _LABELS: dict[str, str] = {
     "SecurityControls": "Security controls", "Liability": "Limitation of liability",
     "Indemnity": "Indemnification", "Warranty": "Warranties", "Term": "Term and renewal",
     "Fees": "Fees", "Payment": "Payment terms",
+    "Royalties": "Royalties, milestones, equity and sublicense income",
+    "PublicationRights": "Publication rights and review period",
+    "BackgroundIP": "Background and foreground IP",
+    "ExportControl": "Export control and foreign parties",
+    "DataRights": "Data rights, confidentiality term and use of name",
+    "SponsorReporting": "Sponsor reporting and flow-down terms",
+    "Diligence": "Diligence and commercialisation",
 }
 
 _ACRONYMS = {"ip", "sla", "slas", "gdpr", "hipaa", "ccpa", "nda", "kpi", "kpis", "pii", "phi",
@@ -91,8 +102,10 @@ _KNOWN_SYNONYMS: dict[str, str] = {
     "insurance": "Insurance", "insurance-requirement": "Insurance",
     "license-grant": "LicenseGrant", "licence-grant": "LicenseGrant", "grant-of-license": "LicenseGrant",
     "license-scope": "LicenseScope", "licence-scope": "LicenseScope",
+    "license-grant-scope": "LicenseScope", "field-of-use": "LicenseScope", "territory": "LicenseScope",
     "restriction": "Restrictions", "use-restriction": "Restrictions", "license-restriction": "Restrictions",
-    "royalty": "Royalties", "license-fee": "Royalties",
+    "royalty": "Royalties", "license-fee": "Royalties", "royalty-and-milestone": "Royalties",
+    "sublicense-income": "Royalties", "equity": "Royalties", "license-issue-fee": "Royalties",
     "sublicensing": "Sublicensing", "sub-licensing": "Sublicensing",
     "source-code-escrow": "SourceCodeEscrow", "escrow": "SourceCodeEscrow",
     "audit-right": "AuditRights", "audit": "AuditRights", "audit-and-inspection": "AuditRights",
@@ -104,6 +117,25 @@ _KNOWN_SYNONYMS: dict[str, str] = {
     "data-retention": "DataRetention", "data-deletion": "DataRetention", "record-retention": "DataRetention",
     "security-control": "SecurityControls", "information-security": "SecurityControls", "security": "SecurityControls",
     "accessibility": "Accessibility",
+    # research & licensing
+    "publication": "PublicationRights", "publication-right": "PublicationRights",
+    "publication-review": "PublicationRights", "right-to-publish": "PublicationRights",
+    "publication-and-presentation": "PublicationRights", "academic-publication": "PublicationRights",
+    "background-ip": "BackgroundIP", "foreground-ip": "BackgroundIP", "invention": "BackgroundIP",
+    "background-intellectual-property": "BackgroundIP", "ownership-of-invention": "BackgroundIP",
+    "background-and-foreground-ip": "BackgroundIP", "invention-and-patent": "BackgroundIP",
+    "export-control": "ExportControl", "export": "ExportControl", "itar": "ExportControl",
+    "ear": "ExportControl", "export-compliance": "ExportControl", "foreign-national": "ExportControl",
+    "data-right": "DataRights", "research-data": "DataRights", "data-ownership": "DataRights",
+    "right-in-data": "DataRights", "ownership-of-data": "DataRights",
+    "sponsor-reporting": "SponsorReporting", "reporting-requirement": "SponsorReporting",
+    "flow-down": "SponsorReporting", "flowdown": "SponsorReporting", "flow-down-term": "SponsorReporting",
+    "technical-reporting": "SponsorReporting", "progress-report": "SponsorReporting",
+    "federal-flow-down": "SponsorReporting", "prime-award-term": "SponsorReporting",
+    "diligence": "Diligence", "diligence-obligation": "Diligence", "commercial-diligence": "Diligence",
+    "commercialization": "Diligence", "commercialisation": "Diligence",
+    "commercially-reasonable-effort": "Diligence", "development-milestone": "Diligence",
+    "sovereign-immunity": "GoverningLaw",
 }
 
 # normalised key → canonical custom key (obvious synonyms for types with no
@@ -131,7 +163,7 @@ _CUSTOM_SYNONYMS: dict[str, str] = {
     "business-continuity": "business-continuity", "disaster-recovery": "business-continuity",
     "step-in-right": "step-in-rights", "benchmarking": "benchmarking",
     "most-favoured-nation": "most-favoured-customer", "most-favored-nation": "most-favoured-customer",
-    "export-control": "export-control", "order-of-precedence": "order-of-precedence",
+    "order-of-precedence": "order-of-precedence",
     "precedence": "order-of-precedence", "conflict-of-interest": "conflict-of-interest",
     "transition": "exit-and-transition", "exit": "exit-and-transition", "transition-assistance": "exit-and-transition",
     "exit-assistance": "exit-and-transition", "client-responsibility": "client-responsibilities",
@@ -247,3 +279,11 @@ def type_counts(clauses: list[dict[str, Any]]) -> list[dict[str, Any]]:
         })
         row["count"] += 1
     return sorted(agg.values(), key=lambda r: (-r["count"], r["key"]))
+
+
+# A known category's own label, spelled as a custom type ("Other" + "Background
+# and foreground IP"), resolves back to the category — so relabelling a category
+# never strands clauses typed with its label.
+for _cat in KNOWN_CATEGORIES:
+    if _cat != "Other":
+        _KNOWN_SYNONYMS.setdefault(type_key(known_label(_cat)), _cat)

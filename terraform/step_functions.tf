@@ -19,7 +19,7 @@ resource "aws_cloudwatch_log_group" "sfn" {
 # (Express is at-least-once, i.e. duplicate LLM spend), and costs ~$0.0002/doc.
 
 locals {
-  _fn  = aws_lambda_function.pipeline.arn
+  _fn    = aws_lambda_function.pipeline.arn
   _catch = [{ ErrorEquals = ["States.ALL"], Next = "MarkFailed", ResultPath = "$.error" }]
 
   # Slightly above the Lambda timeout, so a hung invoke is caught (States.Timeout
@@ -128,20 +128,36 @@ locals {
         TimeoutSeconds = local._task_timeout
         Retry          = local._retry
         Catch          = local._catch
-        Next           = "DocumentReady"
+        Next           = "PublishDocumentAnalysed"
       }
-      DocumentReady = {
+      # Tell the platform bus the document is analysed (govern-intake turns it
+      # into a contract). Retried; a failure here must NOT fail an analysis that
+      # already succeeded: the hourly Govern reconciliation captures any
+      # document whose event was lost.
+      PublishDocumentAnalysed = {
         Type     = "Task"
         Resource = "arn:aws:states:::events:putEvents"
         Parameters = {
           Entries = [{
             "Detail.$"   = "$"
-            DetailType   = "blue-iq.documentReady"
-            Source       = "blue-iq.${var.stage}.pipeline"
-            EventBusName = "default"
+            DetailType   = "Document Analysed"
+            Source       = "blue-iq.pipeline"
+            EventBusName = aws_cloudwatch_event_bus.platform.name
           }]
         }
-        End = true
+        ResultPath = null
+        Retry = [{
+          ErrorEquals     = ["States.ALL"]
+          IntervalSeconds = 2
+          MaxAttempts     = 4
+          BackoffRate     = 2
+        }]
+        Catch = [{ ErrorEquals = ["States.ALL"], Next = "AnalysedEventNotPublished", ResultPath = "$.publishError" }]
+        End   = true
+      }
+      AnalysedEventNotPublished = {
+        Type    = "Succeed"
+        Comment = "The document is READY; Govern reconciliation will capture it."
       }
       MarkFailed = {
         Type     = "Task"
@@ -160,8 +176,8 @@ locals {
           UpdateExpression = "SET #st = :failed, updatedAt = :ts, errorMessage = :err"
           # updateItem upserts: without this, a failure for a document that was
           # deleted mid-run would recreate a tenant-less ghost row.
-          ConditionExpression       = "attribute_exists(PK)"
-          ExpressionAttributeNames  = { "#st" = "status" }
+          ConditionExpression      = "attribute_exists(PK)"
+          ExpressionAttributeNames = { "#st" = "status" }
           ExpressionAttributeValues = {
             ":failed" = { S = "FAILED" }
             ":ts"     = { "S.$" = "$$.State.EnteredTime" }
