@@ -42,8 +42,9 @@ def contract(sub=OWNER, cid="lic-1", **kw):
 
 def test_me_reports_the_govern_role(world, monkeypatch):
     me = call("GET", "/govern/me", OWNER)[1]
-    assert {k: v for k, v in me.items() if k != "features"} == {"email": EMAIL[OWNER], "name": "Dana Ruiz",
-                                                                "role": "admin", "tenantId": f"u-{OWNER}"}
+    skip = {"features", "edition", "defaultEdition", "agreementTypes"}
+    assert {k: v for k, v in me.items() if k not in skip} == {"email": EMAIL[OWNER], "name": "Dana Ruiz",
+                                                             "role": "admin", "tenantId": f"u-{OWNER}"}
     assert set(me["features"]) == {"routingRules", "docusign", "notifications", "obligations", "exports", "integrations"}
     assert call("GET", "/govern/me", OWNER, groups=["govern-leader"])[1]["role"] == "leader"
     assert call("GET", "/govern/me", OWNER, groups="[govern-reviewer other]")[1]["role"] == "reviewer"
@@ -447,3 +448,25 @@ def test_a_leader_who_edits_the_workspace_still_cannot_change_a_contract(world):
     status, _ = call("POST", "/contracts/lic-1/actions", OWNER, {"action": "comment", "text": "Looks fine"},
                      groups=["govern-leader"])
     assert status == 200
+
+
+def test_edition_comes_from_the_organization_and_changes_the_vocabulary(world, monkeypatch):
+    # No choice yet: the deployment default, with the Campus agreement types.
+    monkeypatch.setattr(settings, "govern_default_edition", "campus")
+    me = call("GET", "/govern/me", OWNER)[1]
+    assert me["edition"] == "campus" and me["defaultEdition"] == "campus"
+    ids = [t["id"] for t in me["agreementTypes"]]
+    assert {"sponsored_research", "license", "mta", "grant"} <= set(ids) and "sow" not in ids
+    # An admin picks Workforce in Settings → Organization: SOW, MSA and staffing appear.
+    status, _ = call("PUT", "/workflow/settings", OWNER, body={"organization": {"edition": "workforce"}})
+    assert status == 200
+    me = call("GET", "/govern/me", OWNER)[1]
+    assert me["edition"] == "workforce"
+    ids = [t["id"] for t in me["agreementTypes"]]
+    assert ids[:3] == ["sow", "msa", "staffing"] and "sponsored_research" not in ids
+    # A reviewer cannot change it; clearing it falls back to the default.
+    assert call("PUT", "/workflow/settings", OWNER, groups=["govern-reviewer"],
+                body={"organization": {"edition": "campus"}})[0] == 403
+    assert call("PUT", "/workflow/settings", OWNER, body={"organization": {"edition": None}})[0] == 200
+    assert call("GET", "/govern/me", OWNER)[1]["edition"] == "campus"
+    assert call("PUT", "/workflow/settings", OWNER, body={"organization": {"edition": "enterprise"}})[0] == 400

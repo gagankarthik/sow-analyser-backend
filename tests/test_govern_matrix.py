@@ -462,7 +462,7 @@ def test_imported_threshold_change_changes_the_grade():
     ({"docType": "NDA", "title": "agreement.pdf"}, "nda"),
     ({"docType": "OTHER", "title": "Mutual Confidential Disclosure Agreement"}, "nda"),
     ({"docType": "OTHER", "title": "scan_0042.pdf", "summary": "A subaward under a prime award from NSF."}, "grant"),
-    ({"docType": "MSA", "title": "Master Services Agreement"}, "other"),
+    ({"docType": "MSA", "title": "Master Services Agreement"}, "msa"),
 ])
 def test_infer_agreement_type(meta, expected):
     assert m.infer_agreement_type(meta, None) == expected

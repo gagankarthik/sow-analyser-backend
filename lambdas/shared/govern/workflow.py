@@ -268,7 +268,7 @@ def counterparty_noun(c: dict[str, Any]) -> str:
         return "sponsor"
     if t in ("license", "option"):
         return "licensee"
-    if t == "software":
+    if t in ("software", "sow", "msa", "staffing"):
         return "vendor"
     if t == "data_use":
         return "data provider"

@@ -182,6 +182,16 @@ variable "govern_features" {
   }
 }
 
+variable "govern_default_edition" {
+  description = "Requirement 7: the Govern edition (campus or workforce) an organization sees until an admin picks one in Settings → Organization. Reported to the web app by GET /govern/me."
+  type        = string
+  default     = "campus"
+  validation {
+    condition     = contains(["campus", "workforce"], var.govern_default_edition)
+    error_message = "govern_default_edition must be campus or workforce."
+  }
+}
+
 variable "notify_from_email" {
   description = "Verified SES sender for Govern alert email (an SES identity is created when set). Empty = email alerts off."
   type        = string

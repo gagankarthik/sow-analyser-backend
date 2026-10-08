@@ -43,6 +43,7 @@ locals {
     INTAKE_QUEUE_URL             = aws_sqs_queue.govern["intake"].url
     GOVERN_OPEN_ADMIN            = tostring(local.govern_open_admin)
     GOVERN_FEATURES              = var.govern_features
+    GOVERN_DEFAULT_EDITION       = var.govern_default_edition
     NOTIFY_FROM_EMAIL            = var.notify_from_email
     SES_REGION                   = local.region
     APP_BASE_URL                 = var.app_base_url

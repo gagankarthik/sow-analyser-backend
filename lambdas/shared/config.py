@@ -232,6 +232,12 @@ class Settings:
         default_factory=lambda: parse_govern_features(_env("GOVERN_FEATURES", ""))
     )
 
+    # Requirement 7: the edition an organization sees until it picks one
+    # (Settings → Organization). "campus" or "workforce".
+    govern_default_edition: str = field(
+        default_factory=lambda: "workforce" if _env("GOVERN_DEFAULT_EDITION", "campus").strip().lower() == "workforce" else "campus"
+    )
+
     log_level: str = field(default_factory=lambda: _env("LOG_LEVEL", "INFO"))
 
     # ── Guardrails / data protection ──────────────────────────────────────────

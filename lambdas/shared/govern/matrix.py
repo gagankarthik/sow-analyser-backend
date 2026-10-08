@@ -85,8 +85,24 @@ from ..playbook import rule_id_for_clause, valid_rule_id
 
 AGREEMENT_TYPES: list[str] = [
     "sponsored_research", "clinical_trial", "grant", "license", "option", "mta", "data_use", "nda",
-    "collaboration", "software", "other",
+    "collaboration", "software", "sow", "msa", "staffing", "other",
 ]
+
+# Requirement 7: one Govern, two editions. Each edition offers its own
+# agreement types (the vocabulary) and the matrix positions for them (the rule
+# set); everything else is shared. Types not listed for an edition stay in the
+# data model and the matrix, so switching an edition back loses nothing.
+EDITIONS: tuple[str, ...] = ("campus", "workforce")
+EDITION_AGREEMENT_TYPES: dict[str, list[str]] = {
+    "campus": ["sponsored_research", "license", "mta", "grant", "clinical_trial", "option", "data_use", "nda",
+               "collaboration", "software", "other"],
+    "workforce": ["sow", "msa", "staffing", "nda", "software", "other"],
+}
+
+
+def edition_agreement_types(edition: str | None) -> list[str]:
+    """The agreement types an edition offers (campus when unknown)."""
+    return list(EDITION_AGREEMENT_TYPES.get(edition or "campus", EDITION_AGREEMENT_TYPES["campus"]))
 AGREEMENT_TYPE_LABELS: dict[str, str] = {
     "sponsored_research": "Sponsored research",
     "clinical_trial": "Clinical trial",
@@ -98,6 +114,9 @@ AGREEMENT_TYPE_LABELS: dict[str, str] = {
     "nda": "Non-disclosure (NDA / CDA)",
     "collaboration": "Collaboration",
     "software": "Software or SaaS (purchase)",
+    "sow": "Statement of work (SOW)",
+    "msa": "Master services agreement (MSA)",
+    "staffing": "Staffing vendor agreement",
     "other": "Other",
 }
 
@@ -248,8 +267,10 @@ def _th(thresholds: dict[str, Any], key: str) -> float:
         return float(value)
     if key in _THRESHOLD_DEFAULTS:
         return float(_THRESHOLD_DEFAULTS[key])
-    from . import software  # buyer-side thresholds (software purchases)
-    return float(software.THRESHOLD_DEFAULTS.get(key, 0))
+    from . import software, workforce  # buyer-side thresholds (software, services, staffing)
+    if key in software.THRESHOLD_DEFAULTS:
+        return float(software.THRESHOLD_DEFAULTS[key])
+    return float(workforce.THRESHOLD_DEFAULTS.get(key, 0))
 
 
 # "Our" party in a research or licensing agreement.
@@ -870,6 +891,10 @@ def thresholds_for(clause_type: str, agreement_type: str | None = None) -> dict[
     if agreement_type == "software":
         from . import software
         return dict(software.THRESHOLDS.get(clause_type, {}))
+    from . import workforce
+    if agreement_type in workforce.WORKFORCE_TYPES:
+        from . import software
+        return dict(workforce.THRESHOLDS.get(clause_type) or software.THRESHOLDS.get(clause_type, {}))
     return dict(_THRESHOLDS.get(clause_type, {}))
 
 
@@ -1285,6 +1310,8 @@ def default_matrix() -> dict[str, Any]:
         "data_use": data_use_clauses, "nda": nda_clauses, "collaboration": collaboration_clauses,
         "software": software.default_clauses(), "other": other_clauses,
     }
+    from . import workforce
+    by_type.update(workforce.default_playbooks())
     return {
         "version": 1,
         "effectiveDate": DEFAULT_EFFECTIVE_DATE,
@@ -1483,6 +1510,9 @@ _CLAUSE_KEYWORDS: list[tuple[str, str]] = [
 ]
 
 _AGREEMENT_SYNONYMS: list[tuple[str, str]] = [
+    (r"statement\s+of\s+work|\bsow\b", "sow"),
+    (r"master\s+(?:services?|consulting)|\bmsa\b", "msa"),
+    (r"staffing|contingent|temporary\s+(?:staff|labou?r)", "staffing"),
     (r"clinical|\bcta\b", "clinical_trial"),
     (r"data\s+use|\bdua\b|data\s+sharing", "data_use"),
     (r"software|saas|subscription|eula|cloud", "software"),
@@ -1808,10 +1838,15 @@ def _grade(mclause: dict[str, Any], text: str, home: str | None = None,
     software purchase is graded by the buyer-side checks (``software.py``):
     there the university is the customer and the vendor the other party."""
     clause_type = mclause["clauseType"]
+    from . import workforce
     if agreement_type == "software":
         from . import software
         thresholds = {**software.THRESHOLDS.get(clause_type, {}), **(mclause.get("thresholds") or {}), "homeState": home}
         check = software.CHECKS.get(clause_type)
+    elif agreement_type in workforce.WORKFORCE_TYPES:
+        # Services and staffing: graded from the client's side (workforce.py).
+        thresholds = {**thresholds_for(clause_type, agreement_type), **(mclause.get("thresholds") or {}), "homeState": home}
+        check = workforce.CHECKS.get(clause_type)
     else:
         thresholds = {**thresholds_for(clause_type), **(mclause.get("thresholds") or {}), "homeState": home}
         check = _CHECKS.get(clause_type)
@@ -2004,7 +2039,10 @@ def infer_agreement_type(doc_meta: dict[str, Any] | None, classification: dict[s
         (r"non-?\s?disclosure|confidential\s+disclosure|confidentiality\s+agreement|\bnda\b|\bcda\b", "nda"),
         (r"licen[cs]e\s+agreement|\blicen[cs]e\b", "license"),
     ]
-    from . import software
+    from . import software, workforce
+    services = workforce.workforce_type(title, rest, doc_type)
+    if services:
+        return services
     if software.looks_like_software_purchase(title, rest + " " + _all_text(classification).lower(), doc_type):
         return "software"
     for pattern, kind in rules:
@@ -2044,7 +2082,7 @@ def infer_direction(agreement_type: str, classification: dict[str, Any] | None) 
     subawards, vendor spend). License, option, sponsored research and grants are
     incoming unless the text shows your organization paying — your organization as pass-through entity or
     "Organization shall pay / reimburse" the other party."""
-    if agreement_type == "software":
+    if agreement_type in ("software", "sow", "msa", "staffing"):
         return "outgoing"
     read = ((classification or {}).get("agreement") or {}).get("moneyDirection")
     if read in ("incoming", "outgoing"):

@@ -59,6 +59,7 @@ from shared.access import Caller, can
 from shared.auth import AuthError, jwt_claims
 from shared.config import settings
 from shared.govern import aggregates, capture, connectors, secrets, store, workflow
+from shared.govern import matrix as govern_matrix
 from shared.govern.store import ContractConflict, iso
 from shared.logger import get_logger
 from shared.uploads import clean_upload_filename, pending_document_meta, upload_key
@@ -689,10 +690,25 @@ def _capture_report(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
                 "lastReconciledAt": state.get("lastReconciledAt")})
 
 
+def _edition_for(tenant_id: str) -> str:
+    """The organization's edition (Settings → Organization), else the deployment default."""
+    try:
+        chosen = (workflow.get_settings(tenant_id).get("organization") or {}).get("edition")
+    except Exception:  # noqa: BLE001 - the profile must load even if settings cannot
+        chosen = None
+    return chosen if chosen in govern_matrix.EDITIONS else settings.govern_default_edition
+
+
 def _me(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
     p = user.person or {}
+    edition = _edition_for(user.caller.tenant_id)
     return _ok({"email": p.get("email"), "name": p.get("name"), "role": user.role,
                 "tenantId": user.caller.tenant_id,
+                # Requirement 7: which edition this organization sees, and its vocabulary.
+                "edition": edition,
+                "defaultEdition": settings.govern_default_edition,
+                "agreementTypes": [{"id": t, "label": govern_matrix.AGREEMENT_TYPE_LABELS[t]}
+                                   for t in govern_matrix.edition_agreement_types(edition)],
                 # Which "Later" features this deployment has on (GOVERN_FEATURES).
                 "features": settings.govern_feature_flags()})
 
