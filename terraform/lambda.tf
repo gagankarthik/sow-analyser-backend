@@ -559,6 +559,8 @@ resource "aws_lambda_function" "rag" {
     variables = merge(local.pipeline_env, {
       PIPELINE_STAGE          = "08_rag"
       RAG_MAX_CONTEXT_CLAUSES = "8"
+      # Sonar adds the Govern review (ratings, positions, next step) to its answers.
+      CONTRACTS_TABLE = aws_dynamodb_table.govern_contracts.name
       # A retrieval chunk is at most ~1,800 characters; the old 1,200 cap cut the
       # end off every longer clause before the model saw it.
       RAG_MAX_CLAUSE_CHARS     = "2400"

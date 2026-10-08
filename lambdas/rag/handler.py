@@ -63,7 +63,12 @@ MAX_CLAUSE_CHARS    = int(os.environ.get("RAG_MAX_CLAUSE_CHARS", "2400") or 2400
 # Hard caps on caller-controlled input: bound prompt size (and so LLM spend).
 MAX_QUESTION_CHARS  = 2000
 MAX_TOP_K           = 20
-MAX_ANSWER_TOKENS   = int(os.environ.get("RAG_MAX_ANSWER_TOKENS", "700") or 700)
+MAX_ANSWER_TOKENS   = int(os.environ.get("RAG_MAX_ANSWER_TOKENS", "900") or 900)
+# Earlier turns of the conversation sent back with a question (follow-ups).
+MAX_HISTORY_TURNS   = 6
+MAX_HISTORY_CHARS   = 1200
+# How many matrix findings the contract brief lists (most serious first).
+MAX_BRIEF_FINDINGS  = 12
 _ID_RE              = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _CITE_RE            = re.compile(r"\[§\s*([^\]]{1,60})\]")
 _NO_HITS_ANSWER     = (
@@ -71,10 +76,35 @@ _NO_HITS_ANSWER     = (
     "Try rephrasing, or ask about a specific clause or topic."
 )
 
-_SYSTEM_PROMPT = """You are Bluely, the contract-intelligence assistant for Blue-IQ.
+_SYSTEM_PROMPT = """You are Sonar, the contract assistant in Blue-IQ Govern. You help
+reviewers and leaders act on an agreement: what it says, how it compares
+with their review matrix, and what to do next.
+
+Sources:
+- <context>: clause excerpts from the agreement. The only source for what the
+  agreement SAYS.
+- <review> (when present): this organization's matrix review of the agreement
+  (each finding's rating, the standard position, the acceptable fallback,
+  suggested language), plus its stage, who it waits on, open blockers and the
+  recommended next step. Use it for how the agreement COMPARES with their
+  positions and what to do; call it "your matrix".
+- <conversation> (when present): earlier turns, so a follow-up such as "and
+  the payment terms?" keeps its meaning.
+
+How to answer:
+- Start with a one- or two-sentence direct answer. Then details as short
+  bullets. No preamble, no restating the question.
+- When asked what to change, fix, negotiate or send back: list each finding
+  that is not within the matrix (most serious first) with its clause number,
+  what the agreement says, what your matrix allows, and the suggested
+  language from <review> word for word when it is there.
+- When asked for a summary: parties, type, value and key dates, then the
+  matrix result (counts and the findings that need action), then the next step.
+- End with "Next step:" and one concrete action when the question is about
+  status, risk or what to do.
 
 Rules:
-- Answer ONLY using the clause excerpts in <context>. Do not use outside
+- Answer ONLY using <context> and <review>. Do not use outside
   knowledge about contracts, law or the parties.
 - If the context does not contain the answer, say plainly that the document
   does not state it (and, if useful, what the nearest related clause does say).
@@ -243,8 +273,79 @@ def _used(answer: str, citations: list[dict[str, Any]]) -> list[str]:
     return out
 
 
-def _user_message(blocks: list[str], question: str) -> str:
-    return f"<context>\n{chr(10).join(blocks)}\n</context>\n\nQuestion: {_as_data(question)}"
+def _user_message(blocks: list[str], question: str, brief: str | None = None,
+                  history: list[dict[str, str]] | None = None) -> str:
+    parts = [f"<context>\n{chr(10).join(blocks)}\n</context>"]
+    if brief:
+        parts.append(f"<review>\n{_as_data(brief)}\n</review>")
+    if history:
+        turns = "\n".join(f"{t['role'].capitalize()}: {_as_data(t['content'])}" for t in history)
+        parts.append(f"<conversation>\n{turns}\n</conversation>")
+    parts.append(f"Question: {_as_data(question)}")
+    return "\n\n".join(parts)
+
+
+def _history(raw: Any) -> list[dict[str, str]]:
+    """The last few user/assistant turns the client sent, trimmed and typed."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, str]] = []
+    for t in raw[-MAX_HISTORY_TURNS:]:
+        if isinstance(t, dict) and t.get("role") in ("user", "assistant") and isinstance(t.get("content"), str):
+            text = t["content"].strip()[:MAX_HISTORY_CHARS]
+            if text:
+                out.append({"role": t["role"], "content": text})
+    return out
+
+
+_TIER_ORDER = {"unacceptable": 0, "deviates": 1, "missing": 2, "review": 3, "fallback": 4, "within": 5}
+_TIER_WORDS = {"unacceptable": "not acceptable", "deviates": "needs changes", "missing": "missing",
+               "review": "check by hand", "fallback": "acceptable fallback", "within": "within matrix"}
+
+
+def _contract_brief(doc_id: str, meta: dict[str, Any]) -> str | None:
+    """A short, plain-text brief of the Govern contract for this document: its
+    stage, who it waits on, the next step, open blockers and the matrix findings
+    (with standard, fallback and suggested language). None when the document
+    has no contract or Govern is not configured. Best-effort: Sonar still
+    answers from the clauses if this fails."""
+    if not settings.contracts_table:
+        return None
+    try:
+        from shared.govern import store, workflow
+        c = store.contracts.get(doc_id) or (store.contracts.get(str(meta.get("contractId"))) if meta.get("contractId") else None)
+        if not c:
+            return None
+        api = workflow.to_api(c)
+        review = store.contracts.get_review(c["contractId"], c.get("reviewedDocId") or c.get("currentDocId") or c["contractId"])
+        blockers = [b for b in store.contracts.blockers(c["contractId"]) if b.get("status") != "resolved"]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("rag.brief_failed", error_type=type(exc).__name__)
+        return None
+    lines = [
+        f"Contract: {api.get('title') or 'Untitled'} ({api.get('agreementType')}, money {api.get('direction')})",
+        f"Stage: {api.get('stage')}; waiting on: {(api.get('waitingOn') or {}).get('label') or 'nobody'}; "
+        f"{api.get('daysInStage')} days in this stage; status: {api.get('slaStatus')}",
+        f"Value: {api.get('value')} {api.get('currency') or ''}; term: {api.get('effectiveDate') or '?'} to {api.get('termEndDate') or '?'}",
+        f"Recommended next step: {(api.get('nextStep') or {}).get('headline') or 'none'}",
+    ]
+    if blockers:
+        lines.append("Open blockers: " + "; ".join(str(b.get("text") or "")[:160] for b in blockers[:6]))
+    if review and review.get("clauses"):
+        counts = review.get("counts") or {}
+        lines.append("Matrix result (version " + str(review.get("matrixVersion")) + "): "
+                     + ", ".join(f"{_TIER_WORDS.get(k, k)} {v}" for k, v in counts.items() if v))
+        findings = sorted(review["clauses"], key=lambda r: _TIER_ORDER.get(r.get("tier"), 9))
+        for r in findings[:MAX_BRIEF_FINDINGS]:
+            row = (f"- {r.get('label')} [§{r.get('clauseNumber') or '-'}]: {_TIER_WORDS.get(r.get('tier'), r.get('tier'))}"
+                   + (f"; favours you: {r.get('beneficialReason')}" if r.get("beneficial") else ""))
+            if r.get("tier") not in ("within",):
+                row += (f"\n  Finding: {str(r.get('reason') or '')[:240]}"
+                        f"\n  Standard: {str(r.get('standard') or '')[:240]}"
+                        + (f"\n  Fallback: {str(r.get('fallback'))[:200]}" if r.get("fallback") else "")
+                        + (f"\n  Suggested language: {str(r.get('suggestedLanguage'))[:500]}" if r.get("suggestedLanguage") else ""))
+            lines.append(row)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +381,7 @@ def _http_handle(event: dict[str, Any]) -> dict[str, Any]:
     if len(question) > MAX_QUESTION_CHARS:
         return _http_resp(400, {"error": f"Question is too long (max {MAX_QUESTION_CHARS} characters)"})
     top_k = _top_k(body.get("topK"))
+    history = _history(body.get("history"))
 
     log.append_keys(tenant_id=caller.tenant_id, targetId=target_id)
 
@@ -292,9 +394,11 @@ def _http_handle(event: dict[str, Any]) -> dict[str, Any]:
         return _http_resp(200, {"answer": _NO_HITS_ANSWER, "citations": [], "grounded": False})
 
     started = time.monotonic()
-    [q_vec] = embed_texts([question], model=settings.embedding_model)
+    prev = next((t["content"] for t in reversed(history) if t["role"] == "user"), "")
+    search_text = f"{prev}\n{question}" if prev and len(question) < 80 else question
+    [q_vec] = embed_texts([search_text], model=settings.embedding_model)
     # Fetch more chunks than clauses wanted: several chunks can belong to one clause.
-    hits = clause_search(text=question, vector=q_vec, k=min(top_k * 2, MAX_TOP_K * 2), **scope)
+    hits = clause_search(text=search_text, vector=q_vec, k=min(top_k * 2, MAX_TOP_K * 2), **scope)
 
     if not hits:
         return _http_resp(200, {"answer": _NO_HITS_ANSWER, "citations": [], "grounded": False})
@@ -304,7 +408,9 @@ def _http_handle(event: dict[str, Any]) -> dict[str, Any]:
     blocks, citations = _assemble(hits, multi_doc, titles)
     blocks, citations = blocks[:top_k], citations[:top_k]
 
-    red = _redact(_user_message(blocks, question))
+    # One agreement: add its Govern review (ratings, positions, next step).
+    brief = None if multi_doc else _contract_brief(target_id, get_doc_meta(target_id) or {})
+    red = _redact(_user_message(blocks, question, brief, history))
     _audit_rag(red, tenantId=caller.tenant_id, targetId=target_id, clauses=len(citations))
 
     answer = chat_text(

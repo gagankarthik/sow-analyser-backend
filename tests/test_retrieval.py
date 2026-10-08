@@ -374,3 +374,39 @@ def test_chat_answer_carries_citations_and_grounding(monkeypatch, ddb):
     assert out["usedCitations"] == [] and out["grounded"] is False        # honest "not in the document"
     assert "[§7.2] Payment" in sent["user"] and sent["temperature"] == 0.0
     assert sent["model"] == rag.settings.model_for("rag")
+
+
+def test_sonar_adds_the_review_and_remembers_the_conversation(monkeypatch, ddb):
+    owner = "11111111-1111-4111-8111-111111111111"
+    monkeypatch.setattr(rag, "get_doc_meta", lambda _id: {"docId": DOC, "tenantId": "acme", "ownerSub": owner})
+    searched = {}
+
+    def embed(texts, model=None):
+        searched["text"] = texts[0]
+        return [[0.0]]
+    monkeypatch.setattr(rag, "embed_texts", embed)
+    monkeypatch.setattr(rag, "clause_search", lambda **kw: [_hit("9", "Licensee shall indemnify.", title="Indemnity")])
+    monkeypatch.setattr(rag, "_contract_brief", lambda doc_id, meta: (
+        "Recommended next step: Send back\n- Indemnification [§9]: needs changes\n  Suggested language: Each party's liability is capped."))
+    sent = {}
+    monkeypatch.setattr(rag, "chat_text", lambda **kw: sent.update(kw) or "Change §9 [§9].\nNext step: send back.")
+    history = [{"role": "user", "content": "What needs to change before signing?"},
+               {"role": "assistant", "content": "Indemnity needs changes [§9]."},
+               {"role": "system", "content": "ignored"}]
+    ev = {"pathParameters": {"docId": DOC}, "body": json.dumps({"question": "And the wording?", "history": history}),
+          "requestContext": {"http": {"method": "POST"}, "authorizer": {"jwt": {"claims": {"sub": owner}}}}}
+    out = json.loads(rag._http_handle(ev)["body"])
+    assert out["usedCitations"] == ["9"]
+    user = sent["user"]
+    assert "<review>" in user and "Suggested language: Each party's liability is capped." in user
+    assert "<conversation>" in user and "User: What needs to change before signing?" in user and "ignored" not in user
+    # A short follow-up searches with the previous question too.
+    assert searched["text"].startswith("What needs to change before signing?")
+    assert "You are Sonar" in sent["system"] and "Next step:" in sent["system"]
+
+
+def test_history_is_trimmed_and_typed():
+    long = [{"role": "user", "content": "x" * 5000}] * 10
+    out = rag._history(long)
+    assert len(out) == rag.MAX_HISTORY_TURNS and all(len(t["content"]) == rag.MAX_HISTORY_CHARS for t in out)
+    assert rag._history("nope") == [] and rag._history([{"role": "tool", "content": "x"}]) == []

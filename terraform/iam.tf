@@ -298,6 +298,20 @@ resource "aws_iam_role_policy" "rag" {
         Resource = [aws_dynamodb_table.main.arn, "${aws_dynamodb_table.main.arn}/index/*"]
       },
       {
+        # Read-only: the Govern contract, its review and blockers, so Sonar can
+        # answer "what do I need to change" from the organization's matrix.
+        Sid      = "GovernContractsRead"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:Query"]
+        Resource = [aws_dynamodb_table.govern_contracts.arn]
+      },
+      {
+        Sid      = "GovernReviewsRead"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = ["${aws_s3_bucket.processed.arn}/*"]
+      },
+      {
         Sid      = "AppSync"
         Effect   = "Allow"
         Action   = ["appsync:GraphQL"]
