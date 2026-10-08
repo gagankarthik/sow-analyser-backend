@@ -971,7 +971,11 @@ def _blocker_view(b: dict[str, Any]) -> dict[str, Any]:
 
 
 def obligation_view(o: dict[str, Any]) -> dict[str, Any]:
-    return {k: o.get(k) for k in ("id", "kind", "title", "dueDate", "amount", "status", "source", "completedAt")}
+    out = {k: o.get(k) for k in ("id", "kind", "title", "dueDate", "amount", "status", "source", "completedAt",
+                                 "verifiedAt", "verifiedBy")}
+    # Older items predate verification: manual ones were entered by a person.
+    out["verified"] = bool(o["verified"]) if o.get("verified") is not None else o.get("source") != "sonar"
+    return out
 
 
 def _income_view(i: dict[str, Any]) -> dict[str, Any]:
@@ -1618,6 +1622,10 @@ def _clean_obligation_fields(body: dict[str, Any], creating: bool) -> dict[str, 
         if body["status"] not in ("open", "done"):
             raise BadRequest("status must be open or done")
         out["status"] = body["status"]
+    if "verified" in body:
+        if not isinstance(body["verified"], bool):
+            raise BadRequest("verified must be true or false")
+        out["verified"] = body["verified"]
     return out
 
 
@@ -1635,7 +1643,7 @@ def add_obligation(contract_id: str, body: dict[str, Any], actor: dict[str, Any]
     now_s = iso(_now(now))
     obl = {"id": uuid.uuid4().hex[:16], "kind": fields["kind"], "title": fields["title"],
            "dueDate": fields.get("dueDate"), "amount": fields.get("amount"), "status": "open",
-           "source": "manual", "completedAt": None}
+           "source": "manual", "completedAt": None, "verified": True, "verifiedAt": now_s, "verifiedBy": actor}
     store.contracts.put_obligation(contract_id, c0["tenantId"], obl)
 
     def change(c: dict[str, Any], entries: list[dict[str, Any]]) -> Any:
@@ -1653,7 +1661,7 @@ def edit_obligation(contract_id: str, obligation_id: str, body: dict[str, Any], 
                     *, now: datetime | None = None) -> dict[str, Any]:
     if not isinstance(body, dict):
         raise BadRequest("Body must be a JSON object")
-    unknown = set(body) - {"status", "dueDate", "title", "amount"}
+    unknown = set(body) - {"status", "dueDate", "title", "amount", "verified"}
     if unknown:
         raise BadRequest(f"Unknown field(s): {', '.join(sorted(unknown))}")
     fields = _clean_obligation_fields(body, False)
@@ -1665,8 +1673,13 @@ def edit_obligation(contract_id: str, obligation_id: str, body: dict[str, Any], 
         raise NotFound("Contract not found")
     now_s = iso(_now(now))
     was = obl.get("status", "open")
+    was_verified = bool(obl.get("verified")) if obl.get("verified") is not None else obl.get("source") != "sonar"
     before = dict(obl)
     obl.update(fields)
+    if fields.get("verified") is True and not was_verified:
+        obl["verifiedAt"], obl["verifiedBy"] = now_s, actor
+    elif fields.get("verified") is False:
+        obl["verifiedAt"], obl["verifiedBy"] = None, None
     if obl.get("status") == "done" and was != "done":
         obl["completedAt"] = now_s
     elif obl.get("status") == "open":
@@ -1677,6 +1690,8 @@ def edit_obligation(contract_id: str, obligation_id: str, body: dict[str, Any], 
     store.contracts.put_obligation(contract_id, c0["tenantId"], obl)
     if obl.get("status") == "done" and was != "done":
         action, summary = "obligation_done", f"{display(actor)} marked an obligation done: {obl['title']}."
+    elif fields.get("verified") is True and not was_verified:
+        action, summary = "obligation_verified", f"{display(actor)} verified an obligation Sonar found: {obl['title']}."
     else:
         action, summary = "field_updated", f"{display(actor)} updated an obligation: {obl['title']}."
 
@@ -2087,7 +2102,9 @@ def _sonar_obligations(c: dict[str, Any], signed_at: str, now_s: str) -> list[di
                     "kind": o.get("kind") if o.get("kind") in OBLIGATION_KINDS else "other",
                     "title": str(o.get("title") or "Obligation")[:300],
                     "dueDate": (str(o["dueDate"])[:10] if o.get("dueDate") else None), "amount": o.get("amount"),
-                    "status": "open", "source": "sonar", "completedAt": None})
+                    "status": "open", "source": "sonar", "completedAt": None,
+                    # AI output waits for a person to confirm it (human in the loop).
+                    "verified": False, "verifiedAt": None, "verifiedBy": None})
     return out
 
 

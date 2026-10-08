@@ -406,3 +406,19 @@ def test_organization_settings(world):
     for bad in ({"defaultCurrency": "euro"}, {"fiscalYearStartMonth": 13}, {"name": ""}, {"setupCompletedAt": "soon"},
                 {"confirmedSteps": ["everything"]}):
         assert call("PUT", "/workflow/settings", OWNER, {"organization": bad})[0] == 400
+
+
+def test_obligation_verification(world):
+    c = call("POST", "/contracts/lic-1/obligations", OWNER,
+             {"kind": "royalty_report", "title": "Annual report", "dueDate": "2026-12-01"})[1]["contract"]
+    obl = c["obligations"][0]
+    assert obl["verified"] is True and obl["verifiedAt"]          # a person entered it
+    oid = obl["id"]
+    body = call("PATCH", f"/contracts/lic-1/obligations/{oid}", OWNER, {"verified": False})[1]["contract"]
+    assert body["obligations"][0]["verified"] is False and body["obligations"][0]["verifiedAt"] is None
+    body = call("PATCH", f"/contracts/lic-1/obligations/{oid}", OWNER, {"verified": True})[1]["contract"]
+    assert body["obligations"][0]["verified"] is True
+    assert body["activity"][0]["action"] == "obligation_verified"
+    assert call("PATCH", f"/contracts/lic-1/obligations/{oid}", OWNER, {"verified": "yes"})[0] == 400
+    listed = call("GET", "/obligations", OWNER)[1]["obligations"][0]
+    assert listed["verified"] is True
