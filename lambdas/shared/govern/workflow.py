@@ -50,7 +50,8 @@ STATES = ("intake", "in_review", "sent_back", "escalated", "ready_to_sign",
 DIRECTIONS = ("incoming", "outgoing")
 REJECT_REASONS = ("unacceptable_terms", "sponsor_withdrew", "pi_withdrew", "duplicate", "out_of_scope", "other")
 OBLIGATION_KINDS = ("sponsor_report", "milestone_payment", "royalty_report", "diligence_milestone",
-                    "publication_review", "term_end", "closeout", "renewal_notice", "data_return", "other")
+                    "publication_review", "term_end", "closeout", "renewal_notice", "data_return",
+                    "invention_disclosure", "royalty_audit", "deliverable_due", "other")
 INCOME_KINDS = ("upfront", "milestone", "royalty", "equity", "sublicense", "sponsor_funding", "subaward", "other")
 TIERS = ("within", "fallback", "deviates", "unacceptable", "review", "missing")
 RISK_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
@@ -101,7 +102,8 @@ _STATE_WORDS = {
 # by a person is listed in ``userFields`` and never overwritten by inference.
 PATCH_FIELDS = ("agreementType", "direction", "counterparty", "sponsor", "piName", "department", "college",
                 "expectedValue", "manualValue", "currency", "requestedDate", "effectiveDate", "termEndDate",
-                "huronRecordId", "workdayRef", "workdayMatch")
+                "huronRecordId", "workdayRef", "workdayMatch", "poNumber", "poAmount", "pricingModel")
+PRICING_MODELS = ("fixed_fee", "time_materials", "mixed")
 _DATE_FIELDS = ("requestedDate", "effectiveDate", "termEndDate")
 _TEXT_FIELDS = ("counterparty", "sponsor", "piName", "department", "college")
 _FIELD_WORDS = {
@@ -110,7 +112,8 @@ _FIELD_WORDS = {
     "expectedValue": "expected value", "manualValue": "contract value", "currency": "currency",
     "requestedDate": "requested date", "effectiveDate": "effective date", "termEndDate": "term end date",
     "huronRecordId": "Huron record ID", "workdayRef": "Workday reference",
-    "workdayMatch": "Workday match",
+    "workdayMatch": "Workday match", "poNumber": "purchase order", "poAmount": "purchase order amount",
+    "pricingModel": "pricing model",
 }
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -268,7 +271,7 @@ def counterparty_noun(c: dict[str, Any]) -> str:
         return "sponsor"
     if t in ("license", "option"):
         return "licensee"
-    if t in ("software", "sow", "msa", "staffing"):
+    if t in ("software", "sow", "msa", "staffing", "subcontract"):
         return "vendor"
     if t == "data_use":
         return "data provider"
@@ -330,7 +333,9 @@ def default_settings() -> dict[str, Any]:
         "organization": {"name": None, "defaultCurrency": "USD", "fiscalYearStartMonth": 7,
                          "confirmedSteps": [], "setupCompletedAt": None,
                          # Requirement 7: which edition this customer sees (None = deployment default).
-                         "edition": None},
+                         "edition": None,
+                         # Requirement 7: the modules this organization uses (None = every module the deployment has on).
+                         "enabledModules": None},
     }
 
 
@@ -486,6 +491,13 @@ def validate_settings(body: Any, current: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(steps, list) or any(s_ not in SETUP_STEPS for s_ in steps):
                 raise BadRequest(f"organization.confirmedSteps may only name: {', '.join(SETUP_STEPS)}")
             merged["confirmedSteps"] = [s_ for s_ in SETUP_STEPS if s_ in steps]
+        if "enabledModules" in org:
+            mods = org["enabledModules"]
+            from ..config import GOVERN_FEATURES
+            known = set(GOVERN_FEATURES.values())
+            if mods is not None and (not isinstance(mods, list) or any(m_ not in known for m_ in mods)):
+                raise BadRequest(f"organization.enabledModules may only name: {', '.join(sorted(known))}, or be null")
+            merged["enabledModules"] = sorted(set(mods)) if mods is not None else None
         if "edition" in org:
             if org["edition"] not in (None, "campus", "workforce"):
                 raise BadRequest("organization.edition must be campus, workforce or null")
@@ -865,6 +877,9 @@ def to_api(c: dict[str, Any], now: datetime | None = None, cfg: dict[str, Any] |
         "huronRecordId": c.get("huronRecordId"),
         "workdayRef": c.get("workdayRef"),
         "workdayMatch": c.get("workdayMatch") or "unmatched",
+        "poNumber": c.get("poNumber"),
+        "poAmount": c.get("poAmount"),
+        "pricingModel": c.get("pricingModel"),
         "syncConflicts": list(c.get("syncConflicts") or []),
         "routing": {"required": list(routing.get("required") or []),
                     "approvals": list(routing.get("approvals") or []),
@@ -1173,7 +1188,15 @@ def clean_fields(body: dict[str, Any], *, allow: tuple[str, ...] = PATCH_FIELDS)
             if v is not None and not isinstance(v, str):
                 raise BadRequest(f"{k} must be a string or null")
             out[k] = (v or "").strip()[:200] or None
-        elif k in ("expectedValue", "manualValue"):
+        elif k == "poNumber":
+            if v is not None and (not isinstance(v, str) or not re.fullmatch(r"[A-Za-z0-9._:/#-]{1,60}", v.strip())):
+                raise BadRequest("poNumber must be up to 60 letters, digits or - _ . : / #, or null")
+            out[k] = v.strip() if v else None
+        elif k == "pricingModel":
+            if v is not None and v not in PRICING_MODELS:
+                raise BadRequest(f"pricingModel must be one of: {', '.join(PRICING_MODELS)}, or null")
+            out[k] = v
+        elif k in ("expectedValue", "manualValue", "poAmount"):
             if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0 or v > 1e13):
                 raise BadRequest(f"{k} must be a non-negative number or null")
             out[k] = v
@@ -2023,9 +2046,18 @@ def infer_fields(meta: dict[str, Any], classification: dict[str, Any] | None,
         "huronRecordId": header.get("huronRecordId") or (huron.group(1) if huron else None),
         "workdayRef": header.get("workdayRef") or (workday.group(1) if workday else None),
         "parentContractId": str(meta["parentDocId"]) if is_amendment else None,
+        # Workforce spend: fixed fee or time and materials, read from the pricing terms.
+        "pricingModel": _workforce_pricing(agreement_type, text),
         "amendsToValue": (float(meta["newTotalValue"]) if is_amendment and isinstance(meta.get("newTotalValue"), (int, float))
                           and not isinstance(meta.get("newTotalValue"), bool) else None),
     }
+
+
+def _workforce_pricing(agreement_type: str, text: str) -> str | None:
+    if agreement_type not in ("sow", "msa", "staffing", "subcontract"):
+        return None
+    from .workforce import pricing_model
+    return pricing_model(text)
 
 
 def _apply_inferred(c: dict[str, Any], inferred: dict[str, Any]) -> None:

@@ -42,7 +42,7 @@ def contract(sub=OWNER, cid="lic-1", **kw):
 
 def test_me_reports_the_govern_role(world, monkeypatch):
     me = call("GET", "/govern/me", OWNER)[1]
-    skip = {"features", "edition", "defaultEdition", "agreementTypes"}
+    skip = {"features", "deploymentFeatures", "edition", "defaultEdition", "agreementTypes"}
     assert {k: v for k, v in me.items() if k not in skip} == {"email": EMAIL[OWNER], "name": "Dana Ruiz",
                                                              "role": "admin", "tenantId": f"u-{OWNER}"}
     assert set(me["features"]) == {"routingRules", "docusign", "notifications", "obligations", "exports", "integrations"}
@@ -401,7 +401,7 @@ def test_a_one_off_obligation_does_not_repeat(world):
 def test_organization_settings(world):
     org = call("GET", "/workflow/settings", OWNER)[1]["settings"]["organization"]
     assert org == {"name": None, "defaultCurrency": "USD", "fiscalYearStartMonth": 7, "confirmedSteps": [],
-                   "setupCompletedAt": None, "edition": None}
+                   "setupCompletedAt": None, "edition": None, "enabledModules": None}
     assert call("PUT", "/workflow/settings", OWNER, {"organization": {"edition": "workforce"}})[1]["settings"]["organization"]["edition"] == "workforce"
     assert call("PUT", "/workflow/settings", OWNER, {"organization": {"edition": "enterprise"}})[0] == 400
     call("PUT", "/workflow/settings", OWNER, {"organization": {"edition": None}})
@@ -411,7 +411,8 @@ def test_organization_settings(world):
     assert status == 200
     assert body["settings"]["organization"] == {"name": "Acme Research", "defaultCurrency": "EUR",
                                                  "fiscalYearStartMonth": 7, "confirmedSteps": [],
-                                                 "setupCompletedAt": "2026-10-08T12:00:00Z", "edition": None}
+                                                 "setupCompletedAt": "2026-10-08T12:00:00Z", "edition": None,
+                                                 "enabledModules": None}
     body = call("PUT", "/workflow/settings", OWNER, {"organization": {"confirmedSteps": ["workflow", "matrix"]}})[1]
     assert body["settings"]["organization"]["confirmedSteps"] == ["matrix", "workflow"]
     # A partial update keeps the rest.
@@ -470,3 +471,25 @@ def test_edition_comes_from_the_organization_and_changes_the_vocabulary(world, m
     assert call("PUT", "/workflow/settings", OWNER, body={"organization": {"edition": None}})[0] == 200
     assert call("GET", "/govern/me", OWNER)[1]["edition"] == "campus"
     assert call("PUT", "/workflow/settings", OWNER, body={"organization": {"edition": "enterprise"}})[0] == 400
+
+
+def test_organization_modules_narrow_the_features(world):
+    me = call("GET", "/govern/me", OWNER)[1]
+    assert me["features"]["exports"] and me["features"]["obligations"]
+    assert call("PUT", "/workflow/settings", OWNER, body={"organization": {"enabledModules": ["obligations"]}})[0] == 200
+    me = call("GET", "/govern/me", OWNER)[1]
+    assert me["features"]["obligations"] and not me["features"]["exports"]
+    assert me["deploymentFeatures"]["exports"]
+    assert call("PUT", "/workflow/settings", OWNER, body={"organization": {"enabledModules": ["teleport"]}})[0] == 400
+    assert call("PUT", "/workflow/settings", OWNER, body={"organization": {"enabledModules": None}})[0] == 200
+    assert call("GET", "/govern/me", OWNER)[1]["features"]["exports"]
+
+
+def test_purchase_order_and_pricing_model_are_editable(world):
+    status, _ = call("PATCH", "/contracts/lic-1", OWNER, body={"poNumber": "PO-2026-0412", "poAmount": 50000,
+                                                                "pricingModel": "time_materials"})
+    assert status == 200
+    c = call("GET", "/contracts/lic-1", OWNER)[1]
+    c = c.get("contract", c)
+    assert c["poNumber"] == "PO-2026-0412" and c["poAmount"] == 50000 and c["pricingModel"] == "time_materials"
+    assert call("PATCH", "/contracts/lic-1", OWNER, body={"pricingModel": "barter"})[0] == 400

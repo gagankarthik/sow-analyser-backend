@@ -21,7 +21,7 @@ from . import software as _sw
 
 _Check = _m._Check
 
-WORKFORCE_TYPES = ("sow", "msa", "staffing")
+WORKFORCE_TYPES = ("sow", "msa", "staffing", "subcontract")
 
 
 def _low(text: str) -> str:
@@ -134,6 +134,45 @@ def check_co_employment(text: str, th: dict[str, Any]) -> _Check:
     return _Check("review", "Who employs the workers is not clear; confirm they are the vendor's employees.")
 
 
+def check_expenses(text: str, th: dict[str, Any]) -> _Check:
+    """Reimbursable expenses are pre-approved and capped (a not-to-exceed amount
+    or a share of the fees, at most maxExpensePct), under the client's travel
+    policy. Expenses reimbursed in full with no cap deviate."""
+    max_p, fb_p = _m._th(th, "maxExpensePct"), _m._th(th, "fallbackExpensePct")
+    low = _low(text)
+    if not re.search(r"expens|reimburs|travel", low):
+        return _Check("within", None, "no expenses billed")
+    if re.search(r"(?:all|any)\s+(?:reasonable\s+)?(?:out[- ]of[- ]pocket\s+)?expenses[^.]{0,40}(?:reimburs|at\s+cost)", low) and not re.search(
+            r"not\s+(?:to\s+)?exceed|cap|prior\s+(?:written\s+)?approv|pre[- ]?approv|policy", low):
+        return _Check("deviates", "Expenses are reimbursed in full with no cap or approval.", "uncapped expenses")
+    pct = None
+    for m in _m._PCT_RE.finditer(low):
+        pct = float(m.group(1))
+    policy = re.search(r"travel\s+(?:and\s+expense\s+)?policy|prior\s+(?:written\s+)?approv|pre[- ]?approv", low)
+    capped = re.search(r"not\s+(?:to\s+)?exceed|\bcap\b|capped|maximum", low)
+    if pct is not None and capped:
+        if pct <= max_p:
+            return _Check("within", None, f"expenses capped at {_m._fmt(pct)}% of fees")
+        return _Check("fallback" if pct <= fb_p else "deviates",
+                      f"Expenses are capped at {_m._fmt(pct)}% of fees; the matrix allows {_m._fmt(max_p)}% "
+                      f"(fallback {_m._fmt(fb_p)}%).", f"expenses up to {_m._fmt(pct)}%")
+    if capped and policy:
+        return _Check("within", None, "expenses capped and pre-approved")
+    if capped or policy:
+        return _Check("fallback", "Expenses are either capped or pre-approved, not both.", "expenses partly controlled")
+    return _Check("review", "No cap or approval rule for expenses was found.")
+
+
+def pricing_model(text: str) -> str | None:
+    """fixed_fee, time_materials or mixed, from how the agreement prices the work."""
+    low = _low(text)
+    fixed = bool(re.search(r"fixed[- ](?:fee|price)|firm[- ]fixed|lump[- ]sum", low))
+    tm = bool(re.search(r"time[- ]and[- ]materials?|\bt&m\b|hourly\s+rate|per\s+hour|rate\s+card|daily\s+rate", low))
+    if fixed and tm:
+        return "mixed"
+    return "fixed_fee" if fixed else "time_materials" if tm else None
+
+
 CHECKS: dict[str, Callable[[str, dict[str, Any]], _Check]] = {
     **_sw.CHECKS,
     "Fees": check_rates,
@@ -143,13 +182,15 @@ CHECKS: dict[str, Callable[[str, dict[str, Any]], _Check]] = {
     "IP": check_work_for_hire,
     "Deliverables": check_work_for_hire,
     "type.co-employment": check_co_employment,
+    "type.expenses": check_expenses,
     "Term": _m._check_termination,
 }
 
 THRESHOLDS: dict[str, dict[str, float]] = {
     "Fees": {"maxRateIncreasePct": 3, "fallbackRateIncreasePct": 5},
     "type.overtime": {"maxOvertimeMultiple": 1.5, "fallbackOvertimeMultiple": 2},
-    "Payment": {"netDays": 45, "fallbackNetDays": 60},
+    "Payment": {"netDays": 30, "fallbackNetDays": 60},
+    "type.expenses": {"maxExpensePct": 10, "fallbackExpensePct": 15},
 }
 THRESHOLD_DEFAULTS: dict[str, float] = {k: v for t in THRESHOLDS.values() for k, v in t.items()}
 
@@ -164,7 +205,9 @@ LABELS: dict[str, str] = {
     "Warranty": "Warranties and acceptance",
     "Termination": "Termination for convenience",
     "Insurance": "Insurance",
-    "Payment": "Payment terms",
+    "Payment": "Payment terms and milestones",
+    "type.expenses": "Expense reimbursement",
+    "type.service-levels": "Service levels and penalties",
     "Confidentiality": "Confidentiality",
     "DataProcessing": "Data protection and security",
 }
@@ -202,8 +245,13 @@ def _shared() -> list[dict[str, Any]]:
            "Termination for convenience on 60 days' notice.", [], ["transition assistance"], "procurement",
            "Client may terminate this Agreement or any SOW for convenience on thirty (30) days' written notice and will "
            "pay only for Services performed and accepted before termination.", required=False),
-        _c("Payment", "Payment net 45 days from an undisputed, approved invoice.", "Net 60 days.", ["payment in advance"],
-           [], "procurement", "Client will pay undisputed invoices within forty-five (45) days of receipt."),
+        _c("Payment", "Payment net 30 days from an undisputed, approved invoice, against accepted milestones.", "Net 60 days.",
+           ["payment in advance"], [], "procurement",
+           "Client will pay undisputed invoices within thirty (30) days of receipt, against milestones accepted in writing."),
+        _c("type.expenses", "Reimbursable expenses only with prior approval, under Client's travel policy, capped at 10% "
+                            "of fees.", "Capped at 15% of fees.", ["all expenses at cost"], [], "procurement",
+           "Vendor will be reimbursed only for reasonable expenses approved in advance in writing and incurred under "
+           "Client's travel policy, not to exceed ten percent (10%) of the fees under the applicable SOW."),
         _c("Insurance", "The vendor carries commercial general liability, professional liability and workers' "
                         "compensation insurance and names the client as an additional insured.",
            None, [], ["additional insured"], "risk_management",
@@ -240,10 +288,19 @@ def default_playbooks() -> dict[str, list[dict[str, Any]]]:
                        "Vendor's personnel are employees of Vendor, not Client. Vendor is solely responsible for their "
                        "wages, benefits, taxes and withholding and will indemnify Client against any claim arising from "
                        "their employment or classification.")
-    sow = [rates, hours, overtime] + _shared()
-    msa = [rates] + _shared()
+    from . import software as _s
+    sla = next(c for c in _s.default_clauses() if c["clauseType"] == "type.service-levels")
+    sla = {**sla, "required": False, "label": LABELS["type.service-levels"]}
+    flow_down = _c("type.flow-down", "The subcontractor accepts the prime agreement's terms that apply to its work "
+                                     "(confidentiality, data, insurance, audit), and the client may terminate the "
+                                     "subcontract with the prime.", None, [], [], "procurement",
+                   "Subcontractor is bound by the terms of the Prime Agreement that apply to the Services, including "
+                   "confidentiality, data protection, insurance and audit, and this Addendum ends with the Prime Agreement.")
+    sow = [rates, hours, overtime, dict(sla)] + _shared()
+    msa = [rates, dict(sla)] + _shared()
     staffing = [rates, hours, overtime, co_employment] + _shared()
-    return {"sow": sow, "msa": msa, "staffing": staffing}
+    subcontract = [flow_down, rates, hours] + _shared()
+    return {"sow": sow, "msa": msa, "staffing": staffing, "subcontract": subcontract}
 
 
 _STAFFING_TITLE = re.compile(r"staffing|temporary\s+(?:worker|staff|labou?r)|contingent\s+(?:worker|labou?r)")
@@ -253,6 +310,8 @@ _STAFFING_TEXT = re.compile(r"staffing\s+(?:services\s+)?agreement|staffing\s+ve
 def workforce_type(title: str, text: str, doc_type: str) -> str | None:
     """sow / msa / staffing from the document type and wording, or None."""
     title, text = (title or "").lower(), (text or "").lower()
+    if re.search(r"subcontract", title):
+        return "subcontract"
     if _STAFFING_TITLE.search(title) or _STAFFING_TEXT.search(text):
         return "staffing"
     if doc_type == "SOW" or re.search(r"statement\s+of\s+work|\bsow\b", title):

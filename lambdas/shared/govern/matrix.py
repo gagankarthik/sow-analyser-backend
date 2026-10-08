@@ -85,7 +85,7 @@ from ..playbook import rule_id_for_clause, valid_rule_id
 
 AGREEMENT_TYPES: list[str] = [
     "sponsored_research", "clinical_trial", "grant", "license", "option", "mta", "data_use", "nda",
-    "collaboration", "software", "sow", "msa", "staffing", "other",
+    "collaboration", "consortium", "software", "sow", "msa", "staffing", "subcontract", "other",
 ]
 
 # Requirement 7: one Govern, two editions. Each edition offers its own
@@ -95,8 +95,8 @@ AGREEMENT_TYPES: list[str] = [
 EDITIONS: tuple[str, ...] = ("campus", "workforce")
 EDITION_AGREEMENT_TYPES: dict[str, list[str]] = {
     "campus": ["sponsored_research", "license", "mta", "grant", "clinical_trial", "option", "data_use", "nda",
-               "collaboration", "software", "other"],
-    "workforce": ["sow", "msa", "staffing", "nda", "software", "other"],
+               "collaboration", "consortium", "software", "other"],
+    "workforce": ["sow", "msa", "staffing", "subcontract", "nda", "software", "other"],
 }
 
 
@@ -117,6 +117,8 @@ AGREEMENT_TYPE_LABELS: dict[str, str] = {
     "sow": "Statement of work (SOW)",
     "msa": "Master services agreement (MSA)",
     "staffing": "Staffing vendor agreement",
+    "subcontract": "Subcontractor addendum",
+    "consortium": "Consortium agreement",
     "other": "Other",
 }
 
@@ -147,6 +149,7 @@ TIERS: list[str] = ["within", "fallback", "deviates", "unacceptable", "review", 
 # wording). Other clause types use the clause taxonomy's label.
 _MATRIX_LABELS: dict[str, str] = {
     "PublicationRights": "Publication rights and review period",
+    "type.use-of-name": "Use of the organization's name and marks",
     "BackgroundIP": "Background and foreground IP ownership",
     "LicenseScope": "License grant scope (exclusivity, field of use, territory)",
     "Royalties": "Royalties, milestones, equity and sublicense income",
@@ -848,8 +851,26 @@ def _check_termination(text: str, th: dict[str, Any]) -> _Check:
 
 
 # clause type → (check, its thresholds and their defaults)
+def _check_use_of_name(text: str, th: dict[str, Any]) -> _Check:
+    """The other party may not use your organization's name, logos or marks
+    without prior written consent. Free use (or use "for any purpose")
+    deviates; a consent requirement is within the matrix."""
+    low = re.sub(r"\s+", " ", (text or "").lower())
+    consent = re.search(r"(?:prior\s+)?written\s+(?:consent|approval|permission)", low)
+    free = re.search(r"may\s+(?:freely\s+)?use\s+(?:the\s+)?(?:name|marks?|logos?)[^.]{0,80}(?:university|organi[sz]ation|institution)"
+                     r"(?![^.]{0,60}(?:consent|approval))|for\s+any\s+(?:commercial\s+)?purpose", low)
+    if free and not consent:
+        return _Check("deviates", "The other party may use your organization's name without asking; the matrix requires "
+                                  "prior written consent.", "name use without consent")
+    if consent:
+        ben = "Use is limited to factual acknowledgement." if re.search(r"factual|acknowledg", low) else None
+        return _Check("within", None, "prior written consent", ben)
+    return _Check("review", "The clause does not say whether the other party needs consent to use your name.")
+
+
 _CHECKS: dict[str, Callable[[str, dict[str, Any]], _Check]] = {
     "PublicationRights": _check_publication,
+    "type.use-of-name": _check_use_of_name,
     "BackgroundIP": _check_background_ip,
     "IP": _check_background_ip,
     "LicenseScope": _check_license_scope,
@@ -1067,6 +1088,18 @@ _BENEF = {
     "payment": ["in advance"],
     "sublicensing": ["sublicense income shall be paid to Organization within"],
 }
+
+
+def _use_of_name(office: str = "legal_affairs") -> dict[str, Any]:
+    return _clause(
+        "type.use-of-name",
+        "Neither party uses the other's name, logos or marks in advertising or publicity without prior written consent; "
+        "factual statements required by law or sponsor reporting are allowed.",
+        "Use limited to a factual acknowledgement of the research funding.",
+        ["may use the name of the university", "may use organization's name"], ["prior written consent"], office,
+        "Neither party shall use the name, logos or trademarks of the other in any advertising, publicity or "
+        "endorsement without the other party's prior written consent, except as required by law.",
+        None, False)
 
 
 def _pub(office: str) -> dict[str, Any]:
@@ -1310,6 +1343,9 @@ def default_matrix() -> dict[str, Any]:
         "data_use": data_use_clauses, "nda": nda_clauses, "collaboration": collaboration_clauses,
         "software": software.default_clauses(), "other": other_clauses,
     }
+    by_type["consortium"] = copy.deepcopy(collaboration_clauses)
+    for kind in ("sponsored_research", "license", "collaboration", "consortium", "clinical_trial"):
+        by_type[kind].append(_use_of_name("tech_commercialization" if kind == "license" else "legal_affairs"))
     from . import workforce
     by_type.update(workforce.default_playbooks())
     return {
@@ -1513,6 +1549,8 @@ _AGREEMENT_SYNONYMS: list[tuple[str, str]] = [
     (r"statement\s+of\s+work|\bsow\b", "sow"),
     (r"master\s+(?:services?|consulting)|\bmsa\b", "msa"),
     (r"staffing|contingent|temporary\s+(?:staff|labou?r)", "staffing"),
+    (r"subcontract", "subcontract"),
+    (r"consortium", "consortium"),
     (r"clinical|\bcta\b", "clinical_trial"),
     (r"data\s+use|\bdua\b|data\s+sharing", "data_use"),
     (r"software|saas|subscription|eula|cloud", "software"),
@@ -1563,6 +1601,10 @@ def resolve_clause_type(value: Any) -> str | None:
             continue
         if low in (cat.lower(), known_label(cat).lower(), matrix_clause_label(cat).lower()):
             return cat
+    # Matrix-only types ("type.<key>") by their exact label, e.g. the use-of-name row.
+    for key, label in _MATRIX_LABELS.items():
+        if key.startswith("type.") and low == label.lower():
+            return key
     resolved = normalise_type("Other", text)
     if resolved["category"] != "Other":
         return resolved["category"]
@@ -1762,6 +1804,7 @@ _ALIASES: dict[str, list[str]] = {
 # Wording that marks a clause as being about a matrix clause type (heading first,
 # then the body) — the last resort before "missing".
 _SIGNALS: dict[str, str] = {
+    "type.use-of-name": r"use\s+of\s+(?:the\s+)?(?:name|marks?)|(?:name|trademarks?|logos?)\s+of\s+(?:the\s+)?(?:university|organi[sz]ation|institution)|publicity|endorse",
     "PublicationRights": r"\bpublication|right\s+to\s+publish",
     "BackgroundIP": r"background\s+(?:ip|intellectual)|ownership\s+of\s+inventions|inventions?\s+and\s+patents",
     "LicenseScope": r"grant\s+of\s+licen[cs]e|licen[cs]e\s+grant|field\s+of\s+use",
@@ -2035,6 +2078,7 @@ def infer_agreement_type(doc_meta: dict[str, Any] | None, classification: dict[s
         (r"data\s+use|\bdua\b|data\s+sharing|data\s+transfer\s+agreement", "data_use"),
         (r"sponsored\s+research|research\s+agreement|clinical\s+research|\bsra\b", "sponsored_research"),
         (r"\bsub-?awards?\b|\bgrant\s+agreement\b|\bgrant\b|\baward\b|cooperative\s+agreement", "grant"),
+        (r"consortium", "consortium"),
         (r"collaborat", "collaboration"),
         (r"non-?\s?disclosure|confidential\s+disclosure|confidentiality\s+agreement|\bnda\b|\bcda\b", "nda"),
         (r"licen[cs]e\s+agreement|\blicen[cs]e\b", "license"),
@@ -2082,7 +2126,7 @@ def infer_direction(agreement_type: str, classification: dict[str, Any] | None) 
     subawards, vendor spend). License, option, sponsored research and grants are
     incoming unless the text shows your organization paying — your organization as pass-through entity or
     "Organization shall pay / reimburse" the other party."""
-    if agreement_type in ("software", "sow", "msa", "staffing"):
+    if agreement_type in ("software", "sow", "msa", "staffing", "subcontract"):
         return "outgoing"
     read = ((classification or {}).get("agreement") or {}).get("moneyDirection")
     if read in ("incoming", "outgoing"):
@@ -2346,6 +2390,20 @@ def extract_obligations(classification: dict[str, Any] | None, agreement_type: s
                 due = _expected_date(s, effective)
                 if due:
                     add("diligence_milestone", _short(s), due)
+                    continue
+            if re.search(r"disclos\w*\s+(?:all\s+|any\s+)?(?:subject\s+)?inventions?|invention\s+disclosure", low):
+                within = re.search(r"within\s+(?:[a-z\- ]+\s+)?\(?(\d{1,3})\)?\s*days?", low)
+                add("invention_disclosure", "Disclose new inventions to the other party"
+                    + (f" (within {within.group(1)} days of conception)" if within else ""))
+                continue
+            if "audit" in low and re.search(r"royalt|books\s+and\s+records|records", low) and agreement_type in ("license", "option"):
+                years = re.search(r"(\d{1,2}|three|five|seven)\s*\)?\s*years?", low)
+                add("royalty_audit", "Keep royalty records open to audit" + (f" ({years.group(1)} years)" if years else ""))
+                continue
+            if agreement_type in ("sow", "subcontract") and re.search(r"\bdeliver(?:able|y)\b", low):
+                due = _expected_date(s, effective)
+                if due:
+                    add("deliverable_due", _short(s), due, amounts[0] if amounts else None)
                     continue
             if category == "PublicationRights" or (re.search(r"publi(?:sh|cation)", low) and "review" in low):
                 durs = [d for d, unit, _p in _durations(s) if unit != "year"]

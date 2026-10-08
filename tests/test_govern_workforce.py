@@ -56,3 +56,23 @@ def test_editions_offer_their_own_types():
     campus = matrix.edition_agreement_types("campus")
     assert campus[:4] == ["sponsored_research", "license", "mta", "grant"] and "sow" not in campus
     assert matrix.edition_agreement_types(None) == campus
+
+
+def test_expenses_sla_payment_and_subcontract():
+    assert grade("sow", "type.expenses", "Vendor shall be reimbursed for all expenses at cost.").tier in ("deviates", "unacceptable")
+    assert grade("sow", "type.expenses", "Expenses approved in advance under Client's travel policy, not to exceed 8% of fees.").tier == "within"
+    assert grade("sow", "type.expenses", "Expenses not to exceed 20% of fees.").tier == "deviates"
+    assert grade("sow", "Payment", "Client will pay invoices within 30 days.").tier == "within"
+    assert grade("sow", "Payment", "Client will pay invoices within 60 days.").tier == "fallback"
+    types = {k: v["clauses"] for k, v in matrix.default_matrix()["playbooks"].items()}
+    assert "type.service-levels" in {c["clauseType"] for c in types["sow"]}
+    assert "type.flow-down" in {c["clauseType"] for c in types["subcontract"]}
+    assert matrix.infer_agreement_type({"title": "Subcontractor Addendum to Prime Agreement"}, {}) == "subcontract"
+    assert matrix.infer_direction("subcontract", {}) == "outgoing"
+
+
+def test_pricing_model():
+    assert workforce.pricing_model("The Services are provided for a fixed fee of $40,000.") == "fixed_fee"
+    assert workforce.pricing_model("Billed on a time and materials basis at the hourly rates in the Rate Card.") == "time_materials"
+    assert workforce.pricing_model("A fixed fee for phase 1; phase 2 at hourly rates.") == "mixed"
+    assert workforce.pricing_model("Confidential information shall be protected.") is None

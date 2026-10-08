@@ -699,6 +699,18 @@ def _edition_for(tenant_id: str) -> str:
     return chosen if chosen in govern_matrix.EDITIONS else settings.govern_default_edition
 
 
+def _features_for(tenant_id: str) -> dict[str, bool]:
+    """The deployment's features, narrowed to the organization's modules when it has chosen them."""
+    flags = settings.govern_feature_flags()
+    try:
+        mods = (workflow.get_settings(tenant_id).get("organization") or {}).get("enabledModules")
+    except Exception:  # noqa: BLE001 - the profile must load even if settings cannot
+        mods = None
+    if isinstance(mods, list):
+        flags = {k: on and k in mods for k, on in flags.items()}
+    return flags
+
+
 def _me(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
     p = user.person or {}
     edition = _edition_for(user.caller.tenant_id)
@@ -710,7 +722,8 @@ def _me(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
                 "agreementTypes": [{"id": t, "label": govern_matrix.AGREEMENT_TYPE_LABELS[t]}
                                    for t in govern_matrix.edition_agreement_types(edition)],
                 # Which "Later" features this deployment has on (GOVERN_FEATURES).
-                "features": settings.govern_feature_flags()})
+                "features": _features_for(user.caller.tenant_id),
+                "deploymentFeatures": settings.govern_feature_flags()})
 
 
 # ---------------------------------------------------------------------------
