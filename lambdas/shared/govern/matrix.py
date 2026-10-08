@@ -479,7 +479,7 @@ _US_STATES = [
     "Florida", "Georgia", "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky",
     "Louisiana", "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota", "Mississippi",
     "Missouri", "Montana", "Nebraska", "Nevada", "New Hampshire", "New Jersey", "New Mexico",
-    "New York", "North Carolina", "North Dakota", "its home state", "Oklahoma", "Oregon", "Pennsylvania",
+    "New York", "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon", "Pennsylvania",
     "Rhode Island", "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah", "Vermont",
     "Virginia", "Washington", "West Virginia", "Wisconsin", "Wyoming", "District of Columbia",
     "England", "England and Wales",
@@ -1089,8 +1089,8 @@ def _data_rights(language: str = "data_rights", required: bool = True) -> dict[s
 def _confidentiality(required: bool = False, office: str | None = "legal_affairs") -> dict[str, Any]:
     return _clause(
         "Confidentiality",
-        "Confidentiality obligations last no more than 5 years from disclosure, subject to the its home state Public "
-        "Records Act; standard exclusions apply.",
+        "Confidentiality obligations last no more than 5 years from disclosure, subject to your home state's public "
+        "records law; standard exclusions apply.",
         "Up to 7 years.",
         _UNACC["confidentiality"], [], office, _LANG["confidentiality"], None, required)
 

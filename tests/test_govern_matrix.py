@@ -592,3 +592,21 @@ def test_demo_story_holds_on_pipeline_sub_clauses():
     v2 = m.review_document(_pipeline_clauses("01-exclusive-license-v2-revised.txt"), "license",
                            m.default_matrix(), "d", NOW)
     assert _flagged(v2) == {} and v2["counts"]["missing"] == 0
+
+
+def test_every_us_state_is_a_valid_home_state():
+    """All 50 states and DC: a state missing here can't be chosen as the home
+    state and isn't recognised in governing-law clauses."""
+    states = [
+        "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado", "Connecticut", "Delaware",
+        "District of Columbia", "Florida", "Georgia", "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", "Kansas",
+        "Kentucky", "Louisiana", "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota", "Mississippi",
+        "Missouri", "Montana", "Nebraska", "Nevada", "New Hampshire", "New Jersey", "New Mexico", "New York",
+        "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island",
+        "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah", "Vermont", "Virginia", "Washington",
+        "West Virginia", "Wisconsin", "Wyoming",
+    ]
+    for state in states:
+        assert m.home_state(state) == state, state
+    assert m.home_state("ohio") == "Ohio"
+    assert m.home_state("its home state") is None
