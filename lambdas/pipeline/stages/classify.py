@@ -168,6 +168,10 @@ def _apply_defaults(result: dict[str, Any]) -> None:
         result["governance"] = {"cadence": None, "escalationPath": None, "reporting": None}
     if not isinstance(result.get("amendment"), dict):
         result["amendment"] = {"amendmentType": "none", "changes": []}
+    if not isinstance(result.get("agreement"), dict):
+        result["agreement"] = {"agreementType": "other", "licensing": {}}
+    if not isinstance(result["agreement"].get("licensing"), dict):
+        result["agreement"]["licensing"] = {}
     result["amendment"].setdefault("amendmentType", "none")
     if not isinstance(result["amendment"].get("changes"), list):
         result["amendment"]["changes"] = []
@@ -640,6 +644,8 @@ def _merge_windows(parts: list[dict[str, Any]]) -> dict[str, Any]:
 
     ident, tl, com, amd, conf, gov = (sub("identification"), sub("timeline"), sub("commercials"),
                                       sub("amendment"), sub("confidence"), sub("governance"))
+    agr = sub("agreement")
+    agr_types = [a.get("agreementType") for a in agr if a.get("agreementType") and a.get("agreementType") != "other"]
     signed = any(b.get("signatureStatus") == "signed" for b in ident)
     lifecycle = _first([p.get("lifecycle") for p in parts if p.get("lifecycle") in ("signed", "active")]) \
         or parts[0].get("lifecycle")
@@ -676,6 +682,14 @@ def _merge_windows(parts: list[dict[str, Any]]) -> dict[str, Any]:
             "rateCard": _union([b.get("rateCard") or [] for b in com], ("role", "rate", "unit")),
             "paymentSchedule": _union([b.get("paymentSchedule") or [] for b in com], ("label", "amount", "percent")),
             "recurringFees": _union([b.get("recurringFees") or [] for b in com], ("label", "amount", "period")),
+        },
+        "agreement": {
+            "agreementType": _first(agr_types) or "other",
+            **scalars(agr, ("organizationRole", "moneyDirection", "sponsor", "principalInvestigator",
+                            "department", "college")),
+            "licensing": scalars([a.get("licensing") or {} for a in agr],
+                                 ("model", "metric", "quantity", "annualFee", "priceIncreaseCapPct", "uptimePct",
+                                  "dataLocation", "supportTerms")),
         },
         "slas": _union([p.get("slas") or [] for p in parts], ("metric", "target")),
         "personnel": _union([p.get("personnel") or [] for p in parts], ("name", "role")),

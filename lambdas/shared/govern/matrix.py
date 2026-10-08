@@ -1986,6 +1986,11 @@ def infer_agreement_type(doc_meta: dict[str, Any] | None, classification: dict[s
     "research agreement" → sponsored_research, grant / award / subaward → grant,
     collaboration, NDA / "confidential disclosure" → nda, any other LICENSE →
     license, else other."""
+    # The model reads the whole agreement and says what kind it is; the title
+    # and keyword rules below are the fallback when it could not tell.
+    read = ((classification or {}).get("agreement") or {}).get("agreementType")
+    if read in AGREEMENT_TYPES and read != "other":
+        return read
     title, rest = _doc_text(doc_meta, classification)
     doc_type = str((doc_meta or {}).get("docType") or (classification or {}).get("docType") or "").upper()
     rules: list[tuple[str, str]] = [
@@ -2041,6 +2046,9 @@ def infer_direction(agreement_type: str, classification: dict[str, Any] | None) 
     "Organization shall pay / reimburse" the other party."""
     if agreement_type == "software":
         return "outgoing"
+    read = ((classification or {}).get("agreement") or {}).get("moneyDirection")
+    if read in ("incoming", "outgoing"):
+        return read
     low = _all_text(classification).lower()
     ours_pays = re.search(
         rf"pass-?through\s+entity|{_US}\s+(?:shall|will|agrees\s+to)\s+(?:pay|reimburse)\b"

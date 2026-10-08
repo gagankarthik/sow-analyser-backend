@@ -380,10 +380,20 @@ def test_portfolio_obligations_list(world):
     assert call("GET", "/obligations", VIEWER)[1]["count"] == 1
     # Someone with no access sees none.
     assert call("GET", "/obligations", OUTSIDER)[1]["count"] == 0
-    # Done drops out.
+    # Done drops out, and a royalty report (quarterly) schedules the next one.
     obl = call("GET", "/contracts/lic-1", OWNER)[1]["contract"]["obligations"]
     first = next(x for x in obl if x["title"] == "Q4 royalty report")["id"]
     call("PATCH", f"/contracts/lic-1/obligations/{first}", OWNER, {"status": "done"})
+    remaining = call("GET", "/obligations", OWNER)[1]["obligations"]
+    assert [(o["title"], o["dueDate"]) for o in remaining] == [("Q4 royalty report", "2027-01-20")]
+
+
+def test_a_one_off_obligation_does_not_repeat(world):
+    call("POST", "/contracts/lic-1/obligations", OWNER,
+         {"kind": "milestone_payment", "title": "First patent milestone", "dueDate": "2026-12-01"})
+    obl = call("GET", "/contracts/lic-1", OWNER)[1]["contract"]["obligations"]
+    oid = next(x for x in obl if x["title"] == "First patent milestone")["id"]
+    call("PATCH", f"/contracts/lic-1/obligations/{oid}", OWNER, {"status": "done"})
     assert call("GET", "/obligations", OWNER)[1]["count"] == 0
 
 

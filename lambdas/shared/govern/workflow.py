@@ -880,6 +880,8 @@ def to_api(c: dict[str, Any], now: datetime | None = None, cfg: dict[str, Any] |
         "effectiveDate": c.get("effectiveDate"),
         "termEndDate": c.get("termEndDate"),
         "parentContractId": c.get("parentContractId"),
+        # null = not mirrored yet (reviewed before income was copied onto the contract)
+        "licensingIncome": ([_income_view(i) for i in c["incomeItems"]] if isinstance(c.get("incomeItems"), list) else None),
         "amendmentIds": list(c.get("amendmentIds") or []),
         "rev": int(c.get("rev") or 0),
     }
@@ -1676,6 +1678,44 @@ def add_obligation(contract_id: str, body: dict[str, Any], actor: dict[str, Any]
     return stored
 
 
+_RECURRENCE = (
+    (re.compile(r"\bmonthly\b", re.I), 1, "months"),
+    (re.compile(r"\bquarterly\b|\bcalendar\s+quarter", re.I), 3, "months"),
+    (re.compile(r"\bsemi-?annual|\bhalf-?yearly|\btwice\s+a\s+year", re.I), 6, "months"),
+    (re.compile(r"\bannual|\byearly\b|\beach\s+year", re.I), 12, "months"),
+)
+
+
+def _recurrence(o: dict[str, Any]) -> tuple[int, str] | None:
+    """How often an obligation comes round again, read from its title (and a
+    royalty report defaults to quarterly). None for one-off obligations."""
+    title = str(o.get("title") or "")
+    for pattern, value, unit in _RECURRENCE:
+        if pattern.search(title):
+            return value, unit
+    if o.get("kind") == "royalty_report":
+        return 3, "months"
+    return None
+
+
+def _next_occurrence(c: dict[str, Any], o: dict[str, Any], now_s: str) -> dict[str, Any] | None:
+    """The next report or payment of a recurring obligation, due one period
+    after this one; none once that date is past the term end."""
+    rec = _recurrence(o)
+    due = str(o.get("dueDate") or "")[:10]
+    if rec is None or not re.match(r"^\d{4}-\d{2}-\d{2}$", due):
+        return None
+    from ..dates import add_offset
+    nxt = add_offset(due, rec[0], rec[1])
+    end = str(c.get("termEndDate") or "")[:10]
+    if not nxt or (end and nxt > end):
+        return None
+    return {"id": uuid.uuid4().hex[:16], "kind": o.get("kind") or "other", "title": o.get("title") or "",
+            "dueDate": nxt, "amount": o.get("amount"), "status": "open", "source": o.get("source") or "manual",
+            "completedAt": None, "verified": bool(o.get("verified")), "verifiedAt": o.get("verifiedAt"),
+            "verifiedBy": o.get("verifiedBy"), "recursFrom": o.get("id")}
+
+
 def edit_obligation(contract_id: str, obligation_id: str, body: dict[str, Any], actor: dict[str, Any] | None,
                     *, now: datetime | None = None) -> dict[str, Any]:
     if not isinstance(body, dict):
@@ -1707,8 +1747,15 @@ def edit_obligation(contract_id: str, obligation_id: str, body: dict[str, Any], 
         if "dueDate" in fields:
             obl.pop(k, None)
     store.contracts.put_obligation(contract_id, c0["tenantId"], obl)
+    following = None
     if obl.get("status") == "done" and was != "done":
-        action, summary = "obligation_done", f"{display(actor)} marked an obligation done: {obl['title']}."
+        # A recurring report or payment: the next one is scheduled as this one closes.
+        following = _next_occurrence(c0, obl, now_s)
+        if following is not None:
+            store.contracts.put_obligation(contract_id, c0["tenantId"], following)
+    if obl.get("status") == "done" and was != "done":
+        action, summary = "obligation_done", (f"{display(actor)} marked an obligation done: {obl['title']}."
+                                              + (f" The next one is due {following['dueDate']}." if following else ""))
     elif fields.get("verified") is True and not was_verified:
         action, summary = "obligation_verified", f"{display(actor)} verified an obligation Sonar found: {obl['title']}."
     else:
@@ -1753,6 +1800,7 @@ def replace_income(contract_id: str, body: dict[str, Any], actor: dict[str, Any]
 
     def change(c: dict[str, Any], entries: list[dict[str, Any]]) -> Any:
         c["updatedAt"] = now_s
+        c["incomeItems"] = [_income_view(i) for i in clean][:50]
         entries.append(_entry("field_updated", actor, f"{display(actor)} updated the licensing income ({_plural(len(clean), 'item')}).",
                               at=now_s, detail={"incomeItems": len(clean)}))
 
@@ -1908,6 +1956,13 @@ def infer_fields(meta: dict[str, Any], classification: dict[str, Any] | None,
     except Exception:  # noqa: BLE001
         direction = "incoming"
     header = parse_header(header_text)
+    # What the model read (agreement block); a labelled header line still wins.
+    read = cls.get("agreement") if isinstance(cls.get("agreement"), dict) else {}
+    for key, field in (("sponsor", "sponsor"), ("piName", "principalInvestigator"),
+                       ("department", "department"), ("college", "college")):
+        value = read.get(field)
+        if not header.get(key) and isinstance(value, str) and value.strip():
+            header[key] = value.strip()[:200]
     parties = [str(p) for p in (cls.get("parties") or meta.get("parties") or []) if p]
     others = [p for p in parties if not _US_RE.search(p)]
     counterparty = (others or [None])[0]
@@ -2277,11 +2332,13 @@ def rescore(contract_id: str, actor: dict[str, Any] | None, *, doc_id: str | Non
     income_c = dict(c0, agreementType=agreement_type)
     sonar_income = _sonar_income(income_c, classification)
     manual_income = [i for i in store.contracts.income(contract_id) if i.get("source") != "sonar"]
-    store.contracts.replace_income(contract_id, manual_income + sonar_income)
+    all_income = manual_income + sonar_income
+    store.contracts.replace_income(contract_id, all_income)
     counts = dict(review.get("counts") or {})
 
     def change(c: dict[str, Any], entries: list[dict[str, Any]]) -> Any:
         _apply_inferred(c, inferred)
+        c["incomeItems"] = [_income_view(i) for i in all_income][:50]
         c["agreementType"] = agreement_type
         c["analysisStatus"] = "READY"
         c["matrix"] = {"version": review.get("matrixVersion", matrix.get("version")),

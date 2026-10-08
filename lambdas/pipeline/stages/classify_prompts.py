@@ -33,6 +33,10 @@ _AMENDMENT_TYPES = ["amendment", "change_order", "addendum", "side_letter", "non
 _CHANGE_TYPES = ["replacement", "addition", "deletion", "modification"]
 _CHANGE_CATEGORIES = ["scope", "value", "timeline", "payment", "personnel", "term", "sla", "other"]
 _CONFIDENCE = ["high", "medium", "low"]
+AGREEMENT_KINDS = ["sponsored_research", "clinical_trial", "grant", "license", "option", "mta", "data_use", "nda", "collaboration", "software", "other"]
+_ORG_ROLES = ["licensor", "licensee", "customer", "vendor", "sponsor", "performer", "recipient", "provider",
+              "collaborator", "other"]
+_LICENSE_MODELS = ["subscription", "saas", "perpetual", "term", "patent", "copyright", "open_source", "other"]
 DOC_TYPES = ["SOW", "MSA", "AMENDMENT", "NDA", "LICENSE", "DPA", "BAA", "COMPLIANCE", "OTHER"]
 LIFECYCLES = ["draft", "review", "negotiation", "approval", "signed", "active", "renewal", "expired"]
 
@@ -97,6 +101,27 @@ def _doc_props() -> dict[str, Any]:
             "signatories":     _arr(_obj({
                 "party": _nstr(), "name": _nstr(), "title": _nstr(), "date": _nstr(),
             })),
+        }),
+
+        # ── What kind of agreement, and the organization's place in it ───────
+        "agreement": _obj({
+            "agreementType":         _enum(AGREEMENT_KINDS),
+            "organizationRole":      _nenum(_ORG_ROLES),   # the university / institution's role
+            "moneyDirection":        _nenum(["incoming", "outgoing"]),  # from the organization's side
+            "sponsor":               _nstr(),
+            "principalInvestigator": _nstr(),
+            "department":            _nstr(),
+            "college":               _nstr(),
+            "licensing": _obj({
+                "model":          _nenum(_LICENSE_MODELS),
+                "metric":         _nstr(),   # "named users", "FTE", "enterprise", "per device"
+                "quantity":       _nnum(),   # seats / users / devices licensed
+                "annualFee":      _nnum(),
+                "priceIncreaseCapPct": _nnum(),  # max renewal increase, percent
+                "uptimePct":      _nnum(),
+                "dataLocation":   _nstr(),
+                "supportTerms":   _nstr(),
+            }),
         }),
 
         # ── Scope ────────────────────────────────────────────────────────────
@@ -309,6 +334,36 @@ certain ("03/04/2026"), copy it exactly as written instead of converting it. If
 the document gives only a rule ("12 months from the Effective Date") leave the
 date field null and record the rule in keyDates. Never compute a date yourself.
 
+AGREEMENT (read from the side of the organization that uploaded it — a
+university, research institute or company; "the organization" below)
+- agreementType: the kind of agreement:
+    sponsored_research (a sponsor funds research the organization performs),
+    clinical_trial (a sponsor pays to run a clinical study / CTA),
+    grant (grant, award, subaward, cooperative agreement),
+    license (the organization licenses ITS OWN technology, patents or software OUT),
+    option (an option to take a licence later),
+    mta (material transfer), data_use (data use / data sharing / DUA),
+    nda (confidentiality / CDA), collaboration (joint research),
+    software (the organization BUYS or subscribes to software, SaaS, cloud services or a
+      EULA from a vendor — inbound licence; also software support/maintenance),
+    other (anything else, e.g. services, consulting, facilities).
+  A licence where a VENDOR grants the organization rights to its product is
+  "software", not "license".
+- organizationRole: the organization's role (licensor, licensee, customer, vendor,
+  sponsor, performer, recipient, provider, collaborator) or null if unclear.
+- moneyDirection: "incoming" if money flows to the organization (sponsor funding,
+  licence fees, royalties), "outgoing" if the organization pays (subscriptions,
+  vendor fees, subawards), null if no money changes hands or it is unclear.
+- sponsor: the funding organization, as written (null if none).
+- principalInvestigator: the named PI or lead researcher (a person's name), null if none.
+- department / college: the organization's department or college named for the
+  work, as written, null if not stated.
+- licensing (software and licence terms; nulls when not stated): model
+  (subscription, saas, perpetual, term, patent, copyright, open_source, other),
+  metric ("named users", "FTE", "enterprise", "devices"), quantity, annualFee,
+  priceIncreaseCapPct (maximum renewal increase, %), uptimePct, dataLocation,
+  supportTerms.
+
 IDENTIFICATION
 - sowNumber: e.g. "SOW-2024-0042" or "Statement of Work No. 3".
 - parentReference: THE most valuable field for lineage. Hunt for "pursuant to",
@@ -397,12 +452,19 @@ CLAUSE TYPE — two fields:
 
 _LICENSING = """
 LICENSING & COMPLIANCE DOCUMENTS — when the document is a LICENSE, DPA, BAA, or
-COMPLIANCE attestation, use these categories in addition to the general ones, and
-risk-score them from the receiving party's perspective:
+COMPLIANCE attestation, use these categories in addition to the general ones.
+Score risk from the ORGANIZATION'S side, whichever way the licence runs: when the
+organization BUYS software or a service (it is the licensee / customer), a vendor's
+"as is" warranty, uncapped vendor audits, retroactive true-ups, uncapped renewal
+increases and a duty on the organization to indemnify the vendor are risks; when
+the organization licenses its OWN technology out (it is the licensor), its
+reserved research rights, diligence and royalties matter, as in RESEARCH below.
 - Licensing: LicenseGrant (what is licensed and on what basis — perpetual vs term,
   exclusive vs non-exclusive), LicenseScope (territory, field of use, named users,
   permitted environments), Restrictions (no reverse-engineering, no transfer, use
-  limits — high risk if broad), Royalties (licence fees, usage/true-up, escalation),
+  limits — high risk if broad), Royalties (money paid for the licence: royalties on
+  sales when the organization licenses out; licence or subscription fees, true-ups
+  and renewal increases when it buys),
   Sublicensing (whether and how rights may be passed on), SourceCodeEscrow,
   AuditRights (the licensor's right to inspect usage — note frequency/notice),
   OpenSource (any open-source components and their obligations).
