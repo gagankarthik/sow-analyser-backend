@@ -319,7 +319,9 @@ def default_settings() -> dict[str, Any]:
         "teamsWebhookConfigured": False,
         # The organisation, set during organisation setup (Settings → Overview).
         "organization": {"name": None, "defaultCurrency": "USD", "fiscalYearStartMonth": 1,
-                         "confirmedSteps": [], "setupCompletedAt": None},
+                         "confirmedSteps": [], "setupCompletedAt": None,
+                         # Requirement 7: which edition this customer sees (None = deployment default).
+                         "edition": None},
     }
 
 
@@ -475,6 +477,10 @@ def validate_settings(body: Any, current: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(steps, list) or any(s_ not in SETUP_STEPS for s_ in steps):
                 raise BadRequest(f"organization.confirmedSteps may only name: {', '.join(SETUP_STEPS)}")
             merged["confirmedSteps"] = [s_ for s_ in SETUP_STEPS if s_ in steps]
+        if "edition" in org:
+            if org["edition"] not in (None, "campus", "workforce"):
+                raise BadRequest("organization.edition must be campus, workforce or null")
+            merged["edition"] = org["edition"]
         if "setupCompletedAt" in org:
             v = org["setupCompletedAt"]
             if v is not None and (not isinstance(v, str) or parse_iso(v) is None):

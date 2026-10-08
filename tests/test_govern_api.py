@@ -390,14 +390,17 @@ def test_portfolio_obligations_list(world):
 def test_organization_settings(world):
     org = call("GET", "/workflow/settings", OWNER)[1]["settings"]["organization"]
     assert org == {"name": None, "defaultCurrency": "USD", "fiscalYearStartMonth": 1, "confirmedSteps": [],
-                   "setupCompletedAt": None}
+                   "setupCompletedAt": None, "edition": None}
+    assert call("PUT", "/workflow/settings", OWNER, {"organization": {"edition": "workforce"}})[1]["settings"]["organization"]["edition"] == "workforce"
+    assert call("PUT", "/workflow/settings", OWNER, {"organization": {"edition": "enterprise"}})[0] == 400
+    call("PUT", "/workflow/settings", OWNER, {"organization": {"edition": None}})
     status, body = call("PUT", "/workflow/settings", OWNER, {"organization": {
         "name": "  Acme Research  ", "defaultCurrency": "eur", "fiscalYearStartMonth": 7,
         "setupCompletedAt": "2026-10-08T12:00:00Z"}})
     assert status == 200
     assert body["settings"]["organization"] == {"name": "Acme Research", "defaultCurrency": "EUR",
                                                  "fiscalYearStartMonth": 7, "confirmedSteps": [],
-                                                 "setupCompletedAt": "2026-10-08T12:00:00Z"}
+                                                 "setupCompletedAt": "2026-10-08T12:00:00Z", "edition": None}
     body = call("PUT", "/workflow/settings", OWNER, {"organization": {"confirmedSteps": ["workflow", "matrix"]}})[1]
     assert body["settings"]["organization"]["confirmedSteps"] == ["matrix", "workflow"]
     # A partial update keeps the rest.
