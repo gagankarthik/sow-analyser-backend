@@ -379,7 +379,7 @@ def stage(monkeypatch):
 
 
 def test_no_page_or_character_cap(stage):
-    stage["blob"] = ("Clause text that goes on. " * 40_000).encode()        # ~1 MB of text
+    stage["blob"] = ("The Parties shall perform this Agreement; clause text that goes on. " * 15_000).encode()        # ~1 MB of text
     out = parse.run(stage["event"]())
     assert len(out["parsed"]["text"]) == len(stage["blob"].decode().strip())
     assert out["parsed"]["stats"]["chars"] == len(out["parsed"]["text"])

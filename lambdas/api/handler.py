@@ -229,7 +229,10 @@ def _route(method: str, path: str, event: dict[str, Any], caller: Caller) -> dic
     # POST /documents/{docId}/reprocess → re-run the pipeline on the stored upload
     m = re.fullmatch(r"/documents/([^/]+)/reprocess/?", path)
     if method == "POST" and m:
-        return _reprocess_document(m.group(1), caller)
+        body, err = _body(event)
+        if err:
+            return err
+        return _reprocess_document(m.group(1), caller, force=bool((body or {}).get("force")))
 
     # GET /documents/{docId}/diff
     m = re.fullmatch(r"/documents/([^/]+)/diff/?", path)
@@ -999,7 +1002,7 @@ def _get_doc_file(doc_id: str, caller: Caller) -> dict[str, Any]:
     return _ok({"url": url, "filename": filename, "contentType": _content_type(filename)})
 
 
-def _reprocess_document(doc_id: str, caller: Caller) -> dict[str, Any]:
+def _reprocess_document(doc_id: str, caller: Caller, force: bool = False) -> dict[str, Any]:
     """Re-run the ingestion pipeline on the stored upload.
 
     Re-writes the raw object in place (MetadataDirective=REPLACE), which fires the
@@ -1017,6 +1020,9 @@ def _reprocess_document(doc_id: str, caller: Caller) -> dict[str, Any]:
     # one that is still in flight, so the endpoint can't be used to burn spend.
     if _in_flight(meta):
         return _err(409, "Analysis is already in progress for this document", "in_progress")
+    if force:
+        # "Analyze anyway": a person says this is an agreement despite the check.
+        update_doc_fields(doc_id, {"skipAgreementCheck": True})
 
     try:
         s3_client().copy_object(

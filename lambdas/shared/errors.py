@@ -17,6 +17,10 @@ class UserFacingError(ValueError):
     """A failure the user can understand and usually fix themselves."""
 
 
+class NotAnAgreementError(UserFacingError):
+    """The upload is clearly not a contract (a résumé, an invoice, a paper)."""
+
+
 class PipelineStageError(RuntimeError):
     """What Step Functions records as the cause of a failed run. Its message is
     always user-safe; the original exception is chained for the logs."""
@@ -47,6 +51,8 @@ _AI_NAMES = {
 def safe_message(stage: str, exc: BaseException) -> tuple[str, str]:
     """(message, code) to store for a failed stage — never the raw exception text."""
     name = type(exc).__name__
+    if isinstance(exc, NotAnAgreementError):
+        return str(exc)[:300], "not_agreement"
     if isinstance(exc, UserFacingError):
         return str(exc)[:300], "user_error"
     if name == "DeadlineExceededError":

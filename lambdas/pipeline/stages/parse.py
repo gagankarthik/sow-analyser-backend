@@ -28,7 +28,8 @@ from typing import Any
 from shared.aws import textract_client
 from shared.docx_text import extract_docx
 from shared.dynamodb import get_doc_meta, update_status
-from shared.errors import UserFacingError
+from shared import document_check
+from shared.errors import NotAnAgreementError, UserFacingError
 from shared.logger import get_logger
 from shared.s3 import get_object, head_object, processed_key, put_json
 from shared.schema import ExtractionMethod, now_iso
@@ -127,6 +128,14 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
             "No readable text was found in this file. If it is a scan, make sure the pages are "
             "legible; if it is password-protected, remove the password and upload it again."
         )
+
+    # Stop before any analysis if this is clearly not an agreement (a résumé,
+    # an invoice, a paper), unless a person asked for the analysis anyway.
+    if not meta.get("skipAgreementCheck"):
+        verdict = document_check.check(text, str(meta.get("filename") or meta.get("title") or raw_key.rsplit("/", 1)[-1]))
+        if verdict:
+            log.info("parse.not_an_agreement", kind=verdict.kind)
+            raise NotAnAgreementError(verdict.message)
 
     empty_pages = [p["page"] for p in pages if not p["text"].strip()]
     if empty_pages and len(pages) > 1:
