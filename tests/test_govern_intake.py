@@ -18,13 +18,13 @@ def test_intake_creates_a_reviewed_auto_assigned_contract(gov, ddb, monkeypatch)
     install_analysis(monkeypatch, ddb)
     store.config.put_settings(f"u-aaaaaaaa-0000-4000-8000-0000000000a1", {"assignmentRules": [
         {"id": "r1", "agreementType": "sponsored_research", "department": "*",
-         "reviewer": {"email": "osp@osu.edu", "name": "Olive Sponsored"}}]})
+         "reviewer": {"email": "osp@northfield.edu", "name": "Olive Sponsored"}}]})
     seed_doc(ddb, "sra-1", sample=SRA, doc_type="OTHER", value=425000,
-             parties=["The Ohio State University", "Midwest Advanced Materials Corp."])
+             parties=["Northfield University", "Midwest Advanced Materials Corp."])
     assert intake.handle_event(analysed_event("sra-1")) == "created"
     c = store.contracts.get("sra-1")
     assert (c["agreementType"], c["direction"], c["state"], c["stage"]) == ("sponsored_research", "incoming", "in_review", "review")
-    assert c["owner"] == {"email": "osp@osu.edu", "name": "Olive Sponsored"}
+    assert c["owner"] == {"email": "osp@northfield.edu", "name": "Olive Sponsored"}
     assert (c["sponsor"], c["piName"], c["department"]) == ("Midwest Advanced Materials Corp.", "Dr. Priya Raman",
                                                             "Department of Materials Science & Engineering")
     assert c["matrix"]["version"] == 1 and c["reviewedDocVersion"] == 1
@@ -60,7 +60,7 @@ def test_a_revision_is_linked_rescored_and_sent_back_to_review(gov, ddb, monkeyp
     install_analysis(monkeypatch, ddb)
     seed_doc(ddb, "lic-1")
     intake.handle_event(analysed_event("lic-1"))
-    workflow.perform_action("lic-1", "send_back", {"clauses": []}, {"email": "d@osu.edu", "name": "D"})
+    workflow.perform_action("lic-1", "send_back", {"clauses": []}, {"email": "d@northfield.edu", "name": "D"})
     seed_doc(ddb, "lic-2", sample=LICENSE_V2, revisionOf="lic-1")
     assert intake.handle_event(analysed_event("lic-2")) == "revision"
     c = store.contracts.get("lic-2")

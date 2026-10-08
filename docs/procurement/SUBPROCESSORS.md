@@ -3,16 +3,16 @@
 Prepared 2026-10-08. Derived from `terraform/*.tf`, `lambdas/shared/*`, `sow-analyzer/amplify.yml` and `docs/GOVERN_ARCHITECTURE.md`. Items not in Terraform are marked.
 
 Two kinds of third party are listed:
-- **A. Subprocessors** process OSU data on Blue-IQ's behalf.
-- **B. Customer-authorised integrations** are OSU's own systems or vendors. Govern connects to them only if OSU enables the connection and supplies credentials. They are OSU's processors, not Blue-IQ's.
+- **A. Subprocessors** process the customer data on Blue-IQ's behalf.
+- **B. Customer-authorised integrations** are the customer's own systems or vendors. Govern connects to them only if the customer enables the connection and supplies credentials. They are the customer's processors, not Blue-IQ's.
 
 ## A. Subprocessors
 
 ### A1. Amazon Web Services (AWS)
 
-Entity: Amazon Web Services, Inc. Region: `us-east-2` (Ohio) by default (`var.aws_region`). Production region: **to confirm** (set by a CI secret). Terms: AWS Customer Agreement and AWS GDPR DPA (incorporated into the AWS Service Terms).
+Entity: Amazon Web Services, Inc. Region: `us-east-2` (the home state) by default (`var.aws_region`). Production region: **to confirm** (set by a CI secret). Terms: AWS Customer Agreement and AWS GDPR DPA (incorporated into the AWS Service Terms).
 
-| Service | Used for | OSU data it handles | In Terraform? |
+| Service | Used for | the customer data it handles | In Terraform? |
 |---|---|---|---|
 | Amazon S3 | Raw uploads; processed artefacts; Lambda layer | Full document content | Yes |
 | Amazon DynamoDB | Documents, projects, memberships, embedding cache; Govern tables | Metadata, extracted fields, workflow and audit records | Main table yes; Govern tables **no** |
@@ -47,28 +47,28 @@ Entity: Amazon Web Services, Inc. Region: `us-east-2` (Ohio) by default (`var.aw
 | Contract | **No DPA signed yet.** API usage is under OpenAI's standard Business Terms |
 | Account type | API platform (not ChatGPT). Tier and organisation verification: **to confirm** |
 
-**Vendor actions before the OSU pilot (blocking):**
+**Vendor actions before the the customer pilot (blocking):**
 1. Sign OpenAI's Data Processing Addendum and file the executed copy.
 2. Apply for Zero Data Retention on the API organisation/project used for production. Once approved, set `AI_PROVIDER=openai-zdr` (and `OPENAI_BASE_URL` if a dedicated endpoint is issued) in Terraform and Amplify.
 3. Ask about US data residency and record the answer.
 4. Move the API key from a Lambda environment variable to Secrets Manager (`OPENAI_SECRET_ARN` is already supported in code).
 5. Correct the website text (`/security`, `/legal/privacy`, `/legal/subprocessors`). It now says text is "not retained by the provider" under "an enterprise data-handling agreement". That is true only after steps 1 and 2.
 
-**Alternative for OSU:** if OSU policy rules out an external AI processor for some agreement classes, the options are: (a) exclude those agreements from AI processing by a classification flag (not yet built); (b) a Bedrock-hosted model in the same AWS account (allowlisted in `guardrails.py`, but the client is not implemented).
+**Alternative for the customer:** if the customer policy rules out an external AI processor for some agreement classes, the options are: (a) exclude those agreements from AI processing by a classification flag (not yet built); (b) a Bedrock-hosted model in the same AWS account (allowlisted in `guardrails.py`, but the client is not implemented).
 
-## B. Customer-authorised integrations (OSU systems)
+## B. Customer-authorised integrations (the customer systems)
 
-These are enabled per tenant by a Govern admin. Credentials are stored per tenant in AWS Secrets Manager (`lambdas/shared/govern/secrets.py`). Status is from `GOVERN_ARCHITECTURE.md` and `lambdas/shared/govern/connectors.py`. Each must be confirmed as live and tested before it is listed in an OSU order form.
+These are enabled per tenant by a Govern admin. Credentials are stored per tenant in AWS Secrets Manager (`lambdas/shared/govern/secrets.py`). Status is from `GOVERN_ARCHITECTURE.md` and `lambdas/shared/govern/connectors.py`. Each must be confirmed as live and tested before it is listed in an the customer order form.
 
 | Integration | Direction | Data exchanged | Who contracts with the vendor | Status |
 |---|---|---|---|---|
-| Huron Research Suite (Agreements) | Pull agreements; push findings and status back | Agreement records and documents; Govern findings | OSU | Designed, connector code present. Live connection **not yet** made |
-| Workday (Financials / HCM) | Pull award, cost-centre and spend data | Spend and award fields | OSU | Designed, connector code present. **Not yet** live |
-| DocuSign (Connect webhooks) | Inbound "signed" events | Envelope id, status | OSU | Webhook route designed with HMAC verification. **Not yet** live |
-| Microsoft Teams (incoming webhook) / Microsoft 365 | Outbound alert cards | Contract title, stage, assignee, link | OSU | Webhook URL validated to Microsoft domains (`govern_api/handler.py`). **Not yet** live |
+| Huron Research Suite (Agreements) | Pull agreements; push findings and status back | Agreement records and documents; Govern findings | the customer | Designed, connector code present. Live connection **not yet** made |
+| Workday (Financials / HCM) | Pull award, cost-centre and spend data | Spend and award fields | the customer | Designed, connector code present. **Not yet** live |
+| DocuSign (Connect webhooks) | Inbound "signed" events | Envelope id, status | the customer | Webhook route designed with HMAC verification. **Not yet** live |
+| Microsoft Teams (incoming webhook) / Microsoft 365 | Outbound alert cards | Contract title, stage, assignee, link | the customer | Webhook URL validated to Microsoft domains (`govern_api/handler.py`). **Not yet** live |
 
-Govern sends no OSU data to these systems unless OSU configures them. Disconnecting deletes the per-tenant secret. Synced records in `govern-sync` expire after 400 days (TTL).
+Govern sends no the customer data to these systems unless the customer configures them. Disconnecting deletes the per-tenant secret. Synced records in `govern-sync` expire after 400 days (TTL).
 
 ## Change notification
 
-Blue-IQ will give OSU at least 30 days' written notice before adding or replacing a subprocessor in section A, with a right to object. This is consistent with the published DPA summary (`/legal/dpa`). It needs to be written into the OSU agreement.
+Blue-IQ will give the customer at least 30 days' written notice before adding or replacing a subprocessor in section A, with a right to object. This is consistent with the published DPA summary (`/legal/dpa`). It needs to be written into the the customer agreement.

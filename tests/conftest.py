@@ -82,3 +82,18 @@ def gov(monkeypatch, ddb):
     from fakes import install_fake_govern
 
     return install_fake_govern(monkeypatch, ddb)
+
+
+@pytest.fixture(autouse=True)
+def _matrix_home_state(monkeypatch):
+    """The sample agreements are governed by Minnesota law, so the test
+    matrix names Minnesota as the institution's home state (a tenant sets
+    this in the matrix; the built-in default leaves it unset)."""
+    from shared.govern import matrix as m
+
+    original = m.default_matrix
+
+    def with_home_state():
+        return {**original(), "homeState": "Minnesota"}
+
+    monkeypatch.setattr(m, "default_matrix", with_home_state)

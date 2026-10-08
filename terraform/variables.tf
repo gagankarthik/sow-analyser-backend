@@ -172,7 +172,7 @@ variable "govern_open_admin" {
 variable "govern_features" {
   description = "Govern \"Later\" features switched on for this deployment, as a comma list: routing_rules, docusign, notifications, obligations, exports, integrations (e.g. \"exports,docusign\"). Empty = all of them off. Reported to the web app by GET /govern/me."
   type        = string
-  default     = ""
+  default     = "obligations"
   validation {
     condition = alltrue([
       for f in compact([for s in split(",", var.govern_features) : trimspace(s)]) :

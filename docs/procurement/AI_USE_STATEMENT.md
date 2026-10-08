@@ -1,10 +1,10 @@
 # Blue-IQ Govern: how AI is used
 
-Plain-language statement for OSU Legal Affairs, Privacy, and AI governance reviewers. Prepared 2026-10-08 from the code in `sow-analyser-backend` and `sow-analyzer`.
+Plain-language statement for the customer Legal Affairs, Privacy, and AI governance reviewers. Prepared 2026-10-08 from the code in `sow-analyser-backend` and `sow-analyzer`.
 
 ## In one paragraph
 
-Govern uses an AI model from OpenAI to **read** agreements: to pull out facts (parties, dates, amounts) and to label each clause by type (for example "indemnity" or "publication review"). It does **not** use AI to **decide** anything. Ordinary code checks each labelled clause against OSU's own contract matrix, so the same clause always gets the same result. People make every decision: send back, approve, escalate, sign. The AI never contacts a sponsor, changes contract text on its own, or approves anything.
+Govern uses an AI model from OpenAI to **read** agreements: to pull out facts (parties, dates, amounts) and to label each clause by type (for example "indemnity" or "publication review"). It does **not** use AI to **decide** anything. Ordinary code checks each labelled clause against the customer's own contract matrix, so the same clause always gets the same result. People make every decision: send back, approve, escalate, sign. The AI never contacts a sponsor, changes contract text on its own, or approves anything.
 
 ## Where AI is and is not used
 
@@ -14,8 +14,8 @@ Govern uses an AI model from OpenAI to **read** agreements: to pull out facts (p
 | Extracting facts (parties, dates, money, scope) | **Yes**, OpenAI | The model returns structured fields. A second pass re-checks amounts against quoted source text |
 | Splitting the agreement into clauses | No | Done in code, so no text is skipped (`shared/segment.py`) |
 | Labelling each clause (type, risk, short summary) | **Yes**, OpenAI | The model labels clauses that code has already cut out |
-| Search ("find similar clauses") | **Yes**, OpenAI embeddings | Clause text becomes vectors stored in OSU's search index |
-| **Matrix review: is this clause within OSU terms?** | **No** | Deterministic rules from the OSU matrix version in force (`shared/govern/matrix.py`). Each finding records which rule fired and which matrix version applied |
+| Search ("find similar clauses") | **Yes**, OpenAI embeddings | Clause text becomes vectors stored in the customer's search index |
+| **Matrix review: is this clause within the customer terms?** | **No** | Deterministic rules from the the customer matrix version in force (`shared/govern/matrix.py`). Each finding records which rule fired and which matrix version applied |
 | Routing, deadlines, reminders, reports | No | Workflow code |
 | Approve / send back / escalate / sign | No | A named person acts. Each action goes to the append-only activity log |
 | "Ask Sonar" questions about a contract | **Yes**, OpenAI | Answers are restricted to the user's permitted documents and must cite the clause. Personal identifiers are masked before sending |
@@ -24,10 +24,10 @@ Govern uses an AI model from OpenAI to **read** agreements: to pull out facts (p
 ## Data and training
 
 - **Training.** OpenAI's API terms say API data is not used to train its models unless the customer opts in. Blue-IQ has not opted in. The code will not send data to any AI provider that is not registered as "no training"; it stops instead (`shared/guardrails.py`).
-- **Retention by OpenAI.** Today, OpenAI may keep API inputs for up to 30 days for abuse monitoring. Blue-IQ is applying for Zero Data Retention and will sign OpenAI's DPA **before the OSU pilot**. Until both are in place, we will not tell OSU that text is "not retained". See `SUBPROCESSORS.md`.
+- **Retention by OpenAI.** Today, OpenAI may keep API inputs for up to 30 days for abuse monitoring. Blue-IQ is applying for Zero Data Retention and will sign OpenAI's DPA **before the the customer pilot**. Until both are in place, we will not tell the customer that text is "not retained". See `SUBPROCESSORS.md`.
 - **What is masked.** On the question-and-answer and drafting paths, emails, phone numbers, SSNs, card numbers and IP addresses are replaced with placeholders before sending. On the extraction path, text is sent as written, because the model needs to read amounts, dates and parties.
 - **Logging.** Every AI call is logged with provider, operation and size, never the text. Logs are kept 30 days.
-- **OSU data does not improve Blue-IQ's models.** Blue-IQ does not fine-tune or train any model on customer documents. There is no fine-tuning code in the repository.
+- **the customer data does not improve Blue-IQ's models.** Blue-IQ does not fine-tune or train any model on customer documents. There is no fine-tuning code in the repository.
 
 ## Human in the loop
 
@@ -38,7 +38,7 @@ Govern uses an AI model from OpenAI to **read** agreements: to pull out facts (p
 
 ## Known limits
 
-- The model can mislabel a clause. A mislabel can lead to a wrong matrix outcome, or to "missing". Mitigations: "needs check" states, source quotes, and reviewer confirmation. A labelled regression set of about 50 OSU agreements is planned before go-live (`COMPETITIVE_ANALYSIS.md` §7). It is **not yet built**.
+- The model can mislabel a clause. A mislabel can lead to a wrong matrix outcome, or to "missing". Mitigations: "needs check" states, source quotes, and reviewer confirmation. A labelled regression set of about 50 the customer agreements is planned before go-live (`COMPETITIVE_ANALYSIS.md` §7). It is **not yet built**.
 - Scanned documents depend on OCR quality. A per-page OCR quality flag is planned, **not yet built**.
 - There is no published accuracy benchmark yet.
 

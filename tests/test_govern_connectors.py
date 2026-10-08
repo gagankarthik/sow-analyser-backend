@@ -22,7 +22,7 @@ def sra(gov, ddb, monkeypatch):
     """A sponsored research contract carrying Huron AGR00012402 / Workday WD-GR-220871."""
     install_analysis(monkeypatch, ddb)
     seed_doc(ddb, "sra-1", sample=SRA, doc_type="OTHER", value=425000,
-             parties=["The Ohio State University", "Midwest Advanced Materials Corp."])
+             parties=["Northfield University", "Midwest Advanced Materials Corp."])
     intake.handle_event(analysed_event("sra-1"))
     return gov
 

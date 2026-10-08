@@ -82,7 +82,7 @@ def test_actions_follow_allowed_actions(world):
 
 def test_a_routed_office_approver_may_approve_with_view_access(world):
     call("PUT", "/workflow/settings", OWNER, {"reviewers": [
-        {"email": EMAIL[VIEWER], "name": "Becky Kaufman", "offices": ["legal_affairs"], "agreementTypes": []}]})
+        {"email": EMAIL[VIEWER], "name": "Avery Chen", "offices": ["legal_affairs"], "agreementTypes": []}]})
     call("POST", "/contracts/lic-1/actions", OWNER, {"action": "assign", "owner": DANA})
     call("POST", "/contracts/lic-1/actions", OWNER, {"action": "approve"})
     view = contract(VIEWER, groups=["govern-leader"])
@@ -117,7 +117,7 @@ def test_admin_routes_need_the_admin_role(world, monkeypatch):
 def test_post_contracts_creates_a_draft_and_intake_keeps_user_fields(gov, ddb, monkeypatch):
     install_analysis(monkeypatch, ddb)
     seed_doc(ddb, "sra-1", sample=SRA, status="CLASSIFYING", doc_type="OTHER",
-             parties=["The Ohio State University", "Midwest Advanced Materials Corp."], value=425000)
+             parties=["Northfield University", "Midwest Advanced Materials Corp."], value=425000)
     status, body = call("POST", "/contracts", OWNER, {"docId": "sra-1", "sponsor": "Midwest Materials (MAMC)",
                                                        "expectedValue": 400000})
     c = body["contract"]
@@ -309,11 +309,11 @@ def test_workflow_settings_round_trip_and_teams_secret(world, gov, monkeypatch):
     gov.secrets["arn:teams"] = ""
     status, body = call("PUT", "/workflow/settings", OWNER, {
         "stageTargetDays": {"review": 3}, "redAfterMultiple": 1.5,
-        "teamsWebhookUrl": "https://osu.webhook.office.com/webhookb2/abc"})
+        "teamsWebhookUrl": "https://example.webhook.office.com/webhookb2/abc"})
     s = body["settings"]
     assert status == 200 and s["stageTargetDays"]["review"] == 3 and s["stageTargetDays"]["negotiation"] == 10
     assert s["redAfterMultiple"] == 1.5 and s["teamsWebhookConfigured"] is True and "teamsWebhookUrl" not in s
-    assert json.loads(gov.secrets["arn:teams"])["tenants"][f"u-{OWNER}"].startswith("https://osu.webhook")
+    assert json.loads(gov.secrets["arn:teams"])["tenants"][f"u-{OWNER}"].startswith("https://example.webhook")
     assert call("GET", "/workflow/settings", OWNER)[1]["settings"]["redAfterMultiple"] == 1.5
     assert call("PUT", "/workflow/settings", OWNER, {"teamsWebhookUrl": "http://evil.example"})[0] == 400
     assert call("PUT", "/workflow/settings", OWNER, {"routingRules": [{"when": {}, "route": ["the_dean"]}]})[0] == 400
@@ -365,3 +365,44 @@ def test_open_admin_is_off_unless_the_stage_turns_it_on(monkeypatch):
     assert Settings().govern_open_admin is False
     monkeypatch.setenv("GOVERN_OPEN_ADMIN", "true")
     assert Settings().govern_open_admin is True
+
+
+def test_portfolio_obligations_list(world):
+    call("POST", "/contracts/lic-1/obligations", OWNER,
+         {"kind": "royalty_report", "title": "Q4 royalty report", "dueDate": "2026-10-20"})
+    call("POST", "/contracts/lic-1/obligations", OWNER,
+         {"kind": "royalty_report", "title": "Undated note"})                      # undated: not listed
+    status, body = call("GET", "/obligations", OWNER)
+    assert status == 200 and body["count"] == 1
+    o = body["obligations"][0]
+    assert o["title"] == "Q4 royalty report" and o["contractId"] == "lic-1" and o["contractTitle"]
+    # A project viewer in another workspace sees the shared contract's obligations too.
+    assert call("GET", "/obligations", VIEWER)[1]["count"] == 1
+    # Someone with no access sees none.
+    assert call("GET", "/obligations", OUTSIDER)[1]["count"] == 0
+    # Done drops out.
+    obl = call("GET", "/contracts/lic-1", OWNER)[1]["contract"]["obligations"]
+    first = next(x for x in obl if x["title"] == "Q4 royalty report")["id"]
+    call("PATCH", f"/contracts/lic-1/obligations/{first}", OWNER, {"status": "done"})
+    assert call("GET", "/obligations", OWNER)[1]["count"] == 0
+
+
+def test_organization_settings(world):
+    org = call("GET", "/workflow/settings", OWNER)[1]["settings"]["organization"]
+    assert org == {"name": None, "defaultCurrency": "USD", "fiscalYearStartMonth": 1, "confirmedSteps": [],
+                   "setupCompletedAt": None}
+    status, body = call("PUT", "/workflow/settings", OWNER, {"organization": {
+        "name": "  Acme Research  ", "defaultCurrency": "eur", "fiscalYearStartMonth": 7,
+        "setupCompletedAt": "2026-10-08T12:00:00Z"}})
+    assert status == 200
+    assert body["settings"]["organization"] == {"name": "Acme Research", "defaultCurrency": "EUR",
+                                                 "fiscalYearStartMonth": 7, "confirmedSteps": [],
+                                                 "setupCompletedAt": "2026-10-08T12:00:00Z"}
+    body = call("PUT", "/workflow/settings", OWNER, {"organization": {"confirmedSteps": ["workflow", "matrix"]}})[1]
+    assert body["settings"]["organization"]["confirmedSteps"] == ["matrix", "workflow"]
+    # A partial update keeps the rest.
+    body = call("PUT", "/workflow/settings", OWNER, {"organization": {"name": "Acme"}})[1]
+    assert body["settings"]["organization"]["defaultCurrency"] == "EUR"
+    for bad in ({"defaultCurrency": "euro"}, {"fiscalYearStartMonth": 13}, {"name": ""}, {"setupCompletedAt": "soon"},
+                {"confirmedSteps": ["everything"]}):
+        assert call("PUT", "/workflow/settings", OWNER, {"organization": bad})[0] == 400

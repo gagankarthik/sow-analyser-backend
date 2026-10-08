@@ -13,7 +13,7 @@ from shared.govern import capture, store, workflow
 from shared.govern.store import iso
 
 TENANT = "u-aaaaaaaa-0000-4000-8000-0000000000a1"
-DANA = {"email": "dana@osu.edu", "name": "Dana Ruiz"}
+DANA = {"email": "dana@northfield.edu", "name": "Dana Ruiz"}
 
 
 def _age_stage(contract_id: str, days: int, now: datetime) -> None:
@@ -33,7 +33,7 @@ def test_overdue_is_written_once_per_stage_visit(gov, ddb, monkeypatch):
     last = gov.activity_for("lic-1")[-1]
     assert last["action"] == "overdue" and last["detail"]["slaStatus"] == "amber"
     assert last["summary"] == ("This has been in review for 7 days, past its 5-day target. "
-                               "Waiting on OSU reviewer (Dana Ruiz).")
+                               "Waiting on reviewer (Dana Ruiz).")
     assert sweeper.sweep(now + timedelta(days=10))["overdue"] == 0   # now red, but already raised
     workflow.perform_action("lic-1", "send_back", {"clauses": []}, DANA)    # new stage visit
     assert sweeper.sweep(now + timedelta(days=11))["overdue"] == 1

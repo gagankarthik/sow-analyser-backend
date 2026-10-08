@@ -2,9 +2,9 @@ SPONSORED RESEARCH AGREEMENT
 
 Huron Agreement No. AGR00012402
 Workday Ref: WD-GR-220871
-OSU Office of Sponsored Programs Proposal No. PR-2026-08812
+Northfield Office of Sponsored Programs Proposal No. PR-2026-08812
 
-This Sponsored Research Agreement (the "Agreement") is entered into as of November 1, 2026 (the "Effective Date") by and between The Ohio State University, an instrumentality of the State of Ohio, acting through its Office of Sponsored Programs, 1960 Kenny Road, Columbus, Ohio 43210 ("University"), and Midwest Advanced Materials Corp., a Michigan corporation with offices at 2100 Commonwealth Boulevard, Ann Arbor, Michigan 48105 ("Sponsor").
+This Sponsored Research Agreement (the "Agreement") is entered into as of November 1, 2026 (the "Effective Date") by and between Northfield University, an instrumentality of the State of Minnesota, acting through its Office of Sponsored Programs, 1960 Kenny Road, Minneapolis, Minnesota 43210 ("University"), and Midwest Advanced Materials Corp., a Michigan corporation with offices at 2100 Commonwealth Boulevard, Ann Arbor, Michigan 48105 ("Sponsor").
 
 Sponsor wishes to support research at University on high-temperature ceramic matrix composites, to be conducted under the direction of Dr. Priya Raman (the "Principal Investigator"), Department of Materials Science & Engineering, College of Engineering.
 
@@ -50,7 +50,7 @@ Sponsor wishes to support research at University on high-temperature ceramic mat
 
 9. GOVERNING LAW
 
-9.1 This Agreement shall be governed by the laws of the State of Ohio. Nothing in this Agreement shall be construed as a waiver of the sovereign immunity of University or the State of Ohio.
+9.1 This Agreement shall be governed by the laws of the State of Minnesota. Nothing in this Agreement shall be construed as a waiver of the sovereign immunity of University or the State of Minnesota.
 
 10. TERM AND TERMINATION
 
@@ -64,7 +64,7 @@ Sponsor wishes to support research at University on high-temperature ceramic mat
 
 IN WITNESS WHEREOF, the parties have executed this Agreement as of the Effective Date.
 
-THE OHIO STATE UNIVERSITY                     MIDWEST ADVANCED MATERIALS CORP.
+NORTHFIELD UNIVERSITY                     MIDWEST ADVANCED MATERIALS CORP.
 By: ______________________                   By: ______________________
 Title: Director, Office of Sponsored Programs Name: Thomas Brandt
 Read and understood: Dr. Priya Raman, PI     Title: Vice President, Research

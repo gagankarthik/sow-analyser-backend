@@ -2,7 +2,7 @@
 transitions, routing, the recommended next step, SLA colours, value buckets,
 fiscal year, capture gaps, allowed actions and optimistic locking.
 
-Runs on the in-memory tables (tests/fakes.py) with the OSU sample agreements
+Runs on the in-memory tables (tests/fakes.py) with the Northfield sample agreements
 as the analysed documents.
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ from shared.govern import store, workflow
 from shared.govern.store import ContractConflict, iso
 
 NOW = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
-ELI = {"email": "eli@osu.edu", "name": "Eli Park"}
+ELI = {"email": "eli@northfield.edu", "name": "Eli Park"}
 
 
 @pytest.fixture
@@ -57,7 +57,7 @@ def item(**fields) -> dict:
 def test_assign_moves_intake_to_review_and_names_the_reviewer(lic):
     c = act("assign", owner=DANA)
     assert c["state"] == "in_review" and c["owner"] == DANA
-    assert contract()["waitingOn"] == {"kind": "osu_reviewer", "label": "Waiting on OSU reviewer (Dana Ruiz)",
+    assert contract()["waitingOn"] == {"kind": "internal_reviewer", "label": "Waiting on reviewer (Dana Ruiz)",
                                        "office": None, "person": DANA}
     act("assign", owner=ELI)
     entries = lic.activity_for("lic-1")
@@ -86,7 +86,7 @@ def test_send_back_counts_a_round_and_waits_on_the_licensee(lic):
     c = act("send_back", clauses=clauses, note="See redlines")
     assert (c["state"], c["stage"], c["rounds"]) == ("sent_back", "negotiation", 1)
     view = contract()
-    assert view["waitingOn"] == {"kind": "counterparty", "label": "Waiting on licensee (Buckeye BioSensors, Inc.)",
+    assert view["waitingOn"] == {"kind": "counterparty", "label": "Waiting on licensee (Lakeshore BioSensors, Inc.)",
                                  "office": None, "person": None}
     last = lic.activity_for("lic-1")[-1]
     assert last["summary"] == "Dana Ruiz sent this back to the licensee with 3 clauses to change."
@@ -121,7 +121,7 @@ def test_ask_pi_waits_on_the_pi_until_answered(lic):
         act("ask_pi", request="Again")
     c = act("pi_answered")
     assert "piRequest" not in c
-    assert contract()["waitingOn"]["kind"] == "osu_reviewer"
+    assert contract()["waitingOn"]["kind"] == "internal_reviewer"
     assert lic.activity_for("lic-1")[-1]["action"] == "pi_answered"
 
 
@@ -133,12 +133,12 @@ def test_ask_pi_needs_a_request_and_a_move_clears_it(lic):
         act("pi_answered")
     act("ask_pi", request="Budget sign-off from the department")
     c = act("escalate", office="export_control")
-    assert "piRequest" not in c and contract()["waitingOn"]["kind"] == "osu_office"
+    assert "piRequest" not in c and contract()["waitingOn"]["kind"] == "internal_office"
 
 
 def test_reject_keeps_the_stage_and_nothing_more_can_happen(lic):
     act("assign", owner=DANA)
-    c = act("reject", reasonCode="unacceptable_terms", note="No Ohio law")
+    c = act("reject", reasonCode="unacceptable_terms", note="No Minnesota law")
     assert c["state"] == "rejected" and c["stage"] == "review"
     view = contract()
     assert view["nextStep"]["action"] == "none" and view["waitingOn"]["kind"] == "nobody"
@@ -156,7 +156,7 @@ def test_signature_lifecycle_to_close_and_reopen(lic):
     act("office_approve", office="legal_affairs")
     with pytest.raises(workflow.InvalidTransition):
         act("activate")
-    c = act("send_for_signature", provider="docusign", signatory={"email": "sig@osu.edu", "name": "Signer"})
+    c = act("send_for_signature", provider="docusign", signatory={"email": "sig@northfield.edu", "name": "Signer"})
     assert c["state"] == "out_for_signature" and c["signature"]["provider"] == "docusign"
     with pytest.raises(workflow.InvalidTransition):
         act("send_for_signature", provider="manual")       # only from ready_to_sign
@@ -275,15 +275,15 @@ def test_default_routing_sends_large_contracts_to_legal():
 
 def test_auto_assignment_prefers_the_most_specific_rule():
     cfg = {"assignmentRules": [
-        {"agreementType": "*", "department": "*", "reviewer": {"email": "any@osu.edu", "name": "Any"}},
-        {"agreementType": "license", "department": "*", "reviewer": {"email": "lic@osu.edu", "name": "Lic"}},
-        {"agreementType": "license", "department": "Department of Physics", "reviewer": {"email": "phys@osu.edu", "name": "P"}},
+        {"agreementType": "*", "department": "*", "reviewer": {"email": "any@northfield.edu", "name": "Any"}},
+        {"agreementType": "license", "department": "*", "reviewer": {"email": "lic@northfield.edu", "name": "Lic"}},
+        {"agreementType": "license", "department": "Department of Physics", "reviewer": {"email": "phys@northfield.edu", "name": "P"}},
     ], "reviewers": []}
-    assert workflow.auto_assignee(item(department="department of physics"), cfg)[0]["email"] == "phys@osu.edu"
-    assert workflow.auto_assignee(item(department="Chemistry"), cfg)[0]["email"] == "lic@osu.edu"
-    assert workflow.auto_assignee(item(agreementType="nda"), cfg)[0]["email"] == "any@osu.edu"
-    by_type = {"assignmentRules": [], "reviewers": [{"email": "mta@osu.edu", "name": "M", "agreementTypes": ["mta"]}]}
-    assert workflow.auto_assignee(item(agreementType="mta"), by_type)[0]["email"] == "mta@osu.edu"
+    assert workflow.auto_assignee(item(department="department of physics"), cfg)[0]["email"] == "phys@northfield.edu"
+    assert workflow.auto_assignee(item(department="Chemistry"), cfg)[0]["email"] == "lic@northfield.edu"
+    assert workflow.auto_assignee(item(agreementType="nda"), cfg)[0]["email"] == "any@northfield.edu"
+    by_type = {"assignmentRules": [], "reviewers": [{"email": "mta@northfield.edu", "name": "M", "agreementTypes": ["mta"]}]}
+    assert workflow.auto_assignee(item(agreementType="mta"), by_type)[0]["email"] == "mta@northfield.edu"
     assert workflow.auto_assignee(item(agreementType="nda"), by_type) == (None, None)
 
 
@@ -298,7 +298,7 @@ def _step(**fields):
 
 def _unacceptable_law(**extra):
     return {"reviewIndex": {"GoverningLaw": {"label": "Governing law", "tier": "unacceptable", "hasFallback": False,
-                                             "office": "legal_affairs", "suggestedLanguage": "Ohio law"},
+                                             "office": "legal_affairs", "suggestedLanguage": "Minnesota law"},
                             "Royalties": {"label": "Royalties", "tier": "deviates", "hasFallback": True}},
             **extra}
 
@@ -316,7 +316,7 @@ def test_next_step_rules_in_order():
     assert (step["action"], step["office"]) == ("escalate", "legal_affairs")
     assert step["headline"] == "Escalate to Legal Affairs: 1 clause is unacceptable."
     assert step["clauses"] == [{"clauseType": "GoverningLaw", "label": "Governing law", "tier": "unacceptable",
-                                "suggestedLanguage": "Ohio law"}]
+                                "suggestedLanguage": "Minnesota law"}]
     approved = {"required": ["legal_affairs"], "approvals": [{"office": "legal_affairs"}]}
     assert _step(**_unacceptable_law(openBlockerRefs=[law], routing=approved))["action"] == "reject"
     waiting = _step(**_unacceptable_law(openBlockerRefs=[law], state="escalated",
@@ -387,28 +387,28 @@ def test_capture_gaps_depend_on_the_agreement_type():
 
 
 def test_allowed_actions_follow_state_and_role():
-    cfg = {"reviewers": [{"email": "legal@osu.edu", "offices": ["legal_affairs"]}]}
+    cfg = {"reviewers": [{"email": "legal@northfield.edu", "offices": ["legal_affairs"]}]}
     escalated = item(state="escalated", routing={"required": ["legal_affairs"], "approvals": []})
     editor = workflow.Viewer(can_edit=True)
     assert workflow.allowed_actions(escalated, editor, cfg) == [
         "assign", "approve", "office_approve", "send_back", "escalate", "reject", "reopen", "ask_pi", "comment"]
     assert workflow.allowed_actions(item(state="ready_to_sign"), editor, cfg) == [
         "assign", "send_back", "escalate", "reject", "send_for_signature", "mark_signed", "reopen", "comment"]
-    viewer = workflow.Viewer(can_edit=False, email="becky@osu.edu")
+    viewer = workflow.Viewer(can_edit=False, email="avery@northfield.edu")
     assert workflow.allowed_actions(escalated, viewer, cfg) == ["comment"]
-    approver = workflow.Viewer(can_edit=False, is_leader=True, email="legal@osu.edu")
+    approver = workflow.Viewer(can_edit=False, is_leader=True, email="legal@northfield.edu")
     assert workflow.allowed_actions(escalated, approver, cfg) == ["office_approve", "comment"]
-    leader_editor = workflow.Viewer(can_edit=True, is_leader=True, email="becky@osu.edu")
+    leader_editor = workflow.Viewer(can_edit=True, is_leader=True, email="avery@northfield.edu")
     assert workflow.allowed_actions(escalated, leader_editor, cfg) == ["comment"]
 
 
 def test_user_set_fields_survive_reanalysis(lic, ddb):
-    workflow.update_fields("lic-1", {"counterparty": "Buckeye BioSensors LLC", "effectiveDate": "2026-10-01",
+    workflow.update_fields("lic-1", {"counterparty": "Lakeshore BioSensors LLC", "effectiveDate": "2026-10-01",
                                      "termEndDate": "2041-10-01"}, DANA)
     ddb.items[("DOC#lic-1", "META")]["latestVersion"] = 2          # analysed again
     assert intake.handle_event(analysed_event("lic-1")) == "reanalysed"
     c = store.contracts.get("lic-1")
-    assert c["counterparty"] == "Buckeye BioSensors LLC"
+    assert c["counterparty"] == "Lakeshore BioSensors LLC"
     assert (c["effectiveDate"], c["termEndDate"]) == ("2026-10-01", "2041-10-01")
     assert lic.actions("lic-1")[-1] == "rescored"
     with pytest.raises(workflow.BadRequest):

@@ -4,6 +4,7 @@ Routes                                                      needs
 ------                                                      -----
 GET    /govern/me                                           signed in
 GET    /contracts[?includeClosed=true]                      (lists what the caller may see)
+GET    /obligations                                         (open, dated obligations of visible contracts)
 POST   /contracts                                           edit on the document
 GET    /contracts/{id}                                      view
 PATCH  /contracts/{id}                                      edit
@@ -333,6 +334,32 @@ def _list_contracts(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
     return _ok({"contracts": out, "count": len(out), "generatedAt": iso(now)})
 
 
+def _list_obligations(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
+    """Every open, dated obligation across the contracts this caller can see,
+    soonest due first, each with the contract it belongs to."""
+    contracts, _docs = _visible_contracts(user, create_missing=False)
+    by_id = {c["contractId"]: c for c in contracts}
+    # A contract shared through a project can live in another workspace: read
+    # the obligations of every workspace the visible contracts belong to.
+    tenants = sorted({str(c.get("tenantId") or user.caller.tenant_id) for c in contracts} or {user.caller.tenant_id})
+    rows = [o for t in tenants for o in store.contracts.open_obligations(t)]
+    rows.sort(key=lambda o: (str(o.get("dueDate") or ""), str(o.get("id") or "")))
+    out = []
+    for o in rows:
+        c = by_id.get(o.get("contractId"))
+        if c is None:
+            continue
+        owner = c.get("owner") or {}
+        out.append({**workflow.obligation_view(o), "contractId": c["contractId"],
+                    "contractTitle": c.get("title"), "counterparty": c.get("sponsor") or c.get("counterparty"),
+                    "agreementType": c.get("agreementType"), "stage": c.get("stage"),
+                    "currency": c.get("currency"),
+                    "owner": {"email": owner.get("email"), "name": owner.get("name")} if owner else None})
+    return _ok({"obligations": out, "count": len(out),
+                "enabled": settings.feature_enabled("obligations"),
+                "generatedAt": iso(datetime.now(timezone.utc))})
+
+
 def _create_contract(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
     """Intake right after upload — idempotent: an existing contract is patched."""
     body = _body(event)
@@ -503,6 +530,20 @@ def _matrix_meta(body: dict[str, Any]) -> tuple[str | None, str | None]:
     return ((note or "").strip()[:500] or None), eff
 
 
+def _home_state_arg(body: dict[str, Any]) -> Any:
+    """``homeState`` from the body: a US state or DC name, null to clear, or
+    left out (``...``) to keep the current one."""
+    if "homeState" not in body:
+        return ...
+    raw = body.get("homeState")
+    if raw is None or raw == "":
+        return None
+    state = workflow._m().home_state(raw)
+    if state is None:
+        raise workflow.BadRequest("homeState must be the name of a US state or the District of Columbia")
+    return state
+
+
 def _put_matrix(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
     _require_admin(user)
     body = _body(event)
@@ -511,7 +552,7 @@ def _put_matrix(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
     if problem:
         raise workflow.BadRequest(problem)
     matrix = store.config.save_matrix(user.caller.tenant_id, clean, created_by=user.person, note=note,
-                                      effective_date=effective)
+                                      effective_date=effective, home_state=_home_state_arg(body))
     log.info("govern_api.matrix_saved", version=matrix["version"])
     return _ok({"matrix": matrix})
 
@@ -659,6 +700,7 @@ _SEG = r"([^/]+)"
 _RAW_ROUTES: list[tuple[tuple[str, str], Callable[..., dict[str, Any]]]] = [
     (("GET", r"/govern/me"), _me),
     (("GET", r"/contracts"), _list_contracts),
+    (("GET", r"/obligations"), _list_obligations),
     (("POST", r"/contracts"), _create_contract),
     (("GET", rf"/contracts/{_SEG}"), _get_contract),
     (("PATCH", rf"/contracts/{_SEG}"), _patch_contract),

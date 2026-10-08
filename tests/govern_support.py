@@ -1,8 +1,8 @@
 """Shared fixtures-as-functions for the Govern tests.
 
 Documents are seeded straight into the fake documents table; their analysis
-(classification + parsed header text) comes from the OSU sample agreements in
-``samples/osu``, cut into labelled clauses exactly as test_govern_matrix.py
+(classification + parsed header text) comes from the Northfield sample agreements in
+``samples/research``, cut into labelled clauses exactly as test_govern_matrix.py
 does (``_sample_clauses`` — the stand-in for the pipeline's classify stage).
 """
 from __future__ import annotations
@@ -14,14 +14,14 @@ from typing import Any
 from shared.govern import workflow
 from test_govern_matrix import _sample_clauses
 
-SAMPLES = Path(__file__).resolve().parents[1] / "samples" / "osu"
+SAMPLES = Path(__file__).resolve().parents[1] / "samples" / "research"
 
 OWNER = "aaaaaaaa-0000-4000-8000-0000000000a1"
 EDITOR = "aaaaaaaa-0000-4000-8000-0000000000a2"
 VIEWER = "aaaaaaaa-0000-4000-8000-0000000000a3"
 OUTSIDER = "aaaaaaaa-0000-4000-8000-0000000000a4"
-EMAIL = {OWNER: "dana@osu.edu", EDITOR: "eli@osu.edu", VIEWER: "becky@osu.edu", OUTSIDER: "x@else.com"}
-NAME = {OWNER: "Dana Ruiz", EDITOR: "Eli Park", VIEWER: "Becky Kaufman", OUTSIDER: "Out Sider"}
+EMAIL = {OWNER: "dana@northfield.edu", EDITOR: "eli@northfield.edu", VIEWER: "avery@northfield.edu", OUTSIDER: "x@else.com"}
+NAME = {OWNER: "Dana Ruiz", EDITOR: "Eli Park", VIEWER: "Avery Chen", OUTSIDER: "Out Sider"}
 TENANT = f"u-{OWNER}"
 PROJECT = "proj_osu"
 
@@ -58,7 +58,7 @@ def seed_doc(ddb, doc_id: str, *, sample: str = LICENSE_V1, owner: str = OWNER, 
         "PK": f"DOC#{doc_id}", "SK": "META", "GSI1PK": f"TENANT#u-{owner}", "GSI1SK": f"DOC#{doc_id}",
         "entityType": "DOCUMENT", "docId": doc_id, "tenantId": f"u-{owner}", "ownerSub": owner,
         "ownerEmail": EMAIL[owner], "title": first, "docType": doc_type, "status": status,
-        "parties": parties or ["The Ohio State University", "Buckeye BioSensors, Inc."],
+        "parties": parties or ["Northfield University", "Lakeshore BioSensors, Inc."],
         "projectIds": project_ids or [], "latestVersion": 1, "createdAt": "2026-10-01T09:00:00Z",
         "updatedAt": "2026-10-01T09:00:00Z", "lifecycle": "draft", "sample": sample, **extra,
     }
@@ -73,7 +73,7 @@ def seed_project(ddb, members: dict[str, str], doc_ids: list[str], project_id: s
     """A project owned by OWNER; ``members`` maps sub → role."""
     ddb.items[(f"PROJ#{project_id}", "META")] = {
         "PK": f"PROJ#{project_id}", "SK": "META", "entityType": "PROJECT", "projectId": project_id,
-        "name": "OSU", "ownerSub": OWNER, "ownerEmail": EMAIL[OWNER], "docIds": list(doc_ids), "rev": 1}
+        "name": "Northfield", "ownerSub": OWNER, "ownerEmail": EMAIL[OWNER], "docIds": list(doc_ids), "rev": 1}
     ddb.items[(f"PROJ#{project_id}", "OWNER")] = {
         "PK": f"PROJ#{project_id}", "SK": "OWNER", "GSI1PK": f"USER#{OWNER}", "GSI1SK": f"PROJ#{project_id}",
         "projectId": project_id, "role": "owner"}

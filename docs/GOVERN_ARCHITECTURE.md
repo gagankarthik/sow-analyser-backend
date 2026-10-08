@@ -1,6 +1,6 @@
-# Blue-IQ Govern — target architecture (OSU workflow, matrix, reporting, integrations)
+# Blue-IQ Govern — target architecture (the customer workflow, matrix, reporting, integrations)
 
-Status: adopted October 2026. Source: "Blue IQ Govern: OSU Workflow and Reporting
+Status: adopted October 2026. Source: "Blue IQ Govern: the customer Workflow and Reporting
 Requirements" (Requirements 1–6). The API contract is in `GOVERN_API.md`.
 
 ## 1. What changed and why
@@ -9,7 +9,7 @@ The existing platform reads, scores and values a contract well. It is built as o
 ingest pipeline (S3 → EventBridge → Step Functions, 7 stages), one HTTP Lambda that
 routes every REST call, one single-table DynamoDB table and one OpenSearch domain.
 
-OSU adds a second, very different workload: **moving a contract between people**.
+the customer adds a second, very different workload: **moving a contract between people**.
 
 | Concern | Ingest (today) | Govern (new) |
 |---|---|---|
@@ -29,7 +29,7 @@ and analysis output that already exist.
 ## 2. Target architecture
 
 ```
-                         ┌──────────────── Cognito (JWT; SAML federation to OSU IdP, groups → roles)
+                         ┌──────────────── Cognito (JWT; SAML federation to the customer IdP, groups → roles)
                          ▼
 Next.js ──► API Gateway HTTP API ──┬─► api Lambda          /documents /projects /playbook   (unchanged)
                                    ├─► rag Lambda          /documents/{id}/chat              (unchanged)
@@ -128,7 +128,7 @@ collaboration, other). Each clause rule: standard position, acceptable fallback,
 unacceptable terms, beneficial terms, escalation office, numeric thresholds,
 suggested redline language. Grading needs no model call: built-in checks for the
 ten research/licensing types (publication review period, background IP, licence
-scope, royalties, indemnity for a public university, Ohio law / sovereign immunity,
+scope, royalties, indemnity for a public university, home-state law / sovereign immunity,
 export control, data rights / use of name, sponsor reporting / flow-down,
 diligence) plus phrase lists. Outcomes: `within`, `fallback`, `deviates`,
 `unacceptable`, `review`, `missing`; independently `beneficial`. The version used

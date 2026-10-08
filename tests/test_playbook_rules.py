@@ -239,3 +239,23 @@ def test_deployment_override_is_reported_as_such(workspace, monkeypatch):
     assert rules["Payment"]["source"] == "deployment" and rules["Payment"]["thresholds"] == {"netDays": 15}
     assert playbook.resolve_positions(None)["Payment"].check is playbook._check_payment
     assert playbook._grade(playbook.resolve_positions(None)["Payment"], "Payable Net 30.")[0] == "minor"
+
+
+def _shared_call(method, path, groups, body=None):
+    """A request from a shared (custom:tenantId) workspace, with the given groups."""
+    claims = {"sub": SUB_A, "custom:tenantId": "acme-co", "cognito:groups": groups}
+    ev = {"rawPath": path, "body": json.dumps(body) if body is not None else None, "queryStringParameters": None,
+          "requestContext": {"authorizer": {"jwt": {"claims": claims}}}}
+    resp = api._route(method, path, ev, Caller.from_claims(claims))
+    return resp["statusCode"], json.loads(resp["body"])
+
+
+def test_shared_workspace_settings_need_an_admin(workspace, monkeypatch):
+    from shared.config import settings
+    monkeypatch.setattr(settings, "govern_open_admin", False)
+    rule = {"standard": "Net 45 from invoice date."}
+    assert _shared_call("PUT", "/playbook/rules/Payment", "[govern-reviewer]", rule)[0] == 403
+    assert _shared_call("DELETE", "/playbook/rules/Payment", "")[0] == 403
+    assert _shared_call("POST", "/tenant/compliance", "[govern-reviewer]", {"packs": []})[0] == 403
+    assert _shared_call("PUT", "/playbook/rules/Payment", "[govern-admin]", rule)[0] == 200
+    assert _shared_call("POST", "/tenant/compliance", ["govern-admin"], {"packs": []})[0] == 200

@@ -92,9 +92,9 @@ def test_a_hand_escalation_still_applies_with_routing_off(lic, monkeypatch):
 
 
 def test_with_notifications_off_the_notifier_sends_and_claims_nothing(lic, monkeypatch):
-    monkeypatch.setattr(settings, "notify_from_email", "govern@osu.edu")
+    monkeypatch.setattr(settings, "notify_from_email", "govern@northfield.edu")
     only(monkeypatch)
-    workflow.perform_action("lic-1", "assign", {"owner": {"email": "eli@osu.edu", "name": "Eli Park"}}, DANA)
+    workflow.perform_action("lic-1", "assign", {"owner": {"email": "eli@northfield.edu", "name": "Eli Park"}}, DANA)
     entry = {k: v for k, v in lic.activity_for("lic-1")[-1].items() if k not in ("PK", "SK")}
     assert notifier.handle_event({"detail": entry}) == []
     assert lic.emails == [] and "notification_sent" not in lic.actions("lic-1")
@@ -111,7 +111,7 @@ def test_with_notifications_off_the_notifier_sends_and_claims_nothing(lic, monke
 def sra(gov, ddb, monkeypatch):
     install_analysis(monkeypatch, ddb)
     seed_doc(ddb, "sra-1", sample=SRA, doc_type="OTHER", value=425000,
-             parties=["The Ohio State University", "Midwest Advanced Materials Corp."])
+             parties=["Northfield University", "Midwest Advanced Materials Corp."])
     intake.handle_event(analysed_event("sra-1"))
     return gov
 

@@ -9,8 +9,8 @@ What lives here
 * the state machine: ``State`` → ``Stage`` mapping, which action is allowed
   from which state (anything else raises ``InvalidTransition`` → HTTP 409);
 * every action of ``POST /contracts/{id}/actions`` (docs/GOVERN_API.md);
-* routing (which OSU offices must approve), auto-assignment, "waiting on" in
-  plain words, SLA colours, value fields, OSU fiscal year and the ONE
+* routing (which internal offices must approve), auto-assignment, "waiting on" in
+  plain words, SLA colours, value fields, fiscal year and the ONE
   recommended next step;
 * matrix (re)scoring of a contract's current document, Sonar blockers,
   licensing income and obligations;
@@ -172,7 +172,7 @@ def _m() -> Any:
 
 def office_label(office: str | None) -> str:
     if not office:
-        return "an OSU office"
+        return "an internal office"
     try:
         return _m().OFFICE_LABELS.get(office) or office.replace("_", " ").title()
     except Exception:  # noqa: BLE001
@@ -278,7 +278,7 @@ def _plural(n: int, word: str, plural: str | None = None) -> str:
 
 
 def fiscal_year(value: Any) -> int | None:
-    """OSU fiscal year: FY2027 runs 1 July 2026 – 30 June 2027."""
+    """fiscal year: FY2027 runs 1 July 2026 – 30 June 2027."""
     dt = parse_iso(value) if not isinstance(value, datetime) else value
     if dt is None:
         return None
@@ -297,6 +297,11 @@ def _whole_days(start: Any, end: datetime) -> int:
 # ---------------------------------------------------------------------------
 
 
+# Organisation setup steps an admin confirms by hand (the others complete
+# themselves from the data: a name, a home state, a reviewer, a contract).
+SETUP_STEPS = ("matrix", "workflow")
+
+
 def default_settings() -> dict[str, Any]:
     return {
         "stageTargetDays": {"draft": 2, "review": 5, "negotiation": 10, "approval": 3,
@@ -312,6 +317,9 @@ def default_settings() -> dict[str, Any]:
                           "events": {"assigned": True, "sent_back": True, "approved": True,
                                      "overdue": True, "escalated": True}},
         "teamsWebhookConfigured": False,
+        # The organisation, set during organisation setup (Settings → Overview).
+        "organization": {"name": None, "defaultCurrency": "USD", "fiscalYearStartMonth": 1,
+                         "confirmedSteps": [], "setupCompletedAt": None},
     }
 
 
@@ -322,6 +330,8 @@ def get_settings(tenant_id: str) -> dict[str, Any]:
     for key, value in stored.items():
         if key == "stageTargetDays" and isinstance(value, dict):
             out["stageTargetDays"].update({k: v for k, v in value.items() if k in STAGES})
+        elif key == "organization" and isinstance(value, dict):
+            out["organization"].update({k: v for k, v in value.items() if k in out["organization"]})
         elif key == "notifications" and isinstance(value, dict):
             out["notifications"].update({k: v for k, v in value.items() if k != "events"})
             if isinstance(value.get("events"), dict):
@@ -440,6 +450,37 @@ def validate_settings(body: Any, current: dict[str, Any]) -> dict[str, Any]:
                 raise BadRequest("notifications.events has an unknown event")
             merged["events"].update({k: bool(v) for k, v in n["events"].items()})
         out["notifications"] = merged
+    if "organization" in body:
+        org = body["organization"]
+        if not isinstance(org, dict):
+            raise BadRequest("organization must be an object")
+        merged = dict((current.get("organization") or default_settings()["organization"]))
+        if "name" in org:
+            name = org["name"]
+            if name is not None and (not isinstance(name, str) or not name.strip() or len(name.strip()) > 120):
+                raise BadRequest("organization.name must be 1–120 characters or null")
+            merged["name"] = name.strip() if isinstance(name, str) else None
+        if "defaultCurrency" in org:
+            cur = org["defaultCurrency"]
+            if not isinstance(cur, str) or not re.fullmatch(r"[A-Za-z]{3}", cur):
+                raise BadRequest("organization.defaultCurrency must be a 3-letter currency code")
+            merged["defaultCurrency"] = cur.upper()
+        if "fiscalYearStartMonth" in org:
+            m = org["fiscalYearStartMonth"]
+            if isinstance(m, bool) or not isinstance(m, int) or not 1 <= m <= 12:
+                raise BadRequest("organization.fiscalYearStartMonth must be a month number, 1–12")
+            merged["fiscalYearStartMonth"] = m
+        if "confirmedSteps" in org:
+            steps = org["confirmedSteps"]
+            if not isinstance(steps, list) or any(s_ not in SETUP_STEPS for s_ in steps):
+                raise BadRequest(f"organization.confirmedSteps may only name: {', '.join(SETUP_STEPS)}")
+            merged["confirmedSteps"] = [s_ for s_ in SETUP_STEPS if s_ in steps]
+        if "setupCompletedAt" in org:
+            v = org["setupCompletedAt"]
+            if v is not None and (not isinstance(v, str) or parse_iso(v) is None):
+                raise BadRequest("organization.setupCompletedAt must be a timestamp or null")
+            merged["setupCompletedAt"] = v
+        out["organization"] = merged
     return out
 
 
@@ -586,17 +627,17 @@ def waiting_on(c: dict[str, Any]) -> dict[str, Any]:
         if state == "intake" and c.get("stage") == "draft":
             return {"kind": "nobody", "label": "Sonar is still reading this agreement", "office": None, "person": None}
         if owner:
-            return {"kind": "osu_reviewer", "label": f"Waiting on OSU reviewer ({display(owner)})",
+            return {"kind": "internal_reviewer", "label": f"Waiting on reviewer ({display(owner)})",
                     "office": None, "person": owner}
-        return {"kind": "osu_reviewer", "label": "Waiting on an OSU reviewer to pick this up",
+        return {"kind": "internal_reviewer", "label": "Waiting on a reviewer to pick this up",
                 "office": None, "person": None}
     if state == "escalated":
         pending = pending_offices(c)
         if pending:
-            return {"kind": "osu_office", "label": f"Waiting on {office_label(pending[0])}",
+            return {"kind": "internal_office", "label": f"Waiting on {office_label(pending[0])}",
                     "office": pending[0], "person": None}
-        return {"kind": "osu_reviewer", "label": f"Waiting on OSU reviewer ({display(owner)})" if owner
-                else "Waiting on an OSU reviewer", "office": None, "person": owner}
+        return {"kind": "internal_reviewer", "label": f"Waiting on reviewer ({display(owner)})" if owner
+                else "Waiting on a reviewer", "office": None, "person": owner}
     if state == "sent_back":
         name = c.get("counterparty") or c.get("sponsor")
         label = f"Waiting on {counterparty_noun(c)}" + (f" ({name})" if name else "")
@@ -604,7 +645,7 @@ def waiting_on(c: dict[str, Any]) -> dict[str, Any]:
     if state in ("ready_to_sign", "out_for_signature"):
         signatory = (c.get("signature") or {}).get("signatory")
         if state == "ready_to_sign":
-            label = "Ready to sign: waiting on the OSU signatory"
+            label = "Ready to sign: waiting on the signatory"
         else:
             label = "Waiting on signature" + (f" ({display(signatory)})" if signatory else "")
         return {"kind": "signatory", "label": label, "office": None, "person": signatory}
@@ -718,8 +759,8 @@ def next_step(c: dict[str, Any], analysis_status: str, now: datetime) -> dict[st
                 return office_step(office, [x for x in hard if (x.get("office") or _review_clause(c, x.get("clauseType")).get("office")) == office], True)
         clauses = [_step_clause(c, r) for r in hard]
         names = ", ".join(x["label"] for x in clauses[:3])
-        return step("reject", f"Reject: {names} {'is' if len(clauses) == 1 else 'are'} unacceptable under OSU's matrix with no fallback.",
-                    "Or send it back if the other side may still agree to OSU's standard terms.", None, clauses)
+        return step("reject", f"Reject: {names} {'is' if len(clauses) == 1 else 'are'} unacceptable under your matrix with no fallback.",
+                    "Or send it back if the other side may still agree to your standard terms.", None, clauses)
     # 5. Blockers that need an office that has not approved.
     for r in refs:
         office = r.get("office")
@@ -750,7 +791,7 @@ def next_step(c: dict[str, Any], analysis_status: str, now: datetime) -> dict[st
         return step("approve", f"{office_label(pending[0])} to approve.", None, pending[0])
     if state == "sent_back":
         return step("approve", "Approve if the other side accepted the changes.", None)
-    return step("approve", "Approve: nothing in this agreement is outside OSU's matrix.", None)
+    return step("approve", "Approve: nothing in this agreement is outside your matrix.", None)
 
 
 def to_api(c: dict[str, Any], now: datetime | None = None, cfg: dict[str, Any] | None = None,
@@ -929,7 +970,7 @@ def _blocker_view(b: dict[str, Any]) -> dict[str, Any]:
                                   "createdAt", "createdBy", "closedAt", "closedBy")}
 
 
-def _obligation_view(o: dict[str, Any]) -> dict[str, Any]:
+def obligation_view(o: dict[str, Any]) -> dict[str, Any]:
     return {k: o.get(k) for k in ("id", "kind", "title", "dueDate", "amount", "status", "source", "completedAt")}
 
 
@@ -955,7 +996,7 @@ def detail(c: dict[str, Any], *, now: datetime | None = None, cfg: dict[str, Any
                          "round": int(rounds.get(doc_id) or 1), "matrixCounts": counts.get(doc_id)})
     out.update({
         "blockers": [_blocker_view(b) for b in blockers or []],
-        "obligations": [_obligation_view(o) for o in obligations or []],
+        "obligations": [obligation_view(o) for o in obligations or []],
         "licensingIncome": [_income_view(i) for i in income or []],
         "review": review,
         "activity": [_activity_view(e) for e in (activity or [])[:200]],
@@ -1739,7 +1780,8 @@ _HURON_RE = re.compile(r"Huron\s+(?:Agreement|Record|Contract)?\s*(?:No\.?|Numbe
 _WORKDAY_RE = re.compile(r"Workday\s+(?:Ref(?:erence)?|ID|No\.?|Number|Award)\s*(?:No\.?|ID)?\s*[:#]?\s*([A-Z]{1,6}-[\w-]{2,40}|\w*\d[\w-]{2,40})", re.I)
 _PI_RE = re.compile(r"Principal\s+Investigator\s*(?:\(PI\))?\s*[:\-]\s*((?:Dr\.?|Prof\.?|Professor)?\s*[A-Z][\w.'-]+(?:\s+[A-Z][\w.'-]+){0,3})")
 _DEPT_RE = re.compile(r"\bDepartment(?:\s+of)?\s*[:\-]\s*([A-Z][\w&,.' -]{2,80}?)(?:\n|;|$|\.\s)")
-_OSU_RE = re.compile(r"\bohio state\b|\bOSU\b|\bthe university\b", re.I)
+# "Our" party, to tell it apart from the counterparty.
+_US_RE = re.compile(r"\buniversity\b|\binstitution\b|\bcollege\b|\bour organi[sz]ation\b", re.I)
 # Prose forms used in preambles: 'Dr. Priya Raman (the "Principal Investigator")',
 # 'Department of Materials Science & Engineering, College of Engineering'.
 _PI_PROSE_RE = re.compile(r"((?:Dr\.|Prof\.|Professor)\s+[A-Z][\w.'-]+(?:\s+[A-Z][\w.'-]+){0,3})\s*\(\s*(?:the\s+)?[\"“]?(?:Principal\s+Investigator|PI)\b")
@@ -1753,7 +1795,7 @@ _HEADER_LABELS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("huronRecordId", re.compile(r"^Huron\s+(?:Agreement|Record|Contract)\s*(?:No\.?|Number|ID|#)?\s*[:#]?\s*(.+)$", re.I)),
     ("workdayRef", re.compile(r"^Workday\s+(?:Ref(?:erence)?|ID|Award(?:\s+ID)?)\.?\s*(?:No\.?)?\s*[:#]?\s*(.+)$", re.I)),
     ("piName", re.compile(r"^(?:Principal\s+Investigator(?:\s*\(PI\))?|PI)\s*[:\-]\s*(.+)$", re.I)),
-    ("department", re.compile(r"^(?:Department|Dept\.?|OSU\s+Department)\s*[:\-]\s*(.+)$", re.I)),
+    ("department", re.compile(r"^(?:[A-Z][\w.]*\s+)?(?:Department|Dept\.?)\s*[:\-]\s*(.+)$", re.I)),
     ("college", re.compile(r"^College\s*[:\-]\s*(.+)$", re.I)),
     ("sponsor", re.compile(r"^Sponsor(?:\s+Name)?\s*[:\-]\s*(.+)$", re.I)),
     ("licensee", re.compile(r"^Licensee(?:\s+Name)?\s*[:\-]\s*(.+)$", re.I)),
@@ -1833,7 +1875,7 @@ def infer_fields(meta: dict[str, Any], classification: dict[str, Any] | None,
         direction = "incoming"
     header = parse_header(header_text)
     parties = [str(p) for p in (cls.get("parties") or meta.get("parties") or []) if p]
-    others = [p for p in parties if not _OSU_RE.search(p)]
+    others = [p for p in parties if not _US_RE.search(p)]
     counterparty = (others or [None])[0]
     if agreement_type in ("license", "option") and header.get("licensee"):
         counterparty = header["licensee"]
@@ -2075,7 +2117,7 @@ def _counts_text(counts: dict[str, Any]) -> str:
     parts = [f"{_plural(need, 'clause')} {'needs' if need == 1 else 'need'} attention" if need else "nothing outside the matrix",
              f"{good} within the matrix or its fallback"]
     if counts.get("beneficial"):
-        parts.append(f"{counts['beneficial']} beneficial to OSU")
+        parts.append(f"{counts['beneficial']} favourable to you")
     return "; ".join(parts)
 
 

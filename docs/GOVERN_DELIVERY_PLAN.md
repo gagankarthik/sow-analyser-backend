@@ -1,6 +1,6 @@
-# Govern for OSU — agile delivery plan and design decisions
+# Govern for the customer — agile delivery plan and design decisions
 
-Goal: help OSU make better and faster contract decisions, with visibility into
+Goal: help the customer make better and faster contract decisions, with visibility into
 where every contract is, what it is worth and how the trends are moving, while
 capture never misses a document or a field.
 
@@ -10,7 +10,7 @@ capture never misses a document or a field.
   demonstrable on its own. No layer is built ahead of a screen that uses it.
 * **Definition of done.** Contract in `GOVERN_API.md` honoured; offline tests
   green; `tsc`, ESLint and `next build` clean; loading / error / empty states;
-  works at 360 px, iPad and laptop; plain-language copy passes the "Becky test"
+  works at 360 px, iPad and laptop; plain-language copy passes the "leader test"
   (a non-technical leader answers her question without help).
 * **One source of truth.** Wording in `lib/govern/labels.ts`, maths in
   `lib/govern/metrics.ts`, transitions in `shared/govern/workflow.py`. A figure or
@@ -28,15 +28,15 @@ capture never misses a document or a field.
 | 4 | Approve / send back / escalate / reject + activity log | R2 | Each action moves the card and writes a log entry with user and time | Mon Oct 12 |
 | 5 | Blockers and recommended next step | R3 | Each unsigned contract lists its open items and one recommended action | Tue Oct 13 |
 | 6 | Current / potential / held-up value tiles | R4 | Tile totals match the sample contracts | Tue Oct 13 |
-| 7 | Leader home (three questions) + plain-word search | R5 | Becky reaches any contract's blockers in ≤ 3 clicks | Tue Oct 13 |
+| 7 | Leader home (three questions) + plain-word search | R5 | the general counsel reaches any contract's blockers in ≤ 3 clicks | Tue Oct 13 |
 | — | Dry run of the demo story; stable demo build | — | Story runs end to end with no manual fixes | Oct 13–14 |
 | 8 | Intake on upload, capture gaps, reconciliation sweep | R2, capture | Every upload is a contract within seconds; nothing missing is silent | Sprint 2 |
 | 9 | Bottleneck report, value report, Excel/PDF export | R3, R4 | Every report downloads and matches the screen | Sprint 2 |
 | 10 | Trends (write-time aggregates) | decisions | 12 months of throughput, cycle time and deviation trends in < 1 s | Sprint 2 |
 | 11 | Routing rules, notifications (SES, Teams), overdue sweeper | R2 | Assign / send back / approve / overdue alerts arrive | Sprint 2 |
 | 12 | Obligations, licensing income, renewals and close-out | R2, R4 | Signing extracts obligations with due dates | Sprint 3 |
-| 13 | DocuSign webhook, Huron and Workday connectors, sync log, manual match | R6 | Live once OSU security review and credentials are in place | Sprint 3+ |
-| 14 | OSU SSO (Cognito SAML) and Govern roles | R6 | Roles carry over from OSU's IdP | Sprint 3+ |
+| 13 | DocuSign webhook, Huron and Workday connectors, sync log, manual match | R6 | Live once the customer security review and credentials are in place | Sprint 3+ |
+| 14 | the customer SSO (Cognito SAML) and Govern roles | R6 | Roles carry over from the customer's IdP | Sprint 3+ |
 
 The code for all slices is built now. The order above is the order of
 **hardening, demo and rollout**, so the Oct 14 demo leads with slices 1–7 and
@@ -60,9 +60,9 @@ nothing later can block it.
 
 ## Risks and mitigations
 
-* **OSU matrix not yet shared.** The default matrix is a proposal, versioned; the
+* **the customer matrix not yet shared.** The default matrix is a proposal, versioned; the
   real one imports from Excel in minutes and old reviews keep their version.
-* **Sample data.** OSU-style samples under `samples/osu/` until redacted
+* **Sample data.** research and licensing samples under `samples/research/` until redacted
   agreements arrive through the sandbox.
-* **Identity.** Until OSU SSO is wired, Govern roles come from Cognito groups;
+* **Identity.** Until the customer SSO is wired, Govern roles come from Cognito groups;
   a sandbox runs with `GOVERN_OPEN_ADMIN=true`.

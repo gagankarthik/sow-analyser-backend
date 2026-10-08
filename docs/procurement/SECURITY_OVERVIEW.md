@@ -1,6 +1,6 @@
-# Blue-IQ Govern: security overview for The Ohio State University
+# Blue-IQ Govern: security overview for the customer university
 
-Prepared 2026-10-08. Audience: OSU Office of Technology and Digital Innovation (OTDI), Legal Affairs, Privacy, Procurement.
+Prepared 2026-10-08. Audience: the customer Office of Technology and Digital Innovation (OTDI), Legal Affairs, Privacy, Procurement.
 
 **Evidence rule.** Every statement here comes from the code or Terraform in `sow-analyser-backend` and `sow-analyzer` as of this date. File references are given. Anything we could not verify from the repository is marked **To confirm**. Gaps are stated as gaps.
 
@@ -21,7 +21,7 @@ Blue-IQ Govern is a serverless application on AWS. Users upload agreements. A pi
 | AI | OpenAI API: chat (`gpt-4.1-mini` by default) and embeddings (`text-embedding-3-small`) | `terraform/variables.tf`, `lambdas/shared/config.py` |
 | OCR | Amazon Textract (scanned PDFs only) | `terraform/iam.tf` (parse policy) |
 
-## 2. Where OSU data lives
+## 2. Where the customer data lives
 
 | Data | Store | Region | Encryption at rest | Notes |
 |---|---|---|---|---|
@@ -34,7 +34,7 @@ Blue-IQ Govern is a serverless application on AWS. Users upload agreements. A pi
 | Application logs | CloudWatch Logs | same | CloudWatch default | 30-day retention (`var.log_retention_days`) |
 | Failed pipeline events | SQS DLQ | same | SQS-managed SSE | 14-day retention; TLS-only policy |
 
-**Customer-managed KMS keys (CMK):** none are configured. All encryption uses AWS-owned or AWS-managed keys. CMKs are a configuration change (S3 `aws:kms`, DynamoDB `kms_key_arn`, OpenSearch `kms_key_id`) and can be offered for OSU.
+**Customer-managed KMS keys (CMK):** none are configured. All encryption uses AWS-owned or AWS-managed keys. CMKs are a configuration change (S3 `aws:kms`, DynamoDB `kms_key_arn`, OpenSearch `kms_key_id`) and can be offered for the customer.
 
 ## 3. Encryption in transit
 
@@ -60,7 +60,7 @@ The public website says "TLS 1.3". The minimum enforced in our configuration is 
 | SOW drafting questionnaire (frontend feature) | Draft generation | Same placeholder redaction (`sow-analyzer/lib/sow/guardrails.ts`) |
 
 **Not sent to OpenAI:**
-- Govern matrix review (grading clauses against the OSU matrix). It is deterministic code (`lambdas/shared/govern/matrix.py`). No Govern module imports the OpenAI client.
+- Govern matrix review (grading clauses against the the customer matrix). It is deterministic code (`lambdas/shared/govern/matrix.py`). No Govern module imports the OpenAI client.
 - Workflow, assignments, comments, approvals and the activity log.
 - User identities and account data (other than any that appear inside a document).
 - Original files. Only extracted text is sent.
@@ -72,7 +72,7 @@ The public website says "TLS 1.3". The minimum enforced in our configuration is 
 
 **Current configuration:** Terraform does not set `AI_PROVIDER`, so the default `openai` applies (`zero_retention=False`). Under OpenAI's API terms, API inputs are not used for training by default. They may be kept for up to 30 days for abuse monitoring unless Zero Data Retention (ZDR) is approved for the account. **ZDR is not yet enabled, and a DPA with OpenAI is not yet signed.** See `SUBPROCESSORS.md`.
 
-**Option for OSU:** the allowlist already includes `bedrock`. That would keep inference inside the AWS account. A Bedrock client is **not implemented** today: this is a roadmap option, not a switch.
+**Option for the customer:** the allowlist already includes `bedrock`. That would keep inference inside the AWS account. A Bedrock client is **not implemented** today: this is a roadmap option, not a switch.
 
 ## 5. Identity, authentication and authorisation
 
@@ -94,7 +94,7 @@ The public website says "TLS 1.3". The minimum enforced in our configuration is 
 - Within a workspace, nobody sees a document unless they uploaded it or are a member of a project that lists it. The project record is the source of truth (`access.py`).
 - Search and chat apply the permitted-document filter *inside* the OpenSearch query, not after it. With no permitted documents, no search runs and no model call is made (`docs/ARCHITECTURE.md` §8).
 - Govern contract visibility equals document visibility (`govern_api/handler.py` docstring).
-- Isolation is logical (shared tables, shared index, partitioned by key and filter). A dedicated single-tenant deployment for OSU, in its own AWS account, is possible with the same Terraform. **To confirm** commercially.
+- Isolation is logical (shared tables, shared index, partitioned by key and filter). A dedicated single-tenant deployment for the customer, in its own AWS account, is possible with the same Terraform. **To confirm** commercially.
 
 ## 7. IAM least privilege
 
@@ -160,7 +160,7 @@ From `terraform/iam.tf` and `lambda.tf`:
 | Item | Status |
 |---|---|
 | Responsible disclosure address | `security@blue-iq.ai` (published on `/security`) |
-| Third-party penetration test | **Not yet performed.** To be commissioned before the OSU pilot |
+| Third-party penetration test | **Not yet performed.** To be commissioned before the the customer pilot |
 | Dependency scanning (Dependabot / pip-audit / npm audit) | **Not configured** in the repo |
 | Patch cadence | Managed runtimes (Lambda, OpenSearch service updates). Written SLA **not yet defined** |
 | Proposed SLA | Critical 7 days, High 30 days, Medium 90 days, from confirmation |
@@ -172,9 +172,9 @@ No written incident response plan exists in the repository. This outline is prop
 1. **Detect:** CloudWatch alarms on errors and DLQ depth; GuardDuty (to enable); reports to `security@blue-iq.ai`.
 2. **Triage** within 4 business hours. Severity S1–S4. Named incident lead.
 3. **Contain:** revoke Cognito sessions, rotate the OpenAI key and integration secrets, disable affected routes, and snapshot evidence.
-4. **Notify:** OSU contact without undue delay and within 72 hours of awareness (the commitment in our published DPA summary). Align to the OSU contract if it is stricter.
+4. **Notify:** the customer contact without undue delay and within 72 hours of awareness (the commitment in our published DPA summary). Align to the the customer contract if it is stricter.
 5. **Recover** from PITR and S3 versions, then re-run analysis to rebuild the search index.
-6. **Review:** written post-incident report to OSU within 10 business days.
+6. **Review:** written post-incident report to the customer within 10 business days.
 
 Owner: Blue-IQ security lead. The plan must be written, approved and tested (tabletop) before the pilot.
 

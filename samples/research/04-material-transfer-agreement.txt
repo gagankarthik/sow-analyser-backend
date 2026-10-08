@@ -3,7 +3,7 @@ MATERIAL TRANSFER AGREEMENT (INCOMING)
 Huron Agreement No. AGR00012417
 Workday Ref: WD-NF-000318 (no funds)
 
-This Material Transfer Agreement (the "Agreement") is entered into as of October 12, 2026 (the "Effective Date") by and between Great Lakes Cell Therapeutics, Inc., a Pennsylvania corporation ("Provider"), and The Ohio State University, an instrumentality of the State of Ohio ("University"), for the benefit of Dr. Hannah Lee, Department of Microbial Infection and Immunity, College of Medicine (the "Recipient Scientist").
+This Material Transfer Agreement (the "Agreement") is entered into as of October 12, 2026 (the "Effective Date") by and between Great Lakes Cell Therapeutics, Inc., a Pennsylvania corporation ("Provider"), and Northfield University, an instrumentality of the State of Minnesota ("University"), for the benefit of Dr. Hannah Lee, Department of Microbial Infection and Immunity, College of Medicine (the "Recipient Scientist").
 
 1. MATERIAL
 
@@ -31,7 +31,7 @@ This Material Transfer Agreement (the "Agreement") is entered into as of October
 
 7. LIABILITY AND INDEMNIFICATION
 
-7.1 Each party shall be responsible for its own acts and omissions. University shall indemnify Provider for claims arising from University's use of the Material only to the extent permitted by the laws of the State of Ohio.
+7.1 Each party shall be responsible for its own acts and omissions. University shall indemnify Provider for claims arising from University's use of the Material only to the extent permitted by the laws of the State of Minnesota.
 
 8. GOVERNING LAW
 
@@ -43,7 +43,7 @@ This Material Transfer Agreement (the "Agreement") is entered into as of October
 
 IN WITNESS WHEREOF, the parties have executed this Agreement as of the Effective Date.
 
-GREAT LAKES CELL THERAPEUTICS, INC.           THE OHIO STATE UNIVERSITY
+GREAT LAKES CELL THERAPEUTICS, INC.           NORTHFIELD UNIVERSITY
 By: ______________________                   By: ______________________
 Name: Andrea Kowalski                         Title: Director, Technology Commercialization
 Read and understood: Dr. Hannah Lee, Recipient Scientist

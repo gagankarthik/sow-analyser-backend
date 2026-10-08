@@ -16,7 +16,7 @@ Direction     = "incoming" | "outgoing"         # incoming = sponsor funding, li
 Stage         = "draft" | "review" | "negotiation" | "approval" | "signed" | "active" | "renewal" | "expired"
 State         = "intake" | "in_review" | "sent_back" | "escalated" | "ready_to_sign"
               | "out_for_signature" | "signed" | "active" | "rejected" | "closed"
-WaitingOnKind = "osu_reviewer" | "osu_office" | "counterparty" | "pi_department" | "signatory" | "nobody"
+WaitingOnKind = "internal_reviewer" | "internal_office" | "counterparty" | "pi_department" | "signatory" | "nobody"
 Office        = "legal_affairs" | "tech_commercialization" | "sponsored_programs" | "export_control" | "risk_management"
 Tier          = "within" | "fallback" | "deviates" | "unacceptable" | "review" | "missing"
 SlaStatus     = "on_track" | "amber" | "red" | "none"
@@ -38,7 +38,7 @@ A new contract whose analysis is still running is `draft` / `intake`.
 ```
 Person     { email: string, name: string | null }
 WaitingOn  { kind: WaitingOnKind, label: string, office: Office | null, person: Person | null }
-           # label is plain words: "Waiting on OSU reviewer (Dana Ruiz)", "Waiting on sponsor", "Waiting on Legal Affairs"
+           # label is plain words: "Waiting on the customer reviewer (Dana Ruiz)", "Waiting on sponsor", "Waiting on Legal Affairs"
 
 MatrixCounts { within, fallback, deviates, unacceptable, review, missing, beneficial: number }
 
@@ -202,11 +202,12 @@ Recommended next step (server-computed; first rule that matches):
 |---|---|---|---|
 | GET | `/matrix` | | `{current: Matrix, versions: MatrixVersionInfo[]}` |
 | GET | `/matrix/versions/{n}` | | `{matrix: Matrix}` |
-| PUT | `/matrix` | `{playbooks, note?, effectiveDate?}` | `{matrix}` — saves a NEW version |
+| PUT | `/matrix` | `{playbooks, note?, effectiveDate?, homeState?}` | `{matrix}` — saves a NEW version; `homeState` left out keeps the current one, `null` clears it |
 | POST | `/matrix/import` | `{agreementType, rows: ImportRow[], mode: "replace" | "merge", note?}` or `{agreementType, csv: string, mode}` | `{matrix, imported: number, skipped: {row: number, reason}[]}` |
 
 ```
 Matrix { version, effectiveDate, createdAt, createdBy: Person | null, note: string | null,
+         homeState: string | null,   # the institution's home state; the governing-law check needs it
          playbooks: { [AgreementType]: { agreementType, label, clauses: MatrixClause[] } } }
 MatrixClause { clauseType, label, standard, fallback: string | null, unacceptable: string[],
                beneficial: string[], escalationOffice: Office | null, suggestedLanguage: string | null,

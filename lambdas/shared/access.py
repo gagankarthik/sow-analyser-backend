@@ -200,3 +200,36 @@ class Caller:
             for project in dynamodb.get_projects(list(roles)):
                 ids.extend(project.get("docIds") or [])
         return list(dict.fromkeys(ids))
+
+
+# ---------------------------------------------------------------------------
+# Workspace-wide settings
+# ---------------------------------------------------------------------------
+
+WORKSPACE_ADMIN_GROUP = "govern-admin"
+
+
+def claim_groups(raw: Any) -> set[str]:
+    """``cognito:groups`` arrives as a list, or (HTTP API JWT authorizer) as a
+    string like ``"[govern-admin reviewers]"`` or ``"a,b"``."""
+    import re
+
+    if isinstance(raw, list):
+        return {str(g).strip() for g in raw if str(g).strip()}
+    if isinstance(raw, str):
+        return {g for g in re.split(r"[\s,\[\]\"']+", raw) if g}
+    return set()
+
+
+def workspace_admin(claims: dict[str, Any], tenant_id: str) -> bool:
+    """May this caller change settings every document in the tenant is graded
+    against (playbook rules, compliance packs)? A personal ``u-<sub>``
+    workspace belongs to its one user; a shared tenant needs the admin group
+    (or the dev-only open-admin sandbox)."""
+    from .config import settings
+
+    if tenant_id.startswith("u-"):
+        return True
+    if WORKSPACE_ADMIN_GROUP in claim_groups(claims.get("cognito:groups")):
+        return True
+    return bool(settings.govern_open_admin)

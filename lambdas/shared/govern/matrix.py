@@ -1,4 +1,4 @@
-"""OSU review matrix — per-agreement-type playbooks, deterministic grading, and
+"""your organization review matrix — per-agreement-type playbooks, deterministic grading, and
 the deterministic extractors Govern needs after a document is analysed.
 
 WHAT THE MATRIX IS
@@ -10,16 +10,16 @@ clause names a clause type (a known category id such as ``"PublicationRights"``,
 or ``type.<key>`` for a custom type, exactly like ``shared/playbook.py``) and
 carries:
 
-  standard            OSU's standard position (text shown to reviewers)
+  standard            your organization's standard position (text shown to reviewers)
   fallback            the acceptable fallback position, or None
-  unacceptable        phrases OSU never accepts (literal, case-insensitive)
-  beneficial          phrases that are favourable to OSU
+  unacceptable        phrases your organization never accepts (literal, case-insensitive)
+  beneficial          phrases that are favourable to your organization
   escalationOffice    the office that must review a deviation, or None
-  suggestedLanguage   the redline OSU proposes when the clause deviates
+  suggestedLanguage   the redline your organization proposes when the clause deviates
   thresholds          numbers the built-in check reads ("maxReviewDays": 30)
   required            a required clause missing from the document is a finding
 
-``default_matrix()`` is the proposed OSU-style matrix (OSU to confirm). Admins
+``default_matrix()`` is the proposed your organization-style matrix (your organization to confirm). Admins
 replace it through ``PUT /matrix`` (``validate_matrix``) or a CSV/Excel import
 (``parse_import`` + ``merge_import``); every save is a new version and every
 review records the version it used.
@@ -39,17 +39,17 @@ For every clause of the agreement type's playbook:
      negation ("Nothing in this Agreement waives …") does not count.
   3. The result is one tier:
 
-       within        inside OSU's standard position
+       within        inside your organization's standard position
        fallback      outside the standard but inside the acceptable fallback
        deviates      outside the fallback — needs a change
-       unacceptable  a term OSU never accepts (or an unacceptable phrase)
+       unacceptable  a term your organization never accepts (or an unacceptable phrase)
        review        the clause is there but its text does not settle the
                      question (or the rule has no automatic check) — a human
                      must compare it with the standard position
        missing       a REQUIRED matrix clause has no matching clause at all
 
      and, independently, ``beneficial`` when the clause carries a term that is
-     favourable to OSU (equity, a minimum annual royalty, dated diligence
+     favourable to your organization (equity, a minimum annual royalty, dated diligence
      milestones, a matching beneficial phrase …).
 
 A matrix clause that is not required and is absent from the document is not
@@ -109,7 +109,7 @@ OFFICE_LABELS: dict[str, str] = {
 }
 
 # The ten research / licensing clause types the built-in checks cover.
-OSU_CLAUSE_TYPES: list[str] = [
+RESEARCH_CLAUSE_TYPES: list[str] = [
     "PublicationRights", "BackgroundIP", "LicenseScope", "Royalties", "Indemnity",
     "GoverningLaw", "ExportControl", "DataRights", "SponsorReporting", "Diligence",
 ]
@@ -123,16 +123,16 @@ _MATRIX_LABELS: dict[str, str] = {
     "BackgroundIP": "Background and foreground IP ownership",
     "LicenseScope": "License grant scope (exclusivity, field of use, territory)",
     "Royalties": "Royalties, milestones, equity and sublicense income",
-    "Indemnity": "Indemnification and insurance (public university)",
-    "GoverningLaw": "Governing law (Ohio) and sovereign immunity",
+    "Indemnity": "Indemnification and insurance",
+    "GoverningLaw": "Governing law and sovereign immunity",
     "ExportControl": "Export control and foreign party restrictions",
-    "DataRights": "Data rights, confidentiality term and use of OSU name",
+    "DataRights": "Data rights, confidentiality term and use of your organization's name",
     "SponsorReporting": "Sponsor reporting and grant flow-down terms",
     "Diligence": "Diligence and termination for failure to commercialize",
 }
 
 DEFAULT_EFFECTIVE_DATE = "2026-10-08"
-DEFAULT_NOTE = "OSU-style default matrix (proposed; OSU to confirm)"
+DEFAULT_NOTE = "Default research and licensing matrix (edit to match your positions)"
 
 _TIER_RANK = {"within": 0, "fallback": 1, "review": 2, "deviates": 3, "unacceptable": 4}
 _QUOTE_CHARS = 600
@@ -241,14 +241,15 @@ def _th(thresholds: dict[str, Any], key: str) -> float:
     return float(_THRESHOLD_DEFAULTS.get(key, 0))
 
 
-_OSU = r"(?:the\s+)?(?:university|osu|ohio\s+state)"
+# "Our" party in a research or licensing agreement.
+_US = r"(?:the\s+)?(?:university|institution|college|our\s+organi[sz]ation)"
 _OTHER = (r"(?:the\s+)?(?:sponsor|licensee|optionee|company|recipient|subrecipient|provider|collaborator|"
           r"pass-through\s+entity|contractor)")
 
 
 class _Check(NamedTuple):
     """Outcome of a built-in check: tier, reason sentence, value read, and the
-    reason the clause is beneficial to OSU (None if it is not)."""
+    reason the clause is beneficial to your organization (None if it is not)."""
 
     tier: str
     reason: str | None = None
@@ -275,7 +276,7 @@ def _check_publication(text: str, th: dict[str, Any]) -> _Check:
         low = s.lower()
         # (pattern, whether a preceding negation cancels it)
         for pattern, negatable in (
-                (rf"{_OSU}\s+(?:shall|may|will)\s+not\s+publish", False),
+                (rf"{_US}\s+(?:shall|may|will)\s+not\s+publish", False),
                 (r"(?:prohibit|prevent|block|veto)\w*[^.;]{0,60}publication", True),
                 (r"(?:approval|consent)\s+of\s+(?:the\s+)?(?:sponsor|company|provider|licensee)", True),
                 (r"(?:sponsor|company|provider|licensee)'?s?\s+(?:prior\s+)?(?:written\s+)?"
@@ -283,7 +284,7 @@ def _check_publication(text: str, th: dict[str, Any]) -> _Check:
             m = re.search(pattern, low)
             if m and not (negatable and _negated(low, m.start())):
                 return _Check("unacceptable", "Publication needs the other party's approval or can be blocked; "
-                                              "OSU must keep the right to publish.", "sponsor approval of publications")
+                                              "your organization must keep the right to publish.", "sponsor approval of publications")
     review = deferral = 0
     for s in sents:
         for days, unit, pos in _durations(s):
@@ -298,7 +299,7 @@ def _check_publication(text: str, th: dict[str, Any]) -> _Check:
     if total == 0:
         if re.search(r"(?:free|right)\s+to\s+publish|may\s+publish", text, re.IGNORECASE):
             return _Check("within", None, "right to publish, no review delay")
-        return _Check("review", "No publication review period was found; the matrix requires OSU's right to "
+        return _Check("review", "No publication review period was found; the matrix requires your organization's right to "
                                 f"publish with a review of no more than {_fmt(max_days)} days.")
     found = f"{review} days' review" + (f" + {deferral} days' patent delay" if deferral else "")
     if total <= max_days:
@@ -311,38 +312,38 @@ def _check_publication(text: str, th: dict[str, Any]) -> _Check:
 
 
 def _check_background_ip(text: str, th: dict[str, Any]) -> _Check:
-    """OSU keeps its background IP and owns inventions made by its employees; the
+    """your organization keeps its background IP and owns inventions made by its employees; the
     other party may get an option or a non-exclusive research licence. An
-    assignment of OSU's rights or "work made for hire" is unacceptable."""
+    assignment of your organization's rights or "work made for hire" is unacceptable."""
     low = re.sub(r"\s+", " ", (text or "").lower())
     for pattern in (r"works?\s+(?:made\s+)?for\s+hire",
-                    rf"{_OSU}\s+(?:hereby\s+)?(?:assigns?|shall\s+assign|agrees\s+to\s+assign|transfers?)\b",
+                    rf"{_US}\s+(?:hereby\s+)?(?:assigns?|shall\s+assign|agrees\s+to\s+assign|transfers?)\b",
                     r"\b(?:all|any)\s+(?:right,?\s+title\s+and\s+interest\s+in\s+(?:and\s+to\s+)?)?"
                     r"(?:inventions?|intellectual\s+property|results|foreground\s+ip|developments)"
                     rf"[^.;]{{0,120}}(?:owned\s+(?:solely\s+|exclusively\s+)?by|property\s+of|vest\s+in|belong\s+to)\s+{_OTHER}"):
         m = re.search(pattern, low)
         if m and not _negated(low, m.start(), 40):
-            return _Check("unacceptable", "OSU would assign or give up ownership of its inventions or background "
-                                          "IP; OSU owns inventions made by its employees.", "assignment of OSU IP")
+            return _Check("unacceptable", "your organization would assign or give up ownership of its inventions or background "
+                                          "IP; your organization owns inventions made by its employees.", "assignment of your organization IP")
     exclusive_royalty_free = (r"royalty[- ]free[^.;]{0,40}(?<!non-)(?<!non)\bexclusive"
                               r"|(?<!non-)(?<!non)\bexclusive[^.;]{0,40}royalty[- ]free")
     if re.search(exclusive_royalty_free, low):
-        return _Check("deviates", "The other party gets a royalty-free exclusive licence to OSU inventions; the "
+        return _Check("deviates", "The other party gets a royalty-free exclusive licence to your organization inventions; the "
                                   "matrix allows an option to negotiate or a non-exclusive research licence.",
                       "royalty-free exclusive licence")
     beneficial = None
-    if re.search(rf"{_OTHER}\s+(?:hereby\s+)?grants?\s+(?:back\s+)?to\s+{_OSU}[^.;]{{0,120}}licen[cs]e", low):
-        beneficial = "OSU receives a licence back to the other party's improvements."
-    if re.search(rf"(?:each\s+party|{_OSU})\s+(?:shall\s+|will\s+)?(?:retain|retains|own|owns|hold|holds|keep)"
-                 rf"|title\s+[^.;]{{0,80}}(?:remain|vest)s?\s+(?:with|in)\s+{_OSU}"
-                 rf"|(?:owned\s+by|property\s+of|vest\s+in)\s+{_OSU}|background[^.;]{{0,80}}retain", low):
-        return _Check("within", None, "OSU retains its IP", beneficial)
-    return _Check("review", "Ownership of background IP and inventions is not stated clearly; confirm OSU retains "
+    if re.search(rf"{_OTHER}\s+(?:hereby\s+)?grants?\s+(?:back\s+)?to\s+{_US}[^.;]{{0,120}}licen[cs]e", low):
+        beneficial = "your organization receives a licence back to the other party's improvements."
+    if re.search(rf"(?:each\s+party|{_US})\s+(?:shall\s+|will\s+)?(?:retain|retains|own|owns|hold|holds|keep)"
+                 rf"|title\s+[^.;]{{0,80}}(?:remain|vest)s?\s+(?:with|in)\s+{_US}"
+                 rf"|(?:owned\s+by|property\s+of|vest\s+in)\s+{_US}|background[^.;]{{0,80}}retain", low):
+        return _Check("within", None, "your organization retains its IP", beneficial)
+    return _Check("review", "Ownership of background IP and inventions is not stated clearly; confirm your organization retains "
                             "its background IP and owns inventions made by its employees.", None, beneficial)
 
 
 def _check_license_scope(text: str, th: dict[str, Any]) -> _Check:
-    """A licence limited to a defined field of use, with OSU's reserved rights to
+    """A licence limited to a defined field of use, with your organization's reserved rights to
     practise the technology for research, teaching and education."""
     low = re.sub(r"\s+", " ", (text or "").lower())
     reserved = re.search(r"reserv\w*[^.;]{0,200}(?:research|educational|teaching|academic|non-?commercial)", low)
@@ -353,12 +354,12 @@ def _check_license_scope(text: str, th: dict[str, Any]) -> _Check:
     if reserved and not all_fields:
         return _Check("within", None, "field-limited, research rights reserved")
     if reserved:
-        return _Check("fallback", "The licence covers all fields of use; OSU's research rights are reserved, which "
+        return _Check("fallback", "The licence covers all fields of use; your organization's research rights are reserved, which "
                                   "the matrix accepts as a fallback.", "all fields, research rights reserved")
     parts = [p for p in ("exclusive" if exclusive else "", "worldwide" if worldwide else "",
                          "in all fields of use" if all_fields else "") if p]
     desc = ", ".join(parts) if parts else "granted"
-    return _Check("deviates", f"The licence is {desc} with no reserved right for OSU to use the technology for "
+    return _Check("deviates", f"The licence is {desc} with no reserved right for your organization to use the technology for "
                               "research and education; the matrix requires a defined field of use and reserved "
                               "research rights.", f"{desc}; no reserved research rights")
 
@@ -389,7 +390,7 @@ def _check_royalties(text: str, th: dict[str, Any]) -> _Check:
                 equity = pct if equity is None else max(equity, pct)
     beneficial = []
     if equity is not None:
-        beneficial.append(f"OSU receives equity ({_fmt(equity)}%)." if equity else "OSU receives equity.")
+        beneficial.append(f"your organization receives equity ({_fmt(equity)}%)." if equity else "your organization receives equity.")
     if minimum:
         beneficial.append("A minimum annual royalty is guaranteed.")
     ben = " ".join(beneficial) or None
@@ -421,35 +422,36 @@ def _check_royalties(text: str, th: dict[str, Any]) -> _Check:
             tiers.append("within")
         else:
             tiers.append("fallback" if sub >= fb_s else "deviates")
-            reasons.append(f"OSU's share of sublicense income is {_fmt(sub)}%; the matrix requires at least "
+            reasons.append(f"your organization's share of sublicense income is {_fmt(sub)}%; the matrix requires at least "
                            f"{_fmt(min_s)}% (fallback {_fmt(fb_s)}%).")
     tier = max(tiers, key=lambda t: _TIER_RANK[t])
     return _Check(tier, " ".join(reasons) or None, "; ".join(found), ben)
 
 
 def _check_indemnity(text: str, th: dict[str, Any]) -> _Check:
-    """OSU, a public university, cannot indemnify. The other party indemnifies OSU
-    and carries insurance. OSU indemnity only "to the extent permitted by Ohio
-    law" is the fallback; an unqualified OSU (or mutual) indemnity is unacceptable."""
+    """your organization does not indemnify. The other party indemnifies your organization
+    and carries insurance. Organization indemnity only "to the extent permitted by its home state
+    law" is the fallback; an unqualified your organization (or mutual) indemnity is unacceptable."""
     worst: _Check | None = None
     other = own = False
     for s in _sentences(text):
         low = s.lower()
-        osu = re.search(rf"\b{_OSU}\s+(?:shall|will|agrees\s+to|hereby\s+agrees\s+to)\s+(?:defend,?\s+)?"
+        ours = re.search(rf"\b{_US}\s+(?:shall|will|agrees\s+to|hereby\s+agrees\s+to)\s+(?:defend,?\s+)?"
                         r"(?:indemnify|hold\s+harmless)", low)
         mutual = re.search(r"\beach\s+party\s+(?:shall|will|agrees\s+to)\s+(?:defend,?\s+)?"
                            r"(?:indemnify|hold\s+harmless)"
                            r"|\bmutual(?:ly)?\s+indemn|indemnify\s+each\s+other", low)
-        if osu or mutual:
+        if ours or mutual:
             if re.search(r"to\s+the\s+extent\s+(?:permitted|authorized|allowed)\s+(?:by|under)\s+(?:the\s+)?"
-                         r"(?:(?:constitution\s+and\s+)?laws?\s+of\s+(?:the\s+state\s+of\s+)?ohio|ohio\s+(?:revised\s+code|law))",
+                         r"(?:(?:constitution\s+and\s+)?laws?\s+of\s+(?:the\s+state\s+of\s+)?[a-z][a-z ]{2,30}?"
+                         r"|applicable\s+(?:state\s+)?law|state\s+law|[a-z]+\s+(?:revised\s+code|law))",
                          low):
-                cand = _Check("fallback", "OSU indemnifies only to the extent permitted by Ohio law, which the "
-                                          "matrix accepts as a fallback.", "OSU indemnity limited by Ohio law")
+                cand = _Check("fallback", "Your organization indemnifies only to the extent permitted by its home-state law, which the "
+                                          "matrix accepts as a fallback.", "Organization indemnity limited by home-state law")
             else:
-                cand = _Check("unacceptable", "OSU is asked to indemnify the other party; as a public university OSU "
-                                              "cannot indemnify (at most, to the extent permitted by Ohio law).",
-                              "OSU indemnifies " + ("each party (mutual)" if mutual and not osu else "the other party"))
+                cand = _Check("unacceptable", "Your organization is asked to indemnify the other party; as a public body your organization "
+                                              "cannot indemnify (at most, to the extent permitted by its home-state law).",
+                              "Your organization indemnifies " + ("each party (mutual)" if mutual and not ours else "the other party"))
             if worst is None or _TIER_RANK[cand.tier] > _TIER_RANK[worst.tier]:
                 worst = cand
         if re.search(rf"\b{_OTHER}\s+(?:shall|will|agrees\s+to|hereby\s+agrees\s+to)\s+(?:defend,?\s+)?"
@@ -457,19 +459,19 @@ def _check_indemnity(text: str, th: dict[str, Any]) -> _Check:
             other = True
         if re.search(r"responsible\s+for\s+(?:its|their)\s+own"
                      r"|neither\s+party\s+shall\s+(?:be\s+required\s+to\s+)?indemnify"
-                     rf"|{_OSU}\s+(?:does\s+not|shall\s+not|cannot|will\s+not)\s+indemnify|no\s+indemnif", low):
+                     rf"|{_US}\s+(?:does\s+not|shall\s+not|cannot|will\s+not)\s+indemnify|no\s+indemnif", low):
             own = True
     beneficial = None
     if other and re.search(r"additional\s+insured", text or "", re.IGNORECASE):
-        beneficial = "The other party indemnifies OSU and names OSU as an additional insured."
+        beneficial = "The other party indemnifies your organization and names your organization as an additional insured."
     if worst is not None:
         return worst._replace(beneficial=beneficial)
     if other:
-        return _Check("within", None, "other party indemnifies OSU", beneficial)
+        return _Check("within", None, "other party indemnifies your organization", beneficial)
     if own:
         return _Check("within", None, "each party responsible for its own acts")
-    return _Check("review", "Who indemnifies whom is not clear; confirm OSU gives no indemnity and the other "
-                            "party indemnifies OSU.")
+    return _Check("review", "Who indemnifies whom is not clear; confirm your organization gives no indemnity and the other "
+                            "party indemnifies your organization.")
 
 
 _US_STATES = [
@@ -477,7 +479,7 @@ _US_STATES = [
     "Florida", "Georgia", "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky",
     "Louisiana", "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota", "Mississippi",
     "Missouri", "Montana", "Nebraska", "Nevada", "New Hampshire", "New Jersey", "New Mexico",
-    "New York", "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon", "Pennsylvania",
+    "New York", "North Carolina", "North Dakota", "its home state", "Oklahoma", "Oregon", "Pennsylvania",
     "Rhode Island", "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah", "Vermont",
     "Virginia", "Washington", "West Virginia", "Wisconsin", "Wyoming", "District of Columbia",
     "England", "England and Wales",
@@ -487,9 +489,12 @@ _STATE_RE = re.compile(r"\b(" + "|".join(sorted(map(re.escape, _US_STATES), key=
 
 
 def _check_governing_law(text: str, th: dict[str, Any]) -> _Check:
-    """Ohio law; no waiver of OSU's sovereign immunity (claims against OSU go to
-    the Ohio Court of Claims). Another state's law deviates; a waiver of
-    immunity is unacceptable; silence on governing law is the fallback."""
+    """Your organization's home-state law; no waiver of its sovereign immunity.
+    The home state is the clause's `homeState` setting in the matrix. Another
+    state's law deviates; a waiver of immunity is unacceptable; silence on
+    governing law is the fallback. With no home state set, a stated law is
+    left for a reviewer to check."""
+    home = str(th.get("homeState") or "").strip().title() or None
     waived = False
     for s in _sentences(text):
         low = s.lower()
@@ -504,24 +509,27 @@ def _check_governing_law(text: str, th: dict[str, Any]) -> _Check:
         name = m.group(1).title()
         if name not in states:
             states.append(name)
-    others = [s for s in states if s != "Ohio"]
+    others = [s for s in states if s != home]
     law = ", ".join(states) + " law" if states else "no governing law stated"
+    required = f"the laws of {home}" if home else "your home-state law"
     if waived:
-        what = f"Governing law is {', '.join(others)} and OSU" if others else "OSU"
-        return _Check("unacceptable", f"{what} would waive its sovereign immunity; the matrix requires Ohio law "
+        what = f"Governing law is {', '.join(others)} and your organization" if others else "Your organization"
+        return _Check("unacceptable", f"{what} would waive its sovereign immunity; the matrix requires {required} "
                                       "and no waiver of immunity.", f"{law}; sovereign immunity waived")
+    if not home and states:
+        return _Check("review", f"Governing law is {', '.join(states)}. Set the home state on this clause in the "
+                                "matrix so Sonar can check it.", law)
     if others:
-        return _Check("deviates", f"Governing law is {', '.join(others)}; the matrix requires the laws of the "
-                                  "State of Ohio.", law)
-    if "Ohio" in states:
-        return _Check("within", None, "Ohio law")
+        return _Check("deviates", f"Governing law is {', '.join(others)}; the matrix requires {required}.", law)
+    if home and home in states:
+        return _Check("within", None, f"{home} law")
     return _Check("fallback", "The agreement is silent on governing law, which the matrix accepts as a fallback "
-                              "provided OSU does not waive its immunity.", law)
+                              "provided your organization does not waive its immunity.", law)
 
 
 def _check_export_control(text: str, th: dict[str, Any]) -> _Check:
     """Fundamental research; export-controlled information only with prior notice
-    and OSU's consent; no restriction on foreign nationals (unacceptable)."""
+    and your organization's consent; no restriction on foreign nationals (unacceptable)."""
     worst: _Check | None = None
     within = False
     for s in _sentences(text):
@@ -535,7 +543,7 @@ def _check_export_control(text: str, th: dict[str, Any]) -> _Check:
             restricts = re.search(r"shall\s+not|may\s+not|not\s+(?:be\s+)?permit|prohibit|restrict|exclud|"
                                   r"\bonly\b|without\s+(?:the\s+)?prior\s+(?:written\s+)?approval|limited\s+to", low)
             if restricts and not allowed:
-                return _Check("unacceptable", "Participation of foreign nationals is restricted; OSU does not accept "
+                return _Check("unacceptable", "Participation of foreign nationals is restricted; your organization does not accept "
                                               "foreign national restrictions, which would end the fundamental "
                                               "research exclusion.", "foreign national restriction")
             if allowed:
@@ -554,7 +562,7 @@ def _check_export_control(text: str, th: dict[str, Any]) -> _Check:
         m = re.search(r"(?:may|will|shall)\s+(?:provide|deliver|disclose|furnish)[^.;]{0,80}"
                       r"(?:export[- ]controlled|itar|\bear\b)", low)
         if m and not _negated(low, m.start(), 30) and not re.search(r"notice|notif|consent|approval", low):
-            cand = _Check("deviates", "Export-controlled information may be provided without prior notice and OSU's "
+            cand = _Check("deviates", "Export-controlled information may be provided without prior notice and your organization's "
                                       "consent; the matrix requires both.",
                           "export-controlled information without notice")
             worst = worst or cand
@@ -611,8 +619,8 @@ def _check_confidentiality(text: str, th: dict[str, Any]) -> _Check:
 
 
 def _check_data_rights(text: str, th: dict[str, Any]) -> _Check:
-    """OSU keeps the right to use research data; confidentiality ≤ 5 years
-    (fallback 7); no use of OSU's name without its prior written consent."""
+    """your organization keeps the right to use research data; confidentiality ≤ 5 years
+    (fallback 7); no use of your organization's name without its prior written consent."""
     results: list[_Check] = []
     years, perpetual = _confidentiality_years(text)
     graded = _years_tier(years, perpetual, th)
@@ -624,15 +632,15 @@ def _check_data_rights(text: str, th: dict[str, Any]) -> _Check:
             if re.search(r"consent|approv|permission", low) or re.search(r"(?:shall|will|may)\s+not\s+use", low):
                 results.append(_Check("within", None, "use of name only with consent"))
             else:
-                results.append(_Check("deviates", "The other party may use OSU's name without OSU's prior written "
-                                                  "consent.", "use of OSU name without consent"))
+                results.append(_Check("deviates", "The other party may use your organization's name without your organization's prior written "
+                                                  "consent.", "use of your organization name without consent"))
         m = re.search(r"(?:all\s+)?(?:research\s+)?(?:data|results)[^.;]{0,80}(?:sole(?:ly)?\s+|exclusive(?:ly)?\s+)?"
                       rf"(?:property\s+of|owned\s+by|belong\s+to)\s+{_OTHER}", low)
         if m and not _negated(low, m.start(), 40):
-            results.append(_Check("deviates", "The other party would own the research data; OSU must keep the right "
+            results.append(_Check("deviates", "The other party would own the research data; your organization must keep the right "
                                               "to use its data for research and education.", "sponsor owns data"))
-        elif re.search(rf"{_OSU}\s+(?:shall\s+|will\s+)?(?:retain|own|owns|may\s+use)[^.;]{{0,60}}data", low):
-            results.append(_Check("within", None, "OSU retains data rights"))
+        elif re.search(rf"{_US}\s+(?:shall\s+|will\s+)?(?:retain|own|owns|may\s+use)[^.;]{{0,60}}data", low):
+            results.append(_Check("within", None, "your organization retains data rights"))
     if not results:
         return _Check("review", "Data rights, confidentiality period and use of name are not clearly addressed.")
     worst = max(results, key=lambda r: _TIER_RANK[r.tier])
@@ -695,9 +703,9 @@ def _check_sponsor_reporting(text: str, th: dict[str, Any]) -> _Check:
 
 
 def _check_diligence(text: str, th: dict[str, Any]) -> _Check:
-    """Commercially reasonable efforts, dated development milestones, and OSU's
+    """Commercially reasonable efforts, dated development milestones, and your organization's
     right to terminate (or convert the licence) for failure to commercialise.
-    Specific dated milestones are beneficial to OSU."""
+    Specific dated milestones are beneficial to your organization."""
     low = re.sub(r"\s+", " ", (text or "").lower())
     efforts = re.search(r"(?:commercially\s+reasonable|diligent|best|reasonable)\s+efforts|diligen", low)
     dated = len(find_dates(text or ""))
@@ -705,7 +713,7 @@ def _check_diligence(text: str, th: dict[str, Any]) -> _Check:
     milestones = dated + relative
     terminate = any(re.search(r"terminat|convert", s) and re.search(r"fail", s)
                     for s in _sentences(low))
-    beneficial = (f"{milestones} dated diligence milestones with OSU's right to terminate."
+    beneficial = (f"{milestones} dated diligence milestones with your organization's right to terminate."
                   if dated >= 2 and terminate else None)
     if milestones and terminate:
         return _Check("within", None, f"{milestones} milestones; termination for failure", beneficial)
@@ -715,7 +723,7 @@ def _check_diligence(text: str, th: dict[str, Any]) -> _Check:
     if efforts:
         return _Check("deviates", "Diligence is limited to an efforts obligation with no milestones and no right to "
                                   "terminate for failure to commercialize.", "efforts only")
-    return _Check("review", "No diligence obligations were found; confirm milestones and OSU's termination right.")
+    return _Check("review", "No diligence obligations were found; confirm milestones and your organization's termination right.")
 
 
 def _check_term(text: str, th: dict[str, Any]) -> _Check:
@@ -763,39 +771,39 @@ def _check_payment(text: str, th: dict[str, Any]) -> _Check:
 
 
 def _check_warranty(text: str, th: dict[str, Any]) -> _Check:
-    """OSU gives no warranties (materials / technology provided "as is"); an OSU
+    """your organization gives no warranties (materials / technology provided "as is"); an your organization
     warranty of non-infringement, merchantability or fitness deviates."""
     low = re.sub(r"\s+", " ", (text or "").lower())
-    m = re.search(rf"{_OSU}\s+(?:represents\s+and\s+)?warrants\s+that[^.;]{{0,160}}"
+    m = re.search(rf"{_US}\s+(?:represents\s+and\s+)?warrants\s+that[^.;]{{0,160}}"
                   r"(?:infring|merchantab|fitness|valid|enforceab)", low)
     if m and not _negated(low, m.start(), 30):
-        return _Check("deviates", "OSU gives a warranty of non-infringement, validity, merchantability or fitness; "
-                                  "OSU provides its technology and materials as is.", "OSU warranty")
+        return _Check("deviates", "your organization gives a warranty of non-infringement, validity, merchantability or fitness; "
+                                  "your organization provides its technology and materials as is.", "your organization warranty")
     if re.search(r"as\s+is|makes\s+no\s+(?:representations?\s+or\s+)?warrant|disclaim|no\s+warrant", low):
         return _Check("within", None, "as is; warranties disclaimed")
-    return _Check("review", "Warranties are not clearly disclaimed; confirm OSU gives no warranties.")
+    return _Check("review", "Warranties are not clearly disclaimed; confirm your organization gives no warranties.")
 
 
 def _check_liability(text: str, th: dict[str, Any]) -> _Check:
-    """OSU's liability excluded or limited to the extent permitted by Ohio law."""
+    """your organization's liability excluded or limited to the extent permitted by its home-state law."""
     low = re.sub(r"\s+", " ", (text or "").lower())
-    if re.search(rf"{_OSU}\s+shall\s+be\s+liable\s+for\s+(?:any\s+and\s+)?all|unlimited\s+liability|uncapped", low):
-        return _Check("deviates", "OSU's liability is unlimited; the matrix requires OSU's liability to be "
-                                  "excluded or limited as permitted by Ohio law.", "unlimited OSU liability")
+    if re.search(rf"{_US}\s+shall\s+be\s+liable\s+for\s+(?:any\s+and\s+)?all|unlimited\s+liability|uncapped", low):
+        return _Check("deviates", "your organization's liability is unlimited; the matrix requires your organization's liability to be "
+                                  "excluded or limited as permitted by its home-state law.", "unlimited organization liability")
     if re.search(r"in\s+no\s+event|shall\s+not\s+be\s+liable|no\s+liability|limited\s+to|shall\s+not\s+exceed", low):
         return _Check("within", None, "liability excluded / limited")
-    return _Check("review", "Liability terms are unclear; confirm OSU's liability is excluded or limited.")
+    return _Check("review", "Liability terms are unclear; confirm your organization's liability is excluded or limited.")
 
 
 def _check_insurance(text: str, th: dict[str, Any]) -> _Check:
-    """The other party carries insurance; OSU is self-insured under Ohio law."""
+    """The other party carries insurance; Your organization is self-insured under home-state law."""
     low = re.sub(r"\s+", " ", (text or "").lower())
     if re.search(rf"{_OTHER}\s+shall\s+(?:maintain|procure|obtain|carry)", low):
-        ben = "OSU is named as an additional insured." if "additional insured" in low else None
+        ben = "Your organization is named as an additional insured." if "additional insured" in low else None
         return _Check("within", None, "other party insured", ben)
-    if re.search(rf"{_OSU}\s+shall\s+(?:maintain|procure|obtain|carry)", low) and "self-insur" not in low:
-        return _Check("fallback", "OSU is asked to carry commercial insurance; OSU is self-insured, which the matrix "
-                                  "accepts if stated as such.", "OSU insurance")
+    if re.search(rf"{_US}\s+shall\s+(?:maintain|procure|obtain|carry)", low) and "self-insur" not in low:
+        return _Check("fallback", "Your organization is asked to carry commercial insurance; Your organization is self-insured, which the matrix "
+                                  "accepts if stated as such.", "your organization insurance")
     return _Check("review", "Insurance obligations are unclear.")
 
 
@@ -804,7 +812,7 @@ def _check_termination(text: str, th: dict[str, Any]) -> _Check:
     low = (text or "").lower()
     if "terminat" in low and re.search(r"cure|notice", low):
         return _Check("within", None, "termination on notice")
-    return _Check("review", "Termination rights are unclear; confirm OSU may terminate on notice.")
+    return _Check("review", "Termination rights are unclear; confirm your organization may terminate on notice.")
 
 
 # clause type → (check, its thresholds and their defaults)
@@ -851,7 +859,7 @@ def thresholds_for(clause_type: str) -> dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
-# Default (OSU-style) matrix
+# Default (your organization-style) matrix
 # ---------------------------------------------------------------------------
 
 
@@ -870,109 +878,109 @@ def _clause(clause_type: str, standard: str, fallback: str | None, unacceptable:
 
 _LANG = {
     "publication": (
-        "University and its investigators shall be free to publish and present the results of the Research. "
-        "University will give Sponsor a copy of each proposed publication at least thirty (30) days before "
+        "Organization and its investigators shall be free to publish and present the results of the Research. "
+        "Organization will give Sponsor a copy of each proposed publication at least thirty (30) days before "
         "submission. Within that period Sponsor may (a) identify Sponsor Confidential Information, which "
-        "University will remove, and (b) request a delay of up to an additional thirty (30) days to allow a "
-        "patent application to be filed. University shall not be required to delay publication for more than "
+        "Organization will remove, and (b) request a delay of up to an additional thirty (30) days to allow a "
+        "patent application to be filed. Organization shall not be required to delay publication for more than "
         "sixty (60) days in total."),
     "background_ip_research": (
         "Each party retains all right, title and interest in its Background Intellectual Property. Inventions "
-        "made solely by University employees or students are owned by University; inventions made solely by "
-        "Sponsor employees are owned by Sponsor; joint inventions are owned jointly. University grants Sponsor a "
-        "non-exclusive, royalty-free licence to use University Inventions for internal research purposes and an "
+        "made solely by Organization employees or students are owned by Organization; inventions made solely by "
+        "Sponsor employees are owned by Sponsor; joint inventions are owned jointly. Organization grants Sponsor a "
+        "non-exclusive, royalty-free licence to use Organization Inventions for internal research purposes and an "
         "option, exercisable within six (6) months of disclosure, to negotiate an exclusive, royalty-bearing "
         "licence on commercially reasonable terms."),
     "background_ip_license": (
-        "Title to the Licensed Patents remains with University. Improvements made solely by University "
-        "employees are owned by University and, at Licensee's request, may be added to this Agreement by "
-        "amendment. Nothing in this Agreement assigns or transfers any University intellectual property to "
+        "Title to the Licensed Patents remains with Organization. Improvements made solely by Organization "
+        "employees are owned by Organization and, at Licensee's request, may be added to this Agreement by "
+        "amendment. Nothing in this Agreement assigns or transfers any Organization intellectual property to "
         "Licensee."),
     "background_ip_mta": (
-        "Provider retains ownership of the Material. University owns all inventions, data and results made by "
-        "University employees using the Material, other than the Material itself and unmodified derivatives. "
-        "Provider has no rights in University inventions except a right of first negotiation for a licence."),
+        "Provider retains ownership of the Material. Organization owns all inventions, data and results made by "
+        "Organization employees using the Material, other than the Material itself and unmodified derivatives. "
+        "Provider has no rights in Organization inventions except a right of first negotiation for a licence."),
     "license_scope": (
-        "University grants Licensee an exclusive licence under the Licensed Patents, in the Field of Use and "
-        "the Territory, to make, have made, use, sell, offer for sale and import Licensed Products. University "
-        "reserves for itself and other academic and non-profit research institutions the right to practise the "
+        "Organization grants Licensee an exclusive licence under the Licensed Patents, in the Field of Use and "
+        "the Territory, to make, have made, use, sell, offer for sale and import Licensed Products. Organization "
+        "reserves for itself and other academic and non-profit research organizations the right to practise the "
         "Licensed Patents for research, teaching and educational purposes. The licence is subject to the rights "
         "of the United States Government under 35 U.S.C. 200-212."),
     "royalties": (
-        "Licensee shall pay University (a) a non-refundable licence issue fee; (b) a running royalty of three "
+        "Licensee shall pay Organization (a) a non-refundable licence issue fee; (b) a running royalty of three "
         "and one-half percent (3.5%) of Net Sales of Licensed Products; (c) twenty-five percent (25%) of all "
         "Sublicense Income; (d) the milestone payments in Section 3.4; and (e) a minimum annual royalty, "
         "creditable against running royalties in the same year."),
     "option_fee": (
-        "Optionee shall pay University a non-refundable option fee within thirty (30) days of the Effective "
+        "Optionee shall pay Organization a non-refundable option fee within thirty (30) days of the Effective "
         "Date. Any licence granted on exercise of the option shall include a running royalty of not less than "
         "three percent (3%) of Net Sales and not less than twenty-five percent (25%) of Sublicense Income, "
-        "diligence milestones, and University's standard reserved rights."),
+        "diligence milestones, and Organization's standard reserved rights."),
     "indemnity": (
-        "Sponsor shall indemnify, defend and hold harmless University, its trustees, officers, employees and "
+        "Sponsor shall indemnify, defend and hold harmless Organization, its trustees, officers, employees and "
         "students from any claims, losses and expenses arising from Sponsor's use of the results of the "
-        "Research or of any product, process or service made or sold by Sponsor. University shall be "
+        "Research or of any product, process or service made or sold by Sponsor. Organization shall be "
         "responsible for its own acts and omissions only to the extent permitted by the laws of the State of "
-        "Ohio; University does not otherwise indemnify any party."),
+        "its home state; Organization does not otherwise indemnify any party."),
     "indemnity_license": (
-        "Licensee shall indemnify, defend and hold harmless University, its trustees, officers, employees and "
+        "Licensee shall indemnify, defend and hold harmless Organization, its trustees, officers, employees and "
         "students from all claims arising from the manufacture, use or sale of Licensed Products, and shall "
         "maintain commercial general and product liability insurance of at least $2,000,000 per occurrence "
-        "naming University as an additional insured. University makes no indemnity."),
+        "naming Organization as an additional insured. Organization makes no indemnity."),
     "governing_law": (
-        "This Agreement is governed by the laws of the State of Ohio, without regard to its conflict-of-laws "
-        "rules. Nothing in this Agreement waives the sovereign immunity of University or the State of Ohio, and "
-        "any claim against University may be brought only in the Ohio Court of Claims."),
+        "This Agreement is governed by the laws of Organization's home state, without regard to its conflict-of-laws "
+        "rules. Nothing in this Agreement waives the sovereign immunity of Organization or the Organization's home state, and "
+        "any claim against Organization may be brought only in the forum its home-state law requires."),
     "export": (
         "The parties intend the Research to be fundamental research, the results of which are ordinarily "
-        "published. Sponsor shall not provide University with any information, technology or material subject "
-        "to the EAR or ITAR without first giving University written notice and receiving University's written "
-        "consent. University will not accept restrictions on the participation of foreign nationals in the "
+        "published. Sponsor shall not provide Organization with any information, technology or material subject "
+        "to the EAR or ITAR without first giving Organization written notice and receiving Organization's written "
+        "consent. Organization will not accept restrictions on the participation of foreign nationals in the "
         "Research."),
     "export_license": (
         "Licensee shall comply with all applicable United States export control laws and regulations, "
-        "including the EAR and ITAR, in its use, sale and export of Licensed Products. University makes no "
+        "including the EAR and ITAR, in its use, sale and export of Licensed Products. Organization makes no "
         "representation that an export licence is not required."),
     "data_rights": (
-        "University retains the right to use all data and results generated in the Research for research, "
+        "Organization retains the right to use all data and results generated in the Research for research, "
         "teaching and publication. Confidentiality obligations shall last five (5) years from disclosure. "
-        "Neither party shall use the name, marks or logos of the other party, or of The Ohio State University, "
+        "Neither party shall use the name, marks or logos of the other party, or of Organization, "
         "in any advertising or publicity without the other party's prior written consent."),
     "use_of_name": (
-        "Licensee shall not use the name, trademarks, logos or other marks of The Ohio State University, or the "
-        "name of any University employee, in any advertising, promotion or publicity without University's prior "
+        "Licensee shall not use the name, trademarks, logos or other marks of Organization, or the "
+        "name of any Organization employee, in any advertising, promotion or publicity without Organization's prior "
         "written consent, except as required by law."),
     "confidentiality": (
         "The receiving party's obligations of confidentiality shall survive for five (5) years from the date of "
         "each disclosure. Information that is publicly available, independently developed, already known or "
-        "lawfully received from a third party is excluded, and University may disclose information as required "
-        "by the Ohio Public Records Act."),
+        "lawfully received from a third party is excluded, and Organization may disclose information as required "
+        "by applicable public records law."),
     "reporting": (
-        "University will provide Sponsor with written technical progress reports quarterly and a final report "
+        "Organization will provide Sponsor with written technical progress reports quarterly and a final report "
         "within ninety (90) days after the end of the Research. Terms of the prime award flowed down to "
-        "University are listed in Attachment 2 by clause number and apply only as required by the prime award."),
+        "Organization are listed in Attachment 2 by clause number and apply only as required by the prime award."),
     "diligence": (
         "Licensee shall use commercially reasonable efforts to develop and commercialize Licensed Products and "
         "shall meet the diligence milestones in Appendix C by the dates stated. If Licensee fails to meet a "
-        "milestone and does not cure the failure within ninety (90) days of notice, University may terminate "
+        "milestone and does not cure the failure within ninety (90) days of notice, Organization may terminate "
         "this Agreement or convert the licence to non-exclusive."),
     "option_term": (
         "The option period is twelve (12) months from the Effective Date. Optionee may request one extension of "
         "up to six (6) months on payment of an extension fee."),
     "payment": (
-        "Sponsor shall pay University the fixed price of the Research in installments, invoiced in advance, "
+        "Sponsor shall pay Organization the fixed price of the Research in installments, invoiced in advance, "
         "each payable within thirty (30) days of the invoice date."),
     "warranty": (
-        "THE MATERIAL AND ALL TECHNOLOGY ARE PROVIDED \"AS IS\". UNIVERSITY MAKES NO REPRESENTATIONS OR "
+        "THE MATERIAL AND ALL TECHNOLOGY ARE PROVIDED \"AS IS\". ORGANIZATION MAKES NO REPRESENTATIONS OR "
         "WARRANTIES OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING OF MERCHANTABILITY, FITNESS FOR A PARTICULAR "
         "PURPOSE, VALIDITY OR NON-INFRINGEMENT."),
     "liability": (
-        "In no event shall University be liable for any indirect, incidental, consequential or punitive "
-        "damages. University's liability is limited to the extent permitted by the laws of the State of Ohio."),
+        "In no event shall Organization be liable for any indirect, incidental, consequential or punitive "
+        "damages. Organization's liability is limited to the extent permitted by the laws of Organization's home state."),
     "sublicensing": (
-        "Licensee may grant sublicenses consistent with this Agreement and shall give University a copy of each "
+        "Licensee may grant sublicenses consistent with this Agreement and shall give Organization a copy of each "
         "sublicense within thirty (30) days of execution. Each sublicense shall survive termination of this "
-        "Agreement at the sublicensee's option, with University as licensor."),
+        "Agreement at the sublicensee's option, with Organization as licensor."),
     "termination": (
         "Either party may terminate this Agreement on ninety (90) days' written notice. Either party may "
         "terminate for material breach not cured within sixty (60) days of written notice. Sponsor shall pay "
@@ -983,49 +991,49 @@ _UNACC = {
     "publication": ["prior written approval of Sponsor", "Sponsor's prior written consent to publish",
                     "shall not publish", "right to prohibit publication",
                     "results shall be Sponsor's Confidential Information"],
-    "background_ip": ["work made for hire", "University hereby assigns", "University shall assign",
+    "background_ip": ["work made for hire", "Organization hereby assigns", "Organization shall assign",
                       "all inventions shall be owned by Sponsor", "all intellectual property shall vest in"],
-    "license_scope": ["University hereby assigns", "irrevocable assignment of the Licensed Patents"],
+    "license_scope": ["Organization hereby assigns", "irrevocable assignment of the Licensed Patents"],
     "royalties": ["royalty-free", "fully paid-up", "no royalties shall be due"],
-    "indemnity": ["University shall defend", "University waives the limitations of Ohio law",
+    "indemnity": ["Organization shall defend", "Organization waives the limitations of its home-state law",
                   "indemnify without limitation"],
     "governing_law": ["waives sovereign immunity", "waives any sovereign immunity", "waive its sovereign immunity",
                       "submits to the jurisdiction of the courts of"],
     "export": ["U.S. citizens only", "no foreign nationals", "foreign nationals shall not",
                "restricted to U.S. persons"],
-    "data_rights": ["all data shall be the property of Sponsor", "University shall not use the data",
-                    "may use the name of the University without"],
+    "data_rights": ["all data shall be the property of Sponsor", "Organization shall not use the data",
+                    "may use the name of the Organization without"],
     "reporting": ["monthly technical reports", "weekly reports", "all terms of the prime award apply"],
     "diligence": ["no diligence obligations"],
     "confidentiality": ["in perpetuity", "shall never expire"],
-    "warranty": ["University warrants that the Licensed Patents are valid", "University warrants non-infringement"],
+    "warranty": ["Organization warrants that the Licensed Patents are valid", "Organization warrants non-infringement"],
     "liability": ["unlimited liability"],
     "sublicensing": ["sublicenses shall terminate automatically"],
 }
 
-# Terms better for OSU than its standard position (the standard itself is not
+# Terms better for your organization than its standard position (the standard itself is not
 # "beneficial"). Built-in checks add their own (equity, dated milestones …).
 _BENEF = {
     "publication": ["free to publish without review", "no review period"],
-    "background_ip": ["grants back to University", "license back to University"],
-    "license_scope": ["non-exclusive license back to University"],
+    "background_ip": ["grants back to Organization", "license back to Organization"],
+    "license_scope": ["non-exclusive license back to Organization"],
     "royalties": ["shares of common stock", "minimum annual royalty", "equity"],
     "indemnity": ["additional insured"],
     "governing_law": [],
     "export": [],
-    "data_rights": ["University may publish the data"],
+    "data_rights": ["Organization may publish the data"],
     "reporting": [],
     "diligence": ["convert the license to non-exclusive"],
     "payment": ["in advance"],
-    "sublicensing": ["sublicense income shall be paid to University within"],
+    "sublicensing": ["sublicense income shall be paid to Organization within"],
 }
 
 
 def _pub(office: str) -> dict[str, Any]:
     return _clause(
         "PublicationRights",
-        "OSU and its investigators may publish the results. The other party may review a proposed publication "
-        "for up to 30 days to identify its confidential information (which OSU removes) and patentable "
+        "your organization and its investigators may publish the results. The other party may review a proposed publication "
+        "for up to 30 days to identify its confidential information (which your organization removes) and patentable "
         "inventions.",
         "A total delay of up to 60 days, including an additional deferral to file a patent application.",
         _UNACC["publication"], _BENEF["publication"], office, _LANG["publication"])
@@ -1034,9 +1042,9 @@ def _pub(office: str) -> dict[str, Any]:
 def _bip_research(office: str = "sponsored_programs") -> dict[str, Any]:
     return _clause(
         "BackgroundIP",
-        "Each party keeps its background IP. OSU owns inventions made by its employees and students; the "
+        "Each party keeps its background IP. your organization owns inventions made by its employees and students; the "
         "sponsor receives a non-exclusive research licence and an option to negotiate an exclusive licence.",
-        "Jointly owned inventions with OSU's share licensable on commercial terms; a time-limited exclusive "
+        "Jointly owned inventions with your organization's share licensable on commercial terms; a time-limited exclusive "
         "option (≤ 6 months).",
         _UNACC["background_ip"], _BENEF["background_ip"], office, _LANG["background_ip_research"])
 
@@ -1044,16 +1052,16 @@ def _bip_research(office: str = "sponsored_programs") -> dict[str, Any]:
 def _indemnity(language: str = "indemnity") -> dict[str, Any]:
     return _clause(
         "Indemnity",
-        "OSU, a public university, does not indemnify. The other party indemnifies OSU and carries insurance; "
-        "OSU is responsible for its own acts only to the extent permitted by Ohio law.",
-        "OSU indemnity expressly limited \"to the extent permitted by the laws of the State of Ohio\".",
+        "your organization, a public body, does not indemnify. The other party indemnifies your organization and carries insurance; "
+        "Your organization is responsible for its own acts only to the extent permitted by its home-state law.",
+        "Organization indemnity expressly limited \"to the extent permitted by the laws of Organization's home state\".",
         _UNACC["indemnity"], _BENEF["indemnity"], "risk_management", _LANG[language])
 
 
 def _law() -> dict[str, Any]:
     return _clause(
         "GoverningLaw",
-        "Laws of the State of Ohio. No waiver of OSU's sovereign immunity; claims against OSU only in the Ohio "
+        "Laws of Organization's home state. No waiver of your organization's sovereign immunity; claims against your organization only in the its home state "
         "Court of Claims.",
         "Silent on governing law (no other state's law named) with no waiver of immunity.",
         _UNACC["governing_law"], _BENEF["governing_law"], "legal_affairs", _LANG["governing_law"])
@@ -1062,9 +1070,9 @@ def _law() -> dict[str, Any]:
 def _export(language: str = "export", required: bool = True) -> dict[str, Any]:
     return _clause(
         "ExportControl",
-        "Fundamental research; no export-controlled information without prior written notice and OSU's consent; "
+        "Fundamental research; no export-controlled information without prior written notice and your organization's consent; "
         "no restrictions on foreign nationals.",
-        "Export-controlled information accepted under an OSU technology control plan approved by Export Control.",
+        "Export-controlled information accepted under an your organization technology control plan approved by Export Control.",
         _UNACC["export"], _BENEF["export"], "export_control", _LANG[language],
         {_ESCALATE_KEY: 1}, required)
 
@@ -1072,8 +1080,8 @@ def _export(language: str = "export", required: bool = True) -> dict[str, Any]:
 def _data_rights(language: str = "data_rights", required: bool = True) -> dict[str, Any]:
     return _clause(
         "DataRights",
-        "OSU keeps the right to use its data and results for research and teaching; confidentiality lasts no "
-        "more than 5 years; no use of OSU's name without its prior written consent.",
+        "your organization keeps the right to use its data and results for research and teaching; confidentiality lasts no "
+        "more than 5 years; no use of your organization's name without its prior written consent.",
         "Confidentiality of up to 7 years.",
         _UNACC["data_rights"], _BENEF["data_rights"], "legal_affairs", _LANG[language], None, required)
 
@@ -1081,7 +1089,7 @@ def _data_rights(language: str = "data_rights", required: bool = True) -> dict[s
 def _confidentiality(required: bool = False, office: str | None = "legal_affairs") -> dict[str, Any]:
     return _clause(
         "Confidentiality",
-        "Confidentiality obligations last no more than 5 years from disclosure, subject to the Ohio Public "
+        "Confidentiality obligations last no more than 5 years from disclosure, subject to the its home state Public "
         "Records Act; standard exclusions apply.",
         "Up to 7 years.",
         _UNACC["confidentiality"], [], office, _LANG["confidentiality"], None, required)
@@ -1099,7 +1107,7 @@ def _reporting(office: str = "sponsored_programs", required: bool = True) -> dic
 def _warranty(required: bool = False) -> dict[str, Any]:
     return _clause(
         "Warranty",
-        "OSU makes no warranties; technology and materials are provided as is.",
+        "your organization makes no warranties; technology and materials are provided as is.",
         None, _UNACC["warranty"], [], "tech_commercialization", _LANG["warranty"], None, required)
 
 
@@ -1112,15 +1120,15 @@ def _payment(required: bool = True) -> dict[str, Any]:
 
 
 def default_matrix() -> dict[str, Any]:
-    """The built-in OSU-style matrix (version 1). Positions reflect what a public
-    research university holds: Ohio law and no waiver of immunity, no OSU
-    indemnity, the right to publish, OSU ownership of its inventions, reserved
-    research rights, diligence and fair financial terms. OSU to confirm."""
+    """The built-in your organization-style matrix (version 1). Positions reflect what a public
+    research organization holds: home-state law and no waiver of immunity, no your organization
+    indemnity, the right to publish, your organization ownership of its inventions, reserved
+    research rights, diligence and fair financial terms. your organization to confirm."""
     license_clauses = [
         _clause("LicenseScope",
-                "Exclusive licence limited to a defined field of use and territory, subject to OSU's reserved right "
+                "Exclusive licence limited to a defined field of use and territory, subject to your organization's reserved right "
                 "to practise the technology for research, teaching and education and to U.S. Government rights.",
-                "All fields of use, provided OSU's research and educational rights are reserved and diligence "
+                "All fields of use, provided your organization's research and educational rights are reserved and diligence "
                 "milestones apply per field.",
                 _UNACC["license_scope"], _BENEF["license_scope"], "tech_commercialization", _LANG["license_scope"]),
         _clause("Royalties",
@@ -1129,22 +1137,22 @@ def default_matrix() -> dict[str, Any]:
                 "Running royalty of at least 2% and at least 15% of sublicense income.",
                 _UNACC["royalties"], _BENEF["royalties"], "tech_commercialization", _LANG["royalties"]),
         _clause("Diligence",
-                "Commercially reasonable efforts with dated development and sales milestones; OSU may terminate "
+                "Commercially reasonable efforts with dated development and sales milestones; your organization may terminate "
                 "(or make the licence non-exclusive) if a milestone is missed and not cured.",
                 "Efforts obligation with annual diligence reports and either milestones or a termination right.",
                 _UNACC["diligence"], _BENEF["diligence"], "tech_commercialization", _LANG["diligence"]),
         _clause("BackgroundIP",
-                "OSU keeps title to the licensed patents and its background IP; improvements by OSU employees "
-                "are owned by OSU; nothing is assigned to the licensee.",
-                "Licensee owns its own improvements with a non-exclusive licence back to OSU for research.",
+                "your organization keeps title to the licensed patents and its background IP; improvements by your organization employees "
+                "are owned by your organization; nothing is assigned to the licensee.",
+                "Licensee owns its own improvements with a non-exclusive licence back to your organization for research.",
                 _UNACC["background_ip"], _BENEF["background_ip"], "tech_commercialization",
                 _LANG["background_ip_license"]),
         _indemnity("indemnity_license"),
         _law(),
         _data_rights("use_of_name"),
         _clause("Sublicensing",
-                "Sublicenses allowed with a copy to OSU; sublicenses survive termination with OSU as licensor.",
-                "Sublicenses with OSU's prior consent, not unreasonably withheld.",
+                "Sublicenses allowed with a copy to your organization; sublicenses survive termination with your organization as licensor.",
+                "Sublicenses with your organization's prior consent, not unreasonably withheld.",
                 _UNACC["sublicensing"], _BENEF["sublicensing"], "tech_commercialization", _LANG["sublicensing"],
                 None, False),
         _confidentiality(False, "tech_commercialization"),
@@ -1155,8 +1163,8 @@ def default_matrix() -> dict[str, Any]:
     option_clauses = [
         _clause("LicenseScope",
                 "Exclusive option to negotiate a licence in a defined field of use; during the option period only "
-                "a non-exclusive evaluation licence for internal research; OSU's research rights reserved.",
-                "Option covering all fields of use with OSU's research rights reserved.",
+                "a non-exclusive evaluation licence for internal research; your organization's research rights reserved.",
+                "Option covering all fields of use with your organization's research rights reserved.",
                 _UNACC["license_scope"], _BENEF["license_scope"], "tech_commercialization", _LANG["license_scope"]),
         _clause("Term",
                 "Option period of no more than 12 months.",
@@ -1168,8 +1176,8 @@ def default_matrix() -> dict[str, Any]:
                 "Royalty of at least 2% and at least 15% of sublicense income.",
                 _UNACC["royalties"], _BENEF["royalties"], "tech_commercialization", _LANG["option_fee"]),
         _clause("BackgroundIP",
-                "OSU keeps title to the optioned technology; no assignment; evaluation results do not give the "
-                "optionee rights in OSU inventions.",
+                "your organization keeps title to the optioned technology; no assignment; evaluation results do not give the "
+                "optionee rights in your organization inventions.",
                 None, _UNACC["background_ip"], _BENEF["background_ip"], "tech_commercialization",
                 _LANG["background_ip_license"]),
         _data_rights("use_of_name"),
@@ -1191,7 +1199,7 @@ def default_matrix() -> dict[str, Any]:
                 "Either party may terminate on notice; the sponsor pays costs incurred and non-cancellable "
                 "obligations.", None, [], [], "sponsored_programs", _LANG["termination"], None, False),
         _clause("Liability",
-                "OSU's liability excluded for indirect damages and limited as permitted by Ohio law.",
+                "your organization's liability excluded for indirect damages and limited as permitted by its home-state law.",
                 None, _UNACC["liability"], [], "risk_management", _LANG["liability"], None, False),
     ]
     grant_clauses = [
@@ -1206,7 +1214,7 @@ def default_matrix() -> dict[str, Any]:
     ]
     mta_clauses = [
         _clause("BackgroundIP",
-                "The provider owns the material; OSU owns inventions, data and results made by its employees "
+                "The provider owns the material; your organization owns inventions, data and results made by its employees "
                 "using it; no reach-through rights for the provider beyond a right to negotiate a licence.",
                 "A non-exclusive, royalty-free research licence to the provider for inventions that incorporate "
                 "the material.",
@@ -1237,7 +1245,7 @@ def default_matrix() -> dict[str, Any]:
     other_clauses = [
         _indemnity(),
         _law(),
-        _clause("Liability", "OSU's liability excluded for indirect damages and limited as permitted by Ohio law.",
+        _clause("Liability", "your organization's liability excluded for indirect damages and limited as permitted by its home-state law.",
                 None, _UNACC["liability"], [], "risk_management", _LANG["liability"], None, False),
         _confidentiality(False),
         _payment(required=False),
@@ -1433,7 +1441,7 @@ _CLAUSE_KEYWORDS: list[tuple[str, str]] = [
     (r"indemn", "Indemnity"),
     (r"governing\s+law|sovereign|choice\s+of\s+law|jurisdiction", "GoverningLaw"),
     (r"export|itar|\bear\b|foreign\s+(?:national|part)", "ExportControl"),
-    (r"data\s+rights?|use\s+of\s+(?:osu\s+|university\s+)?name|publicity", "DataRights"),
+    (r"data\s+rights?|use\s+of\s+(?:[\w'.-]+\s+){0,3}name|publicity", "DataRights"),
     (r"report|flow[- ]?down", "SponsorReporting"),
     (r"diligen|commerciali[sz]", "Diligence"),
     (r"confidential|non-?disclosure", "Confidentiality"),
@@ -1747,10 +1755,18 @@ def _phrase_hit(text: str, phrases: list[str]) -> str | None:
     return None
 
 
-def _grade(mclause: dict[str, Any], text: str) -> _Check:
-    """Built-in check, then the phrase lists; the more serious tier wins."""
+def home_state(value: Any) -> str | None:
+    """A US state (or DC) name as the matrix stores it, else None."""
+    name = str(value or "").strip()
+    match = next((s for s in _US_STATES if s.lower() == name.lower()), None)
+    return match
+
+
+def _grade(mclause: dict[str, Any], text: str, home: str | None = None) -> _Check:
+    """Built-in check, then the phrase lists; the more serious tier wins.
+    ``home`` is the matrix's home state, read by the governing-law check."""
     clause_type = mclause["clauseType"]
-    thresholds = {**thresholds_for(clause_type), **(mclause.get("thresholds") or {})}
+    thresholds = {**thresholds_for(clause_type), **(mclause.get("thresholds") or {}), "homeState": home}
     check = _CHECKS.get(clause_type)
     result: _Check | None = check(text, thresholds) if check else None
     hit = _phrase_hit(text, mclause.get("unacceptable") or [])
@@ -1765,7 +1781,7 @@ def _grade(mclause: dict[str, Any], text: str) -> _Check:
             result = _Check("review", "No automatic check is defined for this clause type; compare the clause with "
                                       "the standard position.")
     if good:
-        reason = f"Contains \"{good}\", which the matrix lists as beneficial to OSU."
+        reason = f"Contains \"{good}\", which the matrix lists as beneficial to your organization."
         if not result.beneficial:
             result = result._replace(beneficial=reason)
     return result
@@ -1793,6 +1809,7 @@ def review_document(clauses: list[dict[str, Any]], agreement_type: str, matrix: 
     unacceptable term, to go to its escalation office: threshold
     ``escalateOnDeviation`` = 1)."""
     playbooks = (matrix or {}).get("playbooks") or {}
+    home = home_state((matrix or {}).get("homeState"))
     book = playbooks.get(agreement_type) or playbooks.get("other") or {"clauses": []}
     mclauses = [c for c in book.get("clauses") or [] if isinstance(c, dict) and c.get("clauseType")]
     graded_types = {c["clauseType"] for c in mclauses}
@@ -1822,12 +1839,12 @@ def review_document(clauses: list[dict[str, Any]], agreement_type: str, matrix: 
                             "found": None, "quote": None})
             continue
         text = "\n\n".join(str(c.get("body") or "") for c in matched)
-        graded = _grade(mclause, text)
+        graded = _grade(mclause, text, home)
         # Point at the clause whose own text carries the outcome.
         anchor = matched[0]
         if len(matched) > 1:
             for c in matched:
-                if _grade(mclause, str(c.get("body") or "")).tier == graded.tier:
+                if _grade(mclause, str(c.get("body") or ""), home).tier == graded.tier:
                     anchor = c
                     break
         counts[graded.tier] += 1
@@ -1960,15 +1977,15 @@ def _all_text(classification: dict[str, Any] | None) -> str:
 
 
 def infer_direction(agreement_type: str, classification: dict[str, Any] | None) -> str:
-    """incoming (sponsor funding, licence fees, royalties) or outgoing (OSU pays:
+    """incoming (sponsor funding, licence fees, royalties) or outgoing (your organization pays:
     subawards, vendor spend). License, option, sponsored research and grants are
-    incoming unless the text shows OSU paying — OSU as pass-through entity or
-    "University shall pay / reimburse" the other party."""
+    incoming unless the text shows your organization paying — your organization as pass-through entity or
+    "Organization shall pay / reimburse" the other party."""
     low = _all_text(classification).lower()
-    osu_pays = re.search(
-        rf"pass-?through\s+entity|{_OSU}\s+(?:shall|will|agrees\s+to)\s+(?:pay|reimburse)\b"
+    ours_pays = re.search(
+        rf"pass-?through\s+entity|{_US}\s+(?:shall|will|agrees\s+to)\s+(?:pay|reimburse)\b"
         r"|\bsubrecipient\b[^.]{0,80}(?:reimburse|paid|invoice)", low)
-    if osu_pays:
+    if ours_pays:
         return "outgoing"
     return "incoming"
 
@@ -2051,7 +2068,7 @@ def extract_income(classification: dict[str, Any] | None, agreement_type: str) -
     expected dates — a calendar date in the sentence, or "within N months of the
     Effective Date"), running royalty %, minimum annual royalty, equity %, the
     sublicense income share, and — for sponsored research, grants and
-    collaborations — the total sponsor funding (or, when OSU pays, the subaward
+    collaborations — the total sponsor funding (or, when your organization pays, the subaward
     amount). Falls back to ``commercials.totalContractValue`` for the funding.
     Items are in document order with stable ids ``sonar-income-<n>``."""
     cls = classification or {}
@@ -2189,7 +2206,7 @@ def extract_obligations(classification: dict[str, Any] | None, agreement_type: s
                     value, unit = periods.get(n, (12, "months"))
                     due = add_offset(signed, value, unit) if signed else None
                     if agreement_type in ("license", "option"):
-                        add("other", f"{word.capitalize()} diligence / progress report to OSU", due)
+                        add("other", f"{word.capitalize()} diligence / progress report to your organization", due)
                     else:
                         add("sponsor_report", f"{word.capitalize()} progress report", due)
                     continue
@@ -2220,7 +2237,7 @@ def extract_obligations(classification: dict[str, Any] | None, agreement_type: s
 
 
 __all__ = [
-    "AGREEMENT_TYPES", "AGREEMENT_TYPE_LABELS", "OFFICES", "OFFICE_LABELS", "OSU_CLAUSE_TYPES", "TIERS",
+    "AGREEMENT_TYPES", "AGREEMENT_TYPE_LABELS", "OFFICES", "OFFICE_LABELS", "RESEARCH_CLAUSE_TYPES", "TIERS",
     "default_matrix", "validate_matrix", "parse_import", "merge_import", "review_document", "sonar_blockers",
     "infer_agreement_type", "infer_direction", "extract_income", "extract_obligations", "matrix_clause_label",
     "resolve_clause_type", "resolve_office", "resolve_agreement_type", "thresholds_for", "valid_clause_type",

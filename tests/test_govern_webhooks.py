@@ -28,7 +28,7 @@ def ready(gov, ddb, monkeypatch):
     install_analysis(monkeypatch, ddb)
     seed_doc(ddb, "lic-1")
     intake.handle_event(analysed_event("lic-1"))
-    actor = {"email": "dana@osu.edu", "name": "Dana Ruiz"}
+    actor = {"email": "dana@northfield.edu", "name": "Dana Ruiz"}
     store.contracts.mutate("lic-1", lambda c: c.update(state="ready_to_sign", stage="approval"))
     workflow.perform_action("lic-1", "send_for_signature", {"provider": "docusign"}, actor)
     monkeypatch.setattr(settings, "docusign_secret_arn", "arn:docusign")

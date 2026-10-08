@@ -104,22 +104,22 @@ def _govern_event(entry: dict) -> dict:
 
 
 def test_notifier_emails_the_new_owner_and_logs_it_once(lic, monkeypatch):
-    monkeypatch.setattr(settings, "notify_from_email", "govern@osu.edu")
-    workflow.perform_action("lic-1", "assign", {"owner": {"email": "eli@osu.edu", "name": "Eli Park"}}, DANA)
+    monkeypatch.setattr(settings, "notify_from_email", "govern@northfield.edu")
+    workflow.perform_action("lic-1", "assign", {"owner": {"email": "eli@northfield.edu", "name": "Eli Park"}}, DANA)
     entry = {k: v for k, v in lic.activity_for("lic-1")[-1].items() if k not in ("PK", "SK")}
     assert notifier.handler(_govern_event(entry), lambda_context()) == {"batchItemFailures": []}
     assert len(lic.emails) == 1
     mail = lic.emails[0]
-    assert mail["Destination"]["ToAddresses"] == ["eli@osu.edu"]
+    assert mail["Destination"]["ToAddresses"] == ["eli@northfield.edu"]
     assert mail["Content"]["Simple"]["Subject"]["Data"] == "Govern: Exclusive License Agreement assigned to you"
     assert lic.actions("lic-1")[-1] == "notification_sent"
-    assert lic.activity_for("lic-1")[-1]["summary"] == "Sonar emailed eli@osu.edu about this."
+    assert lic.activity_for("lic-1")[-1]["summary"] == "Sonar emailed eli@northfield.edu about this."
     notifier.handler(_govern_event(entry), lambda_context())          # re-delivery
     assert len(lic.emails) == 1 and lic.actions("lic-1").count("notification_sent") == 1
 
 
 def test_notifier_respects_settings_and_never_emails_the_actor(lic, monkeypatch):
-    monkeypatch.setattr(settings, "notify_from_email", "govern@osu.edu")
+    monkeypatch.setattr(settings, "notify_from_email", "govern@northfield.edu")
     workflow.perform_action("lic-1", "assign", {"owner": DANA}, DANA)          # Dana assigned herself
     entry = {k: v for k, v in lic.activity_for("lic-1")[-1].items() if k not in ("PK", "SK")}
     assert notifier.handle_event({"detail": entry}) == []
@@ -131,7 +131,7 @@ def test_notifier_respects_settings_and_never_emails_the_actor(lic, monkeypatch)
 
 def test_notifier_posts_to_teams_and_retries_when_every_channel_fails(lic, monkeypatch):
     monkeypatch.setattr(settings, "teams_secret_arn", "arn:teams")
-    lic.secrets["arn:teams"] = json.dumps({"tenants": {TENANT: "https://osu.webhook.office.com/x"}})
+    lic.secrets["arn:teams"] = json.dumps({"tenants": {TENANT: "https://example.webhook.office.com/x"}})
     store.config.put_settings(TENANT, {"notifications": {"email": False, "teams": True}, "teamsWebhookConfigured": True})
     workflow.perform_action("lic-1", "escalate", {"office": "legal_affairs"}, DANA)
     entry = {k: v for k, v in lic.activity_for("lic-1")[-1].items() if k not in ("PK", "SK")}

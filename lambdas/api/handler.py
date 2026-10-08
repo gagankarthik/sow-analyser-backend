@@ -61,8 +61,8 @@ from shared.config import settings
 from aws_lambda_powertools import Tracer
 from shared import dynamodb as ddb
 from shared import playbook
-from shared.access import Caller, can, normalise_email, normalise_role
-from shared.auth import AuthError
+from shared.access import Caller, can, normalise_email, normalise_role, workspace_admin
+from shared.auth import AuthError, jwt_claims
 from shared.aws import s3_client
 from shared.dynamodb import (
     delete_doc_entirely,
@@ -166,7 +166,7 @@ def _route(method: str, path: str, event: dict[str, Any], caller: Caller) -> dic
     # Per-tenant compliance-pack selection (which frameworks Sonar grades against).
     if re.fullmatch(r"/tenant/compliance/?", path):
         if method == "GET":  return _get_compliance(caller.tenant_id)
-        if method == "POST": return _save_compliance(event, caller.tenant_id)
+        if method == "POST": return _admin_only(event, caller) or _save_compliance(event, caller.tenant_id)
         return _err(405, "Method not allowed", "method_not_allowed")
 
     # The caller's playbook: effective rules, and their own custom rules.
@@ -176,8 +176,8 @@ def _route(method: str, path: str, event: dict[str, Any], caller: Caller) -> dic
         return _err(405, "Method not allowed", "method_not_allowed")
     m = re.fullmatch(r"/playbook/rules/([^/]+)/?", path)
     if m:
-        if method == "PUT":    return _put_playbook_rule(unquote(m.group(1)), event, caller)
-        if method == "DELETE": return _delete_playbook_rule(unquote(m.group(1)), caller)
+        if method == "PUT":    return _admin_only(event, caller) or _put_playbook_rule(unquote(m.group(1)), event, caller)
+        if method == "DELETE": return _admin_only(event, caller) or _delete_playbook_rule(unquote(m.group(1)), caller)
         return _err(405, "Method not allowed", "method_not_allowed")
 
     # POST /projects/{id}/invite — add a member to a project
@@ -324,6 +324,13 @@ def _get_compliance(tenant_id: str) -> dict[str, Any]:
         "explicit": saved is not None,                 # has the tenant chosen, or are these defaults?
         "known":    KNOWN_PACK_IDS,
     })
+
+
+def _admin_only(event: dict[str, Any], caller: Caller) -> dict[str, Any] | None:
+    """None when the caller may change workspace-wide settings, else a 403."""
+    if workspace_admin(jwt_claims(event), caller.tenant_id):
+        return None
+    return _err(403, "Only a workspace admin can change this setting.", "forbidden")
 
 
 def _save_compliance(event: dict[str, Any], tenant_id: str) -> dict[str, Any]:

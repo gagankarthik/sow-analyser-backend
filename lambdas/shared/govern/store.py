@@ -296,6 +296,14 @@ class ContractRepository(_Repository):
                                & Key("GSI3SK").lte(through_date))
         return [o for o in (clean_item(i) for i in items) if o]
 
+    def open_obligations(self, tenant_id: str) -> list[dict[str, Any]]:
+        """Every open, dated obligation of a tenant, soonest due first (GSI3)."""
+        from boto3.dynamodb.conditions import Key
+
+        items = self.query_all(IndexName="GSI3", KeyConditionExpression=Key("GSI3PK").eq(f"T#{tenant_id}#OBL"))
+        out = [o for o in (clean_item(i) for i in items) if o]
+        return sorted(out, key=lambda o: (str(o.get("dueDate") or ""), str(o.get("id") or "")))
+
     # -- licensing income -----------------------------------------------------
     def income(self, contract_id: str) -> list[dict[str, Any]]:
         return sorted(self.children(f"CON#{contract_id}", "INC#"),
@@ -414,6 +422,7 @@ class ConfigRepository(_Repository):
         meta = clean_item({k: v for k, v in item.items() if k != "playbooksZ"}) or {}
         return {"version": int(meta.get("version") or 0), "effectiveDate": meta.get("effectiveDate"),
                 "createdAt": meta.get("createdAt"), "createdBy": meta.get("createdBy"), "note": meta.get("note"),
+                "homeState": meta.get("homeState"),
                 "playbooks": _unzip_json(item["playbooksZ"]) if item.get("playbooksZ") is not None else {}}
 
     def _put_matrix(self, tenant_id: str, matrix: dict[str, Any]) -> bool:
@@ -422,6 +431,7 @@ class ConfigRepository(_Repository):
             "PK": f"T#{tenant_id}", "SK": f"MATRIX#{int(matrix['version']):06d}", "entityType": "MATRIX",
             "version": int(matrix["version"]), "effectiveDate": matrix.get("effectiveDate"),
             "createdAt": matrix.get("createdAt"), "createdBy": matrix.get("createdBy"), "note": matrix.get("note"),
+            "homeState": matrix.get("homeState"),
             "clauseCount": sum(len((pb or {}).get("clauses") or []) for pb in playbooks.values()),
             "playbooksZ": _zip_json(playbooks),
         })
@@ -442,7 +452,7 @@ class ConfigRepository(_Repository):
             if version:
                 matrix = self.matrix_version(tenant_id, version)
                 if matrix:
-                    return matrix
+                    return self._upgrade_system_default(tenant_id, matrix)
             from .matrix import default_matrix
 
             seed = dict(default_matrix())
@@ -454,15 +464,49 @@ class ConfigRepository(_Repository):
                           "version": 1})
         raise RuntimeError("could not load or seed the matrix")
 
+    def _upgrade_system_default(self, tenant_id: str, matrix: dict[str, Any]) -> dict[str, Any]:
+        """Keep an untouched built-in matrix current. A version nobody saved
+        (createdBy is None: the system seed) whose positions differ from
+        today's built-in default gets today's default as a NEW version, so
+        history stays intact. Any version a person saved is never changed."""
+        if matrix.get("createdBy") is not None:
+            return matrix
+        from .matrix import default_matrix
+
+        fresh = default_matrix()
+        if matrix.get("playbooks") == fresh.get("playbooks"):
+            return matrix
+        prev = int(matrix["version"])
+        now = iso()
+        upgraded = {"version": prev + 1, "effectiveDate": now[:10], "createdAt": now, "createdBy": None,
+                    "note": "Built-in standard matrix updated", "homeState": matrix.get("homeState"),
+                    "playbooks": fresh["playbooks"]}
+        if not self._put_matrix(tenant_id, upgraded):
+            # Another request upgraded it first; read what is current now.
+            return self.matrix_version(tenant_id, self._pointer(tenant_id) or prev) or matrix
+        try:
+            self.table().put_item(Item={"PK": f"T#{tenant_id}", "SK": "MATRIX#CURRENT",
+                                        "entityType": "MATRIX_POINTER", "version": prev + 1},
+                                  ConditionExpression="version = :v", ExpressionAttributeValues={":v": prev})
+        except ClientError as exc:
+            if not _is_conditional_failure(exc):
+                raise
+            return self.matrix_version(tenant_id, self._pointer(tenant_id) or prev) or matrix
+        return upgraded
+
     def save_matrix(self, tenant_id: str, playbooks: dict[str, Any], *, created_by: dict[str, Any] | None,
-                    note: str | None, effective_date: str | None) -> dict[str, Any]:
+                    note: str | None, effective_date: str | None,
+                    home_state: str | None | object = ...) -> dict[str, Any]:
         """Save ``playbooks`` as a NEW immutable version and point CURRENT at
-        it. Concurrent saves each get their own version number."""
+        it. Concurrent saves each get their own version number. ``home_state``
+        left out keeps the current version's home state."""
         for _ in range(_MAX_WRITE_RETRIES):
-            prev = int(self.current_matrix(tenant_id)["version"])
+            current = self.current_matrix(tenant_id)
+            prev = int(current["version"])
             now = iso()
+            home = current.get("homeState") if home_state is ... else home_state
             matrix = {"version": prev + 1, "effectiveDate": effective_date or now[:10], "createdAt": now,
-                      "createdBy": created_by, "note": note, "playbooks": playbooks}
+                      "createdBy": created_by, "note": note, "homeState": home, "playbooks": playbooks}
             if not self._put_matrix(tenant_id, matrix):
                 continue
             try:

@@ -661,7 +661,7 @@ resource "aws_apigatewayv2_integration" "govern_api" {
 locals {
   govern_routes = toset([
     "GET /govern/me",
-    "GET /contracts", "POST /contracts",
+    "GET /contracts", "POST /contracts", "GET /obligations",
     "GET /contracts/{id}", "PATCH /contracts/{id}",
     "POST /contracts/{id}/actions", "POST /contracts/{id}/rescore",
     "POST /contracts/{id}/blockers", "PATCH /contracts/{id}/blockers/{blockerId}",

@@ -51,7 +51,7 @@ Enterprise contract-intelligence backend that ingests Statements of Work, Master
 
 See `docs/ARCHITECTURE.md` for the full analysis, alternatives, and open questions.
 
-## Govern: contract workflow (OSU)
+## Govern: contract workflow (the customer)
 
 Govern moves a contract between people: matrix review, owner, days in stage, waiting on,
 approve / send back / escalate / reject, signature, obligations, value and trends. It is its own
@@ -98,7 +98,7 @@ lambdas/
     stages/           parse, classify, embed, graph, diff, timeline, persist
   shared/             Access control, segmentation, dates, money, playbook, clients
     govern/           Govern: workflow, store (5 repositories), matrix, connectors, aggregates, capture
-samples/osu/          OSU-style sample agreements and review matrix (demo + tests)
+samples/research/     research and licensing sample agreements and review matrix (tests)
 scripts/              Operational scripts (migrate_access.py, backfill_govern_aggregates.py)
 docs/                 ARCHITECTURE.md, ENGINE_AUDIT.md, COSTS.md, security overview
 tests/                Offline unit and regression tests (AWS and OpenAI are faked)

@@ -1,7 +1,7 @@
-"""OSU review matrix: deterministic grading, import, validation and the
+"""Northfield review matrix: deterministic grading, import, validation and the
 post-signature extractors (shared/govern/matrix.py).
 
-The demo story is graded from the sample agreements in ``samples/osu``. The
+The demo story is graded from the sample agreements in ``samples/research``. The
 pipeline's classify stage is what normally labels each clause with a category;
 these tests are offline, so ``_sample_clauses`` stands in for it: it cuts a
 sample at its numbered top-level headings ("3. FEES, ROYALTIES AND EQUITY") and
@@ -21,7 +21,7 @@ from shared import clause_types as ct
 from shared.govern import matrix as m
 from stages import classify_prompts
 
-SAMPLES = Path(__file__).resolve().parents[1] / "samples" / "osu"
+SAMPLES = Path(__file__).resolve().parents[1] / "samples" / "research"
 NOW = "2026-10-08T12:00:00Z"
 
 HEADING_CATEGORIES = {
@@ -108,7 +108,7 @@ def test_demo_blockers_have_stable_ids_offices_and_redlines():
     assert set(by_id) == {"sonar-LicenseScope-2", "sonar-Royalties-3", "sonar-GoverningLaw-14"}
     law = by_id["sonar-GoverningLaw-14"]
     assert law["office"] == "legal_affairs"                 # unacceptable → its escalation office
-    assert "Ohio" in law["suggestedLanguage"] and "sovereign immunity" in law["suggestedLanguage"]
+    assert "home state" in law["suggestedLanguage"] and "sovereign immunity" in law["suggestedLanguage"]
     assert by_id["sonar-Royalties-3"]["office"] is None     # a plain deviation is sent back, not escalated
     assert by_id["sonar-Royalties-3"]["text"].startswith("Running royalty is 1% of net sales")
     assert all(b["source"] == "sonar" and b["status"] == "open" and b["createdAt"] == NOW for b in blockers)
@@ -131,7 +131,7 @@ def test_other_samples_flag_what_they_were_written_to_flag(name, agreement_type,
 def test_samples_carry_fallbacks_where_intended():
     assert _tier(_review("02-option-agreement.txt", "option"), "Term") == "fallback"          # 15-month option
     mta = _review("04-material-transfer-agreement.txt", "mta")
-    assert _tier(mta, "Indemnity") == "fallback"          # only to the extent permitted by Ohio law
+    assert _tier(mta, "Indemnity") == "fallback"          # only to the extent permitted by Minnesota law
     assert _tier(mta, "GoverningLaw") == "fallback"       # silent on governing law
 
 
@@ -185,7 +185,7 @@ def test_royalty_tiers(body, tier):
 
 @pytest.mark.parametrize("body,tier", [
     ("Sponsor shall indemnify, defend and hold harmless University from all claims.", "within"),
-    ("University shall indemnify Sponsor only to the extent permitted by the laws of the State of Ohio.", "fallback"),
+    ("University shall indemnify Sponsor only to the extent permitted by the laws of the State of Minnesota.", "fallback"),
     ("Each party shall indemnify the other party against third-party claims.", "unacceptable"),
     ("University agrees to indemnify and hold harmless Sponsor from any losses.", "unacceptable"),
 ])
@@ -194,11 +194,11 @@ def test_indemnity_tiers_for_a_public_university(body, tier):
 
 
 @pytest.mark.parametrize("body,tier", [
-    ("This Agreement is governed by the laws of the State of Ohio. Nothing herein waives the sovereign "
+    ("This Agreement is governed by the laws of the State of Minnesota. Nothing herein waives the sovereign "
      "immunity of University.", "within"),
     ("Each party bears its own costs of any dispute.", "fallback"),
     ("This Agreement is governed by the laws of the State of New York.", "deviates"),
-    ("This Agreement is governed by the laws of the State of Ohio. University hereby waives its sovereign "
+    ("This Agreement is governed by the laws of the State of Minnesota. University hereby waives its sovereign "
      "immunity.", "unacceptable"),
 ])
 def test_governing_law_tiers(body, tier):
@@ -273,7 +273,7 @@ def test_beneficial_is_independent_of_tier():
 
 
 def test_negated_unacceptable_phrase_does_not_count():
-    row = _one("GoverningLaw", "Governed by the laws of the State of Ohio. Nothing in this Agreement waives "
+    row = _one("GoverningLaw", "Governed by the laws of the State of Minnesota. Nothing in this Agreement waives "
                                "sovereign immunity.")
     assert row["tier"] == "within"
 
@@ -321,7 +321,7 @@ def test_unknown_agreement_type_uses_other_playbook():
 
 def test_default_matrix_covers_every_agreement_type():
     matrix = m.default_matrix()
-    assert matrix["version"] == 1 and matrix["note"] == "OSU-style default matrix (proposed; OSU to confirm)"
+    assert matrix["version"] == 1 and matrix["note"] == "Default research and licensing matrix (edit to match your positions)"
     assert list(matrix["playbooks"]) == m.AGREEMENT_TYPES
     for agreement_type, book in matrix["playbooks"].items():
         assert book["clauses"], agreement_type
@@ -374,11 +374,11 @@ def test_import_csv_with_labels_offices_and_lists():
         "Clause type,Standard position,Fallback,Unacceptable terms,Escalation office\n"
         "Publication rights and review period,Publish after 30 days,60 days,sponsor approval; veto,Sponsored Programs\n"
         "export control,Fundamental research,,foreign nationals shall not,OSP\n"
-        "Governing Law (Ohio) and sovereign immunity,Ohio law,,waives sovereign immunity,Office of Legal Affairs\n"
-        "Background IP,OSU owns its inventions,,,\n"
+        "Governing Law (Minnesota) and sovereign immunity,Minnesota law,,waives sovereign immunity,Office of Legal Affairs\n"
+        "Background IP,Northfield owns its inventions,,,\n"
         "Flux capacitor,Something,,,\n"
         ",,,,\n"
-        "Indemnity,OSU does not indemnify,,,Dean's office\n"
+        "Indemnity,Northfield does not indemnify,,,Dean's office\n"
         "Royalties,,,,\n"
     )
     clauses, skipped = m.parse_import("sponsored_research", csv_text=csv_text)
@@ -411,7 +411,7 @@ def test_import_rows_and_thresholds_and_duplicates():
 
 
 def test_sample_matrix_csv_round_trips_the_default_matrix():
-    csv_text = (SAMPLES / "osu-review-matrix.csv").read_text(encoding="utf-8")
+    csv_text = (SAMPLES / "review-matrix.csv").read_text(encoding="utf-8")
     defaults = m.default_matrix()["playbooks"]
     for agreement_type, other in (("license", "sponsored_research"), ("sponsored_research", "license")):
         clauses, skipped = m.parse_import(agreement_type, csv_text=csv_text)
@@ -453,7 +453,7 @@ def test_imported_threshold_change_changes_the_grade():
 
 
 @pytest.mark.parametrize("meta,expected", [
-    ({"docType": "LICENSE", "title": "Exclusive Option Agreement - Scioto Robotics"}, "option"),
+    ({"docType": "LICENSE", "title": "Exclusive Option Agreement - Cedar Robotics"}, "option"),
     ({"docType": "LICENSE", "title": "Exclusive License Agreement"}, "license"),
     ({"docType": "OTHER", "title": "Material Transfer Agreement (incoming)"}, "mta"),
     ({"docType": "OTHER", "title": "Sponsored Research Agreement"}, "sponsored_research"),
@@ -557,14 +557,14 @@ def test_new_categories_labels_and_synonyms():
 
 
 def test_matrix_clause_labels_and_resolvers():
-    assert m.matrix_clause_label("GoverningLaw") == "Governing law (Ohio) and sovereign immunity"
+    assert m.matrix_clause_label("GoverningLaw") == "Governing law and sovereign immunity"
     assert m.matrix_clause_label("Payment") == "Payment terms"
     assert m.matrix_clause_label("type.non-solicitation") == "Non solicitation"
     assert m.resolve_office("Technology Commercialization Office") == ("tech_commercialization", True)
     assert m.resolve_office("") == (None, True) and m.resolve_office("Dean") == (None, False)
     assert m.resolve_clause_type("royalties, milestones, equity and sublicense income") == "Royalties"
-    assert m.resolve_clause_type("Use of OSU name") == "DataRights"
-    assert len(m.OSU_CLAUSE_TYPES) == 10 and set(m.OFFICE_LABELS) == set(m.OFFICES)
+    assert m.resolve_clause_type("Use of Northfield name") == "DataRights"
+    assert len(m.RESEARCH_CLAUSE_TYPES) == 10 and set(m.OFFICE_LABELS) == set(m.OFFICES)
 
 
 def _pipeline_clauses(name: str) -> list[dict]:

@@ -3,7 +3,7 @@ MUTUAL CONFIDENTIAL DISCLOSURE AGREEMENT
 Huron Agreement No. AGR00012433
 Workday Ref: WD-NF-000327 (no funds)
 
-This Mutual Confidential Disclosure Agreement (the "Agreement") is entered into as of October 9, 2026 (the "Effective Date") by and between The Ohio State University, an instrumentality of the State of Ohio ("University"), and Lumen Photonics, Inc., a Colorado corporation with offices at 1800 Pearl Street, Boulder, Colorado 80302 ("Company").
+This Mutual Confidential Disclosure Agreement (the "Agreement") is entered into as of October 9, 2026 (the "Effective Date") by and between Northfield University, an instrumentality of the State of Minnesota ("University"), and Lumen Photonics, Inc., a Colorado corporation with offices at 1800 Pearl Street, Boulder, Colorado 80302 ("Company").
 
 The parties wish to exchange confidential information to evaluate a possible research collaboration on silicon photonic sensors with Dr. Marco Bianchi, Department of Electrical and Computer Engineering (the "Purpose").
 
@@ -17,7 +17,7 @@ The parties wish to exchange confidential information to evaluate a possible res
 
 2.1 The recipient shall use the discloser's Confidential Information only for the Purpose and shall protect it with reasonable care. The recipient's confidentiality obligations shall survive for ten (10) years after the date of each disclosure.
 
-2.2 University may disclose Confidential Information as required by the Ohio Public Records Act after giving Company notice where permitted.
+2.2 University may disclose Confidential Information as required by the Minnesota Data Practices Act after giving Company notice where permitted.
 
 3. EXPORT CONTROL
 
@@ -33,10 +33,10 @@ The parties wish to exchange confidential information to evaluate a possible res
 
 6. GOVERNING LAW
 
-6.1 This Agreement shall be governed by the laws of the State of Ohio. Nothing in this Agreement shall be construed as a waiver of the sovereign immunity of University.
+6.1 This Agreement shall be governed by the laws of the State of Minnesota. Nothing in this Agreement shall be construed as a waiver of the sovereign immunity of University.
 
 IN WITNESS WHEREOF, the parties have executed this Agreement as of the Effective Date.
 
-THE OHIO STATE UNIVERSITY                     LUMEN PHOTONICS, INC.
+NORTHFIELD UNIVERSITY                     LUMEN PHOTONICS, INC.
 By: ______________________                   By: ______________________
 Title: Associate Director, Industry Contracts Name: Rachel Kim, General Counsel
