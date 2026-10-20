@@ -64,8 +64,12 @@ def test_a_signed_envelope_marks_the_contract_signed(ready):
     c = store.contracts.get("lic-1")
     assert c["state"] == "signed" and c["signedAt"] == "2026-10-14T14:58:00Z"
     assert c["signature"]["envelopeId"] == "env-42" and c["signature"]["provider"] == "docusign"
-    last = ready.activity_for("lic-1")[-1]
-    assert last["action"] == "signed" and last["actor"] is None
+    # The webhook runs on the fixed NOW while the fixture's setup entries carry
+    # the wall clock, so pick the webhook's entry by action, not by position.
+    signed = [a for a in ready.activity_for("lic-1") if a["action"] == "signed"]
+    assert len(signed) == 1
+    last = signed[0]
+    assert last["actor"] is None
     assert last["summary"] == "DocuSign reported this agreement signed."
 
 
