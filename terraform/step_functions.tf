@@ -19,21 +19,39 @@ resource "aws_cloudwatch_log_group" "sfn" {
 # (Express is at-least-once, i.e. duplicate LLM spend), and costs ~$0.0002/doc.
 
 locals {
-  _fn    = aws_lambda_function.pipeline.arn
-  _catch = [{ ErrorEquals = ["States.ALL"], Next = "MarkFailed", ResultPath = "$.error" }]
+  _fn = aws_lambda_function.pipeline.arn
+  # PipelineSupersededError: another run of the same document saved its version
+  # first — end quietly, without marking the document FAILED over that run's result.
+  _catch = [
+    { ErrorEquals = ["PipelineSupersededError"], Next = "Superseded", ResultPath = "$.error" },
+    { ErrorEquals = ["States.ALL"], Next = "MarkFailed", ResultPath = "$.error" },
+  ]
 
   # Slightly above the Lambda timeout, so a hung invoke is caught (States.Timeout
   # → MarkFailed) instead of leaving the execution open.
   _task_timeout = aws_lambda_function.pipeline.timeout + 30
 
-  # Retry only transient Lambda-service faults. A stage's own error is NOT
-  # retried here — that would repeat the LLM calls it already paid for.
-  _retry = [{
-    ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"]
-    IntervalSeconds = 2
-    MaxAttempts     = 3
-    BackoffRate     = 2
-  }]
+  # Retry transient faults only. PipelineTransientError (the error NAME Lambda
+  # reports: the AI service was unavailable or the stage ran out of time) is
+  # retried after a pause — the stage's own retries already failed, so this
+  # waits out an outage instead of failing the document. Any other stage error
+  # is NOT retried — that would repeat the LLM calls it already paid for. Then
+  # the Lambda-service faults.
+  _retry = [
+    {
+      ErrorEquals     = ["PipelineTransientError"]
+      IntervalSeconds = 60
+      MaxAttempts     = 2
+      BackoffRate     = 2
+      JitterStrategy  = "FULL"
+    },
+    {
+      ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"]
+      IntervalSeconds = 2
+      MaxAttempts     = 3
+      BackoffRate     = 2
+    },
+  ]
 
   sfn_definition = jsonencode({
     Comment = "Blue-IQ document ingestion pipeline"
@@ -154,6 +172,10 @@ locals {
         }]
         Catch = [{ ErrorEquals = ["States.ALL"], Next = "AnalysedEventNotPublished", ResultPath = "$.publishError" }]
         End   = true
+      }
+      Superseded = {
+        Type    = "Succeed"
+        Comment = "Another run of this document saved its analysis first; that one stands."
       }
       AnalysedEventNotPublished = {
         Type    = "Succeed"

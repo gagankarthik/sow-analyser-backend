@@ -58,6 +58,8 @@ from .auth import AuthError, jwt_claims, tenant_for_identity
 
 ROLES = ("owner", "editor", "viewer")
 _RANK = {"viewer": 1, "editor": 2, "owner": 3}
+# What Caller.owns / document_role read from a META row.
+_OWNERSHIP_FIELDS = ("docId", "ownerSub", "tenantId", "projectIds")
 
 CAPABILITIES = (
     "view", "upload", "edit", "reprocess", "manage_documents", "share_document", "delete_document",
@@ -193,7 +195,8 @@ class Caller:
     def visible_doc_ids(self) -> list[str]:
         """Every document id this caller may read: their own uploads plus the
         contents of every project they can see. Used to scope search."""
-        ids = [d["docId"] for d in dynamodb.list_tenant_docs(self.tenant_id)
+        # Projected: ownership (``owns``) needs only these, not the whole row.
+        ids = [d["docId"] for d in dynamodb.list_tenant_docs(self.tenant_id, attributes=_OWNERSHIP_FIELDS)
                if d.get("docId") and self.owns(d)]
         roles = self.project_roles()
         if roles:

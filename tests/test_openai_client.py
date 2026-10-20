@@ -320,3 +320,63 @@ def test_each_task_can_use_its_own_model(monkeypatch):
     assert s.model_for("validation") == "big" and s.model_for("rag") == "chatty"
     monkeypatch.setattr(s, "clause_model", "small")
     assert s.model_for("clause") == "small"
+
+
+# ── Free text cut off by the output limit ───────────────────────────────────
+
+
+def test_a_truncated_text_reply_raises_unless_the_caller_accepts_it(use):
+    use(chat=[chat_response("The fee is", finish_reason="length")])
+    with pytest.raises(oc.OutputTruncatedError):
+        oc.chat_text(system="s", user="u", model="m", max_tokens=900)
+    answer = oc.chat_text(system="s", user="u", model="m", max_tokens=900, allow_truncated=True)
+    assert answer == "The fee is" + oc.TRUNCATION_NOTE
+    assert answer.endswith("\n\n(The answer was cut short. Ask a narrower question for the rest.)")
+    use(chat=[chat_response("Complete answer.")])
+    assert oc.chat_text(system="s", user="u", model="m", allow_truncated=True) == "Complete answer."
+
+
+# ── Streaming goes through the same retries and request slots ───────────────
+
+
+def _chunk(text=None, finish=None):
+    delta = types.SimpleNamespace(content=text)
+    return types.SimpleNamespace(choices=[types.SimpleNamespace(delta=delta, finish_reason=finish)])
+
+
+def test_opening_a_stream_is_retried_and_holds_a_request_slot(use, monkeypatch):
+    held = []
+
+    class _Slots:
+        def __enter__(self):
+            held.append("in")
+
+        def __exit__(self, *exc):
+            held.append("out")
+            return False
+    monkeypatch.setattr(oc, "_request_slots", lambda: _Slots())
+    client = use(chat=[RateLimitError("slow down", 429), [_chunk("Hi"), _chunk(" there", "stop")]])
+    chunks = list(oc.chat_stream("m", [{"role": "user", "content": "u"}], 0.0, 900))
+    assert [c.choices[0].delta.content for c in chunks] == ["Hi", " there"]
+    assert len(client.chat_calls) == 2 and len(use.waits) == 1            # the 429 was retried
+    assert all(c["stream"] is True and c["max_tokens"] == 900 for c in client.chat_calls)
+    assert held == ["in", "out", "in", "out", "in", "out"]               # 2 opens + the stream itself
+
+
+def test_rag_stream_says_when_the_answer_was_cut_short(monkeypatch):
+    from rag import handler as rag
+    from shared.access import Caller
+
+    pushed = []
+    monkeypatch.setattr(rag, "_push_token", lambda sid, token, final: pushed.append((token, final)))
+    monkeypatch.setattr(Caller, "visible_doc_ids", lambda self: ["d1"])
+    monkeypatch.setattr(rag, "embed_texts", lambda texts, model=None: [[0.0]])
+    monkeypatch.setattr(rag, "clause_search", lambda **kw: [
+        {"_id": "d1::4", "_source": {"docId": "d1", "clauseNumber": "4", "title": "Fees", "text": "Fee $5."}}])
+    monkeypatch.setattr(rag.ddb, "get_docs", lambda ids: [{"docId": "d1", "title": "SOW"}])
+    monkeypatch.setattr(rag, "chat_stream", lambda *a, **k: iter([_chunk("The fee"), _chunk(" is", "length")]))
+    ev = {"arguments": {"input": {"question": "fees?"}},
+          "identity": {"claims": {"sub": "11111111-1111-4111-8111-111111111111"}}}
+    out = rag._handle(ev)
+    assert out["answer"] == "The fee is" + oc.TRUNCATION_NOTE
+    assert pushed[-1] == ("", True) and oc.TRUNCATION_NOTE in "".join(t for t, _ in pushed)

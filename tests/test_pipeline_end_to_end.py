@@ -91,6 +91,7 @@ def world(monkeypatch, ddb):
             monkeypatch.setattr(module, "get_json", get_json)
     monkeypatch.setattr(shared_s3, "get_json", get_json)
     monkeypatch.setattr(pipeline, "delete_object", lambda b, k: processed.pop(k, None))
+    monkeypatch.setattr(persist, "copy_object", lambda b, src, dst: processed.__setitem__(dst, copy.deepcopy(processed[src])))
     monkeypatch.setattr(parse, "get_object", lambda b, k: raw[k])
     monkeypatch.setattr(parse, "head_object", lambda b, k: {"ContentLength": len(raw[k])})
 
@@ -322,6 +323,8 @@ def test_reanalysing_an_unchanged_document_makes_no_model_calls_and_leaves_no_st
 
     world["run"](dict(event))                                   # "Re-analyze" on the same file
     assert len(model.calls) == calls                            # classification reused
+    for n in (1, 2):                                            # each version kept its own copy
+        assert f"{TENANT}/doc-sow-0001/versions/{n:06d}/classification.json" in world["processed"]
     meta = world["ddb"].doc("doc-sow-0001")
     assert meta["latestVersion"] == 2 and meta["status"] == "READY"
     assert set(world["index"]) == first_ids                     # same records, rewritten...

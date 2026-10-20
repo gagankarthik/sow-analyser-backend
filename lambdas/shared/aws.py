@@ -21,6 +21,12 @@ _BOTO_CONFIG = Config(
     region_name=settings.aws_region,
     retries={"max_attempts": 5, "mode": "adaptive"},
     user_agent_extra=f"blue-iq/{settings.stage}",
+    # The stages fan out (bounded_map uses up to 2 x LLM_MAX_CONCURRENCY threads
+    # on one shared client); botocore's default pool of 10 made the extra
+    # threads wait for a connection and logged "Connection pool is full".
+    max_pool_connections=max(10, settings.llm_max_concurrency * 2 + 4),
+    # Keep idle pooled connections alive across a warm Lambda's gaps.
+    tcp_keepalive=True,
 )
 
 

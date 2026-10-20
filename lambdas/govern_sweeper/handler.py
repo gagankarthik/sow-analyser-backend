@@ -29,7 +29,7 @@ from shared import aws
 from shared.config import settings
 from shared.dynamodb import list_tenant_docs
 from shared.govern import capture, store, workflow
-from shared.logger import get_logger
+from shared.logger import get_logger, safe_trace
 
 log = get_logger("blue-iq.govern-sweeper")
 tracer = Tracer(service="blue-iq.govern-sweeper")
@@ -52,7 +52,8 @@ def sweep(now: datetime) -> dict[str, Any]:
         try:
             result = sweep_tenant(tenant_id, now)
         except Exception as exc:  # noqa: BLE001 — keep sweeping the other tenants
-            log.exception("govern_sweeper.tenant_failed", tenantId=tenant_id, error_type=type(exc).__name__)
+            log.error("govern_sweeper.tenant_failed", tenantId=tenant_id, error_type=type(exc).__name__,
+                      trace=safe_trace(exc))
             totals["failedTenants"] += 1
             continue
         for k in ("overdue", "termMoves", "obligations", "requeued", "missed"):

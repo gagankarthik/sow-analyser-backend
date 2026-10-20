@@ -76,3 +76,36 @@ def test_pricing_model():
     assert workforce.pricing_model("Billed on a time and materials basis at the hourly rates in the Rate Card.") == "time_materials"
     assert workforce.pricing_model("A fixed fee for phase 1; phase 2 at hourly rates.") == "mixed"
     assert workforce.pricing_model("Confidential information shall be protected.") is None
+
+
+def _review(atype, clauses):
+    out = matrix.review_document(clauses, atype, matrix.default_matrix(), "doc-1", "2026-10-20T00:00:00Z")
+    return {r["clauseType"]: r for r in out["clauses"]}
+
+
+def test_payment_terms_inside_a_fees_clause_are_not_missing():
+    # "Fees and Payment" is classified as Fees, which the matrix grades too; its
+    # net-30 sentence is still the payment term.
+    clauses = [
+        {"id": "c1", "number": "4", "title": "Fees and Payment", "category": "Fees",
+         "body": "Rates are fixed per the Rate Card. Client shall pay each undisputed invoice net 30."},
+    ]
+    for atype in ("sow", "msa"):
+        payment = _review(atype, clauses)["Payment"]
+        assert payment["tier"] == "within", (atype, payment)
+
+
+def test_payment_terms_under_compensation_or_invoicing_headings_are_found():
+    for title, body, tier in [
+        ("Compensation", "Invoices are payable within forty-five (45) days of receipt.", "fallback"),
+        ("Invoicing", "Invoices: Net 45.", "fallback"),
+        ("General", "Client will pay within thirty (30) days after receipt of a proper invoice.", "within"),
+    ]:
+        clauses = [{"id": "c1", "number": "5", "title": title, "category": "Other", "body": body}]
+        assert _review("msa", clauses)["Payment"]["tier"] == tier, title
+
+
+def test_payment_is_missing_when_no_clause_states_it():
+    clauses = [{"id": "c1", "number": "1", "title": "Scope", "category": "ScopeOfWork",
+                "body": "Vendor shall build the portal."}]
+    assert _review("sow", clauses)["Payment"]["tier"] == "missing"

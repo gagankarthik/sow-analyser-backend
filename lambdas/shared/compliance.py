@@ -25,7 +25,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from .logger import get_logger
+from .logger import get_logger, safe_trace
 
 log = get_logger("blue-iq.compliance")
 
@@ -118,7 +118,8 @@ def _load_tenant_packs(tenant_id: str | None) -> list[str] | None:
         from .dynamodb import get_compliance_packs
         return get_compliance_packs(tenant_id)
     except Exception as exc:  # pragma: no cover - best effort
-        log.warning("compliance.tenant_packs_load_failed", tenantId=tenant_id, error=str(exc))
+        log.warning("compliance.tenant_packs_load_failed", tenantId=tenant_id,
+                    error_type=type(exc).__name__, trace=safe_trace(exc))
         return None
 
 
@@ -134,7 +135,7 @@ def resolve_enabled_packs(tenant_id: str | None = None) -> list[str]:
             if isinstance(parsed, list):
                 enabled = [str(p) for p in parsed]
         except Exception as exc:
-            log.warning("compliance.env_packs_invalid", error=str(exc))
+            log.warning("compliance.env_packs_invalid", error_type=type(exc).__name__)
 
     tenant_packs = _load_tenant_packs(tenant_id)
     if tenant_packs is not None:

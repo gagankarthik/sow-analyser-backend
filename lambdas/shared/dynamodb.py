@@ -15,6 +15,8 @@ All items carry `entityType` so a GSI on it can power admin queries.
 from __future__ import annotations
 
 import json
+import random
+import time
 from decimal import Decimal
 from typing import Any, Iterable
 
@@ -87,9 +89,14 @@ def put_doc_meta(doc: dict[str, Any]) -> None:
     _put(item)
 
 
-def update_doc_fields(doc_id: str, fields: dict[str, Any], remove: Iterable[str] = ()) -> None:
+def update_doc_fields(doc_id: str, fields: dict[str, Any], remove: Iterable[str] = (),
+                      expect_updated_at: str | None = None) -> None:
     """Set (and optionally remove) fields on a document META record, leaving every
-    other attribute — ownership, project membership, keys — untouched."""
+    other attribute — ownership, project membership, keys — untouched.
+
+    ``expect_updated_at``: write only if the row's ``updatedAt`` still has this
+    value ("" = still has none) — optimistic locking; a row changed meanwhile
+    raises ConditionalCheckFailedException."""
     expr_parts = ["updatedAt = :ts"]
     names: dict[str, str] = {}
     values: dict[str, Any] = {":ts": now_iso()}
@@ -113,9 +120,44 @@ def update_doc_fields(doc_id: str, fields: dict[str, Any], remove: Iterable[str]
         # deleted would recreate a tenant-less ghost META row.
         "ConditionExpression": "attribute_exists(PK)",
     }
+    if expect_updated_at:
+        kwargs["ConditionExpression"] += " AND updatedAt = :prev"
+        values[":prev"] = expect_updated_at
+    elif expect_updated_at is not None:          # "": the row has never had one
+        kwargs["ConditionExpression"] += " AND attribute_not_exists(updatedAt)"
     if names:
         kwargs["ExpressionAttributeNames"] = names
     _table().update_item(**kwargs)
+
+
+class DocumentConflict(RuntimeError):
+    """A document could not be written after several optimistic-lock retries."""
+
+
+def edit_doc_fields(doc_id: str, fields: dict[str, Any]) -> bool:
+    """A person's edit (PATCH /documents/{id}): set ``fields`` and add their
+    names to ``userEdited`` — the sorted list persist reads so a re-analysis
+    keeps them.
+
+    ``userEdited`` is read-modify-written under optimistic locking on
+    ``updatedAt``: two edits at once (or an edit racing a pipeline status
+    update) re-read and retry instead of one silently dropping the other's
+    field names. Returns False if the document does not exist.
+    """
+    for _ in range(_MAX_WRITE_RETRIES):
+        meta = get_doc_meta(doc_id)
+        if not meta:
+            return False
+        edited = sorted(set(meta.get("userEdited") or []) | set(fields))
+        try:
+            update_doc_fields(doc_id, {**fields, "userEdited": edited},
+                              expect_updated_at=str(meta.get("updatedAt") or ""))
+            return True
+        except ClientError as exc:
+            if not _is_conditional_failure(exc):
+                raise
+            # changed (or deleted) since we read it: re-read and try again
+    raise DocumentConflict(f"document {doc_id} is being changed by someone else; try again")
 
 
 def update_status(doc_id: str, status: str, extra: dict[str, Any] | None = None) -> None:
@@ -141,6 +183,72 @@ def update_status(doc_id: str, status: str, extra: dict[str, Any] | None = None)
     )
 
 
+def claim_doc_run(doc_id: str, in_flight: Iterable[str], stale_before: str,
+                  fields: dict[str, Any] | None = None) -> bool:
+    """Atomically mark a document PENDING for a new pipeline run.
+
+    Succeeds only if the document exists and no run is in flight: its status is
+    not one of ``in_flight``, or it last changed before ``stale_before`` (an ISO
+    timestamp — a run that went quiet that long is treated as dead). Returns
+    False, writing nothing, when another run holds the document — so two
+    simultaneous re-analyze clicks cannot both start a run.
+    """
+    statuses = sorted(in_flight)
+    names: dict[str, str] = {"#s": "status", "#u": "updatedAt"}
+    values: dict[str, Any] = {":pending": "PENDING", ":now": now_iso(), ":stale": stale_before}
+    sets = ["#s = :pending", "#u = :now"]
+    for i, (k, v) in enumerate((fields or {}).items()):
+        names[f"#k{i}"] = k
+        values[f":v{i}"] = _to_ddb(v)
+        sets.append(f"#k{i} = :v{i}")
+    for i, status in enumerate(statuses):
+        values[f":f{i}"] = status
+    busy = ", ".join(f":f{i}" for i in range(len(statuses)))
+    try:
+        _table().update_item(
+            Key={"PK": f"DOC#{doc_id}", "SK": "META"},
+            UpdateExpression="SET " + ", ".join(sets),
+            ConditionExpression=(
+                f"attribute_exists(PK) AND (attribute_not_exists(#s) OR NOT (#s IN ({busy}))"
+                " OR attribute_not_exists(#u) OR #u < :stale)"
+            ),
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+        )
+    except ClientError as exc:
+        if _is_conditional_failure(exc):
+            return False
+        raise
+    return True
+
+
+def release_superseded_run(doc_id: str, version_n: int) -> bool:
+    """A run that lost the version race set status PERSISTING on its way in. If
+    the winner already finished (META is at ``version_n`` or later), that write
+    may have landed after the winner's READY — put READY back. Conditional, so
+    it never touches a document another run has since claimed. Best-effort."""
+    try:
+        _table().update_item(
+            Key={"PK": f"DOC#{doc_id}", "SK": "META"},
+            UpdateExpression="SET #s = :ready, #u = :now",
+            ConditionExpression="attribute_exists(PK) AND #s = :persisting AND latestVersion >= :n",
+            ExpressionAttributeNames={"#s": "status", "#u": "updatedAt"},
+            ExpressionAttributeValues={":ready": "READY", ":persisting": "PERSISTING",
+                                       ":n": version_n, ":now": now_iso()},
+        )
+        return True
+    except ClientError as exc:
+        if not _is_conditional_failure(exc):
+            log.warning("ddb.release_superseded_failed", error_type=type(exc).__name__)
+        return False
+
+
+class VersionConflict(RuntimeError):
+    """A version row for this docId + number already exists: another pipeline run
+    for the same document got there first. Raised so the losing run stops before
+    it overwrites META with its (now stale) analysis."""
+
+
 def put_version(version: dict[str, Any]) -> None:
     doc_id = version["docId"]
     n = version["versionNumber"]
@@ -151,8 +259,15 @@ def put_version(version: dict[str, Any]) -> None:
         **version,
         "createdAt": version.get("createdAt", now_iso()),
     }
-    # Idempotent: same docId+version is a no-op.
-    _put(item, condition="attribute_not_exists(PK) AND attribute_not_exists(SK)")
+    # Create-only. A collision means two runs computed the same version number;
+    # the second must not go on to rewrite META.
+    try:
+        _table().put_item(Item=_to_ddb(item),
+                          ConditionExpression="attribute_not_exists(PK) AND attribute_not_exists(SK)")
+    except ClientError as exc:
+        if _is_conditional_failure(exc):
+            raise VersionConflict(f"version {n} of {doc_id} was already written by another run") from exc
+        raise
 
 
 def put_change(change: dict[str, Any]) -> None:
@@ -169,28 +284,40 @@ def put_change(change: dict[str, Any]) -> None:
 
 
 def put_lineage(parent_id: str, child_id: str) -> None:
-    """Write both forward and reverse adjacency edges."""
+    """Link a child to its parent: the forward LINK# and reverse CHILD# edges.
+
+    A document has one parent. When a re-analysis finds a DIFFERENT parent, the
+    earlier pair is removed in the same transaction that writes the new one, so
+    neither the old parent's CHILD# list nor the child's LINK# can go stale and
+    the two edges never disagree.
+    """
+    from boto3.dynamodb.types import TypeSerializer
+
+    serialise = TypeSerializer().serialize
+    name = settings.table_name
+    if not name:
+        raise RuntimeError("TABLE_NAME env var is not set")
+
+    def key(pk: str, sk: str) -> dict[str, Any]:
+        return {"PK": {"S": pk}, "SK": {"S": sk}}
+
+    ops: list[dict[str, Any]] = []
+    for row in query_doc_parents(child_id):
+        old = row.get("parentId") or str(row.get("SK", ""))[len("LINK#"):]
+        if old and old != parent_id:
+            ops.append({"Delete": {"TableName": name, "Key": key(f"DOC#{child_id}", f"LINK#{old}")}})
+            ops.append({"Delete": {"TableName": name, "Key": key(f"DOC#{old}", f"CHILD#{child_id}")}})
     now = now_iso()
-    _put(
-        {
-            "PK": f"DOC#{child_id}",
-            "SK": f"LINK#{parent_id}",
-            "entityType": "LINEAGE_PARENT",
-            "parentId": parent_id,
-            "childId": child_id,
-            "createdAt": now,
-        }
-    )
-    _put(
-        {
-            "PK": f"DOC#{parent_id}",
-            "SK": f"CHILD#{child_id}",
-            "entityType": "LINEAGE_CHILD",
-            "parentId": parent_id,
-            "childId": child_id,
-            "createdAt": now,
-        }
-    )
+    for item in (
+        {"PK": f"DOC#{child_id}", "SK": f"LINK#{parent_id}", "entityType": "LINEAGE_PARENT"},
+        {"PK": f"DOC#{parent_id}", "SK": f"CHILD#{child_id}", "entityType": "LINEAGE_CHILD"},
+    ):
+        item.update(parentId=parent_id, childId=child_id, createdAt=now)
+        ops.append({"Put": {"TableName": name, "Item": {k: serialise(v) for k, v in item.items()}}})
+    if len(ops) > 2:
+        log.info("ddb.lineage_parent_changed", childId=child_id, parentId=parent_id, removed=(len(ops) - 2) // 2)
+    # 100 actions per transaction: a child has one parent, so this is 2 or 4.
+    dynamodb_resource().meta.client.transact_write_items(TransactItems=ops[:100])
 
 
 # ---------------------------------------------------------------------------
@@ -246,11 +373,16 @@ def query_doc_parents(doc_id: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def list_tenant_docs(tenant_id: str, limit: int = 1000) -> list[dict[str, Any]]:
+def list_tenant_docs(tenant_id: str, limit: int = 1000,
+                     attributes: Iterable[str] | None = None) -> list[dict[str, Any]]:
     """Return the tenant's document META records via GSI1 (at most `limit`).
 
     Pages through the index: one Query page stops at 1 MB, which a tenant with
     large summaries reaches well before `limit` rows, silently hiding documents.
+    ``attributes`` reads only those fields (a projection) — far fewer pages and
+    read units when the caller needs ids and ownership, not whole summaries.
+    Hitting `limit` with rows left over is logged as a warning: the caller is
+    then working from a partial listing.
     """
     from boto3.dynamodb.conditions import Key
 
@@ -259,6 +391,12 @@ def list_tenant_docs(tenant_id: str, limit: int = 1000) -> list[dict[str, Any]]:
         "IndexName": "GSI1",
         "KeyConditionExpression": Key("GSI1PK").eq(f"TENANT#{tenant_id}"),
     }
+    wanted = list(dict.fromkeys(attributes or []))
+    if wanted:
+        names = {f"#p{i}": a for i, a in enumerate(wanted)}
+        kwargs["ProjectionExpression"] = ", ".join(names)
+        kwargs["ExpressionAttributeNames"] = names
+    last: Any = None
     while len(items) < limit:
         resp = _table().query(Limit=limit - len(items), **kwargs)
         items.extend(resp.get("Items", []))
@@ -266,6 +404,8 @@ def list_tenant_docs(tenant_id: str, limit: int = 1000) -> list[dict[str, Any]]:
         if not last:
             break
         kwargs["ExclusiveStartKey"] = last
+    if last and len(items) >= limit:
+        log.warning("ddb.tenant_listing_truncated", tenantId=tenant_id, limit=limit, returned=len(items))
     # Strip DDB internals and return clean META dicts.
     return [
         {k: v for k, v in item.items() if not k.startswith("GSI") and k not in ("PK", "SK", "entityType")}
@@ -349,12 +489,25 @@ def put_compliance_packs(tenant_id: str, packs: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def delete_doc_version(doc_id: str, version_number: int) -> dict[str, Any] | None:
+def delete_doc_version(doc_id: str, version_number: int,
+                       processed_bucket: str | None = None) -> dict[str, Any] | None:
     """Delete a specific version record and roll META back to the previous version.
+
+    The API serves a document's artefacts from fixed keys, which hold the NEWEST
+    run's output. So when the deleted version was the newest, the surviving
+    version's own copies (``runKeys``, written by persist) are copied back over
+    the fixed keys, and the deleted run's search records are removed — otherwise
+    the document would keep serving the analysis the user just deleted. A
+    version saved before ``runKeys`` existed has no copies; its fixed keys are
+    left as they are (the previous behaviour).
 
     Returns the new META record if a previous version exists, or None if the
     document is now empty (caller should decide whether to hard-delete META too).
     """
+    bucket = settings.processed_bucket if processed_bucket is None else processed_bucket
+    deleted = next((v for v in query_doc_versions(doc_id)
+                    if int(v.get("versionNumber", -1)) == version_number), None) or {}
+
     # Delete the version record.
     _table().delete_item(Key={"PK": f"DOC#{doc_id}", "SK": f"V#{version_number:06d}"})
 
@@ -370,13 +523,70 @@ def delete_doc_version(doc_id: str, version_number: int) -> dict[str, Any] | Non
     latest = remaining[0]
     latest_n = int((latest.get("SK") or "V#000000")[2:])
 
+    fields: dict[str, Any] = {":v": latest_n, ":ts": now_iso()}
+    sets = ["latestVersion = :v", "updatedAt = :ts"]
+    if latest_n < version_number and bucket:
+        restored = _restore_version_artefacts(bucket, latest)
+        deleted_run = deleted.get("runId")
+        if (restored and deleted_run and deleted_run != latest.get("runId")
+                and _delete_run_records(doc_id, str(deleted_run))):
+            # Only the deleted run's records were in the index (each run removes
+            # its predecessors'), so nothing is searchable until a re-analysis
+            # indexes the restored version again.
+            fields[":f"] = False
+            sets.append("searchable = :f")
+    if bucket and deleted.get("runKeys"):
+        _drop_version_artefacts(bucket, deleted)
+
     # Update META to reflect the latest surviving version.
     _table().update_item(
         Key={"PK": f"DOC#{doc_id}", "SK": "META"},
-        UpdateExpression="SET latestVersion = :v, updatedAt = :ts",
-        ExpressionAttributeValues=_to_ddb({":v": latest_n, ":ts": now_iso()}),
+        UpdateExpression="SET " + ", ".join(sets),
+        ExpressionAttributeValues=_to_ddb(fields),
+        # update_item upserts: a document deleted meanwhile must stay deleted.
+        ConditionExpression="attribute_exists(PK)",
     )
     return get_doc_meta(doc_id)
+
+
+def _restore_version_artefacts(bucket: str, version: dict[str, Any]) -> int:
+    """Copy a version's own artefact copies back to the fixed keys it lists.
+    Returns how many were restored (0 for a version with no copies)."""
+    from .s3 import copy_object, object_exists
+
+    restored = 0
+    for field, source in (version.get("runKeys") or {}).items():
+        dest = version.get(field)
+        try:
+            if not (source and dest) or not object_exists(bucket, source):
+                continue
+            copy_object(bucket, source, dest)
+            restored += 1
+        except Exception as exc:  # noqa: BLE001 — finish the rollback; the rest still helps
+            log.warning("ddb.version_artefact_restore_failed", artefact=field, error_type=type(exc).__name__)
+    log.info("ddb.version_artefacts_restored", version=version.get("versionNumber"), restored=restored)
+    return restored
+
+
+def _drop_version_artefacts(bucket: str, version: dict[str, Any]) -> None:
+    """Delete a deleted version's own artefact copies. Best-effort."""
+    from .s3 import delete_object
+
+    for key in (version.get("runKeys") or {}).values():
+        try:
+            delete_object(bucket, key)
+        except Exception as exc:  # noqa: BLE001 — the version row is already gone
+            log.warning("ddb.version_artefact_delete_failed", error_type=type(exc).__name__)
+
+
+def _delete_run_records(doc_id: str, run_id: str) -> int:
+    """Remove one run's search records. Best-effort: returns how many went."""
+    try:
+        from .opensearch import delete_run
+        return delete_run(doc_id, run_id)
+    except Exception as exc:  # noqa: BLE001 — the rollback itself has happened
+        log.warning("ddb.version_search_cleanup_failed", error_type=type(exc).__name__)
+        return 0
 
 
 def delete_doc_entirely(doc_id: str) -> None:
@@ -389,7 +599,20 @@ def delete_doc_entirely(doc_id: str) -> None:
         KeyConditionExpression=Key("PK").eq(f"DOC#{doc_id}"),
         ProjectionExpression="PK, SK",
     )
+    # The other half of each lineage edge lives in the OTHER document's
+    # partition: DOC#<parent> / CHILD#<doc> for a LINK#, DOC#<child> / LINK#<doc>
+    # for a CHILD#. Delete those too, or the parent keeps listing a child (or a
+    # child keeps pointing at a parent) that no longer exists.
+    reverse: list[dict[str, str]] = []
+    for item in items:
+        sk = str(item.get("SK", ""))
+        if sk.startswith("LINK#"):
+            reverse.append({"PK": f"DOC#{sk[len('LINK#'):]}", "SK": f"CHILD#{doc_id}"})
+        elif sk.startswith("CHILD#"):
+            reverse.append({"PK": f"DOC#{sk[len('CHILD#'):]}", "SK": f"LINK#{doc_id}"})
     with _table().batch_writer() as batch:
+        for key in reverse:
+            batch.delete_item(Key=key)
         for item in items:
             batch.delete_item(Key={"PK": item["PK"], "SK": item["SK"]})
 
@@ -554,24 +777,44 @@ def _is_conditional_failure(exc: Exception) -> bool:
         exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException"
 
 
+_BATCH_GET_TRIES = 6
+_sleep = time.sleep          # replaced in tests
+
+
+def batch_get_all(resource: Any, table_name: str, keys: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """BatchGetItem (100 keys per call), following UnprocessedKeys.
+
+    DynamoDB hands back the keys it could not read under throttling; the retry
+    waits (exponential backoff, full jitter) so it does not hit the same
+    throttle again at once. Keys still unread after every try raise — silently
+    returning fewer items would make a document or project look missing.
+    """
+    out: list[dict[str, Any]] = []
+    for start in range(0, len(keys), 100):
+        pending: dict[str, Any] = {table_name: {"Keys": keys[start:start + 100]}}
+        for attempt in range(_BATCH_GET_TRIES):
+            if attempt:
+                _sleep(random.uniform(0, min(2.0, 0.05 * 2 ** attempt)))
+            resp = resource.batch_get_item(RequestItems=pending)
+            out.extend((resp.get("Responses") or {}).get(table_name, []))
+            pending = resp.get("UnprocessedKeys") or {}
+            if not pending:
+                break
+        if pending:
+            left = sum(len(spec.get("Keys") or []) for spec in pending.values())
+            log.warning("ddb.batch_get_unprocessed", table=table_name, unprocessed=left)
+            raise RuntimeError(f"BatchGetItem left {left} key(s) unread after {_BATCH_GET_TRIES} tries")
+    return out
+
+
 def _batch_get(keys: list[dict[str, str]]) -> list[dict[str, Any]]:
-    """BatchGetItem (100 keys per call), following UnprocessedKeys."""
+    """BatchGetItem on the documents table (see batch_get_all)."""
     if not keys:
         return []
     name = settings.table_name
     if not name:
         raise RuntimeError("TABLE_NAME env var is not set")
-    out: list[dict[str, Any]] = []
-    resource = dynamodb_resource()
-    for start in range(0, len(keys), 100):
-        pending: dict[str, Any] = {name: {"Keys": keys[start:start + 100]}}
-        for _ in range(6):
-            resp = resource.batch_get_item(RequestItems=pending)
-            out.extend((resp.get("Responses") or {}).get(name, []))
-            pending = resp.get("UnprocessedKeys") or {}
-            if not pending:
-                break
-    return out
+    return batch_get_all(dynamodb_resource(), name, keys)
 
 
 def get_docs(doc_ids: list[str]) -> list[dict[str, Any]]:

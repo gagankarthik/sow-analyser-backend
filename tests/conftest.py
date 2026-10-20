@@ -50,6 +50,8 @@ def _offline(monkeypatch):
     monkeypatch.setattr(openai_client, "openai_client", no_openai)
     # Retries must not actually wait, and state must not leak between tests.
     monkeypatch.setattr(openai_client, "_sleep", lambda _s: None)
+    from shared import dynamodb
+    monkeypatch.setattr(dynamodb, "_sleep", lambda _s: None)
     openai_client.set_deadline(None)
     openai_client.usage_snapshot(reset=True)
     openai_client._quirks.clear()

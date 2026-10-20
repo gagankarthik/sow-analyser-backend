@@ -35,7 +35,7 @@ from typing import Any
 
 from .dates import (
     add_offset, anchor_key, detect_day_first, find_dates, is_iso_date, offset_days, parse_date,
-    parse_offset, plausible,
+    parse_offset, plausible, stated_term,
 )
 from .text import normalize, title_similarity
 
@@ -352,7 +352,24 @@ def build_key_dates(
             break
     known = anchors()
 
+    # No term end from the model, but the document states its length ("an
+    # initial term of thirty-six (36) months"): count it from the effective date.
     tl = result.get("timeline") or {}
+    start_anchor = known.get("effective") or known.get("start")
+    if "term_end" not in known and not tl.get("endDate") and start_anchor:
+        term = stated_term(text)
+        if term:
+            value, unit, sentence = term
+            c = _cand("term_end", None, None, sentence, origin="derived")
+            _normalise(c, day_first)
+            c.update(date=None, ambiguous=False, issues=[], anchor="effective", offsetValue=value, offsetUnit=unit,
+                     offsetDays=offset_days(value, unit),
+                     _rule={"value": value, "unit": unit, "direction": 1, "anchor": "effective"})
+            if _resolve(c, start_anchor):
+                c.pop("_rule", None)
+                cands.append(c)
+                known = anchors()
+
     derived_term_end = known.get("term_end") if not tl.get("endDate") else None
 
     # Notice-to-cancel deadline = term end (or renewal date) − notice days.

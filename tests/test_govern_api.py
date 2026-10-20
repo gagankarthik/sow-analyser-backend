@@ -493,3 +493,40 @@ def test_purchase_order_and_pricing_model_are_editable(world):
     c = c.get("contract", c)
     assert c["poNumber"] == "PO-2026-0412" and c["poAmount"] == 50000 and c["pricingModel"] == "time_materials"
     assert call("PATCH", "/contracts/lic-1", OWNER, body={"pricingModel": "barter"})[0] == 400
+
+
+# ---------------------------------------------------------------------------
+# A document Sonar could not read; removing a contract
+# ---------------------------------------------------------------------------
+
+
+def test_a_document_that_is_not_an_agreement_is_not_left_reading(gov, ddb, monkeypatch):
+    install_analysis(monkeypatch, ddb)
+    seed_doc(ddb, "rfq-1", status="CLASSIFYING", doc_type="OTHER")
+    assert call("POST", "/contracts", OWNER, {"docId": "rfq-1"})[0] == 201
+    ddb.items[("DOC#rfq-1", "META")].update(status="FAILED", errorCode="not_agreement")
+    c = contract(cid="rfq-1")
+    assert (c["analysisStatus"], c["analysisError"]) == ("FAILED", "not_agreement")
+    assert c["nextStep"]["action"] == "analyze_anyway"
+    assert c["nextStep"]["headline"] == "Sonar doesn't think this is an agreement."
+    assert c["waitingOn"]["label"] == "Sonar couldn't analyze this document"
+    ddb.items[("DOC#rfq-1", "META")]["errorCode"] = "ai_unavailable"
+    assert contract(cid="rfq-1")["nextStep"]["action"] == "reanalyze"
+
+
+def test_removing_a_contract_takes_it_off_the_board_and_out_of_the_trends(world):
+    from shared.govern import aggregates
+
+    for entry in store.activity.all_for_tenant_contracts(["lic-1"]):
+        aggregates.record(entry)
+    tenant = f"u-{OWNER}"
+    before = store.metrics.days(tenant, sorted({e["at"][:10] for e in store.activity.all_for_tenant_contracts(["lic-1"])}))
+    assert sum(v.get("received", 0) for v in before.values()) == 1
+
+    assert call("DELETE", "/contracts/lic-1", EDITOR)[0] == 403       # only the document owner removes
+    status, body = call("DELETE", "/contracts/lic-1", OWNER)
+    assert (status, body["deleted"], body["docIds"]) == (200, True, ["lic-1"])
+    assert store.contracts.get("lic-1") is None and store.contracts.blockers("lic-1") == []
+    after = store.metrics.days(tenant, list(before))
+    assert sum(v.get("received", 0) for v in after.values()) == 0
+    assert call("DELETE", "/contracts/lic-1", OWNER)[0] == 404

@@ -65,8 +65,10 @@ from shared.access import Caller, can, normalise_email, normalise_role, workspac
 from shared.auth import AuthError, jwt_claims
 from shared.aws import s3_client
 from shared.dynamodb import (
+    claim_doc_run,
     delete_doc_entirely,
     delete_doc_version,
+    edit_doc_fields,
     get_compliance_packs,
     get_doc_meta,
     put_compliance_packs,
@@ -75,7 +77,7 @@ from shared.dynamodb import (
     update_doc_fields,
 )
 from shared.compliance import resolve_enabled_packs, KNOWN_PACK_IDS
-from shared.logger import get_logger
+from shared.logger import get_logger, safe_trace
 from shared.opensearch import get_clause_vector, knn_search
 from shared.s3 import presign_get
 from shared.schema import now_iso
@@ -141,8 +143,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         return _route(method, path, event, caller)
     except ddb.ProjectConflict:
         return _err(409, "This project was changed by someone else at the same time. Please try again.", "conflict")
+    except ddb.DocumentConflict:
+        return _err(409, "This document was changed by someone else at the same time. Please try again.", "conflict")
     except Exception as exc:
-        log.exception("api.unhandled_error", error_type=type(exc).__name__)
+        log.error("api.unhandled_error", error_type=type(exc).__name__, trace=safe_trace(exc))
         return _err(500, "Internal server error", "internal")
 
 
@@ -931,10 +935,11 @@ def _get_upload_url(event: dict[str, Any], caller: Caller) -> dict[str, Any]:
             doc_id=doc_id, tenant_id=caller.tenant_id, owner_sub=caller.sub, owner_email=caller.email,
             filename=filename, doc_type=doc_type, project_ids=[project_id] if project_id else [],
         ))
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 — answered with a 500 below
         # The pipeline only processes uploads that have a META row owned by the
         # key's tenant, so handing out a URL without one would lose the upload.
-        log.exception("api.upload_url.meta_write_failed", docId=doc_id)
+        log.error("api.upload_url.meta_write_failed", docId=doc_id,
+                  error_type=type(exc).__name__, trace=safe_trace(exc))
         return _err(500, "Could not start the upload. Please try again.", "internal")
 
     if project_id:
@@ -1018,11 +1023,16 @@ def _reprocess_document(doc_id: str, caller: Caller, force: bool = False) -> dic
         return _err(409, "Original upload is no longer available to re-analyze", "conflict")
     # Each run costs several LLM calls. Refuse to stack a second run on top of
     # one that is still in flight, so the endpoint can't be used to burn spend.
+    # The read is only a fast path: the claim below is the real guard — it marks
+    # the document PENDING only if no run holds it, atomically, so two clicks
+    # that both pass this check cannot both start a run.
     if _in_flight(meta):
         return _err(409, "Analysis is already in progress for this document", "in_progress")
-    if force:
-        # "Analyze anyway": a person says this is an agreement despite the check.
-        update_doc_fields(doc_id, {"skipAgreementCheck": True})
+    stale_before = (datetime.now(timezone.utc) - _IN_FLIGHT_GRACE).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # "Analyze anyway" (force): a person says this is an agreement despite the check.
+    if not claim_doc_run(doc_id, _IN_FLIGHT_STATUSES, stale_before,
+                         fields={"skipAgreementCheck": True} if force else None):
+        return _err(409, "Analysis is already in progress for this document", "in_progress")
 
     try:
         s3_client().copy_object(
@@ -1034,10 +1044,15 @@ def _reprocess_document(doc_id: str, caller: Caller, force: bool = False) -> dic
             ContentType=_content_type(raw_key),
         )
     except Exception as exc:
-        log.exception("api.reprocess_failed", docId=doc_id, error_type=type(exc).__name__)
+        log.error("api.reprocess_failed", docId=doc_id, error_type=type(exc).__name__, trace=safe_trace(exc))
+        # No run was started: release the claim so the user can try again now
+        # rather than after the in-flight grace period.
+        try:
+            update_doc_fields(doc_id, {"status": meta.get("status") or "FAILED"})
+        except Exception as release_exc:  # noqa: BLE001 — the 500 below still stands
+            log.warning("api.reprocess_release_failed", docId=doc_id, error_type=type(release_exc).__name__)
         return _err(500, "Failed to re-trigger analysis", "internal")
 
-    update_doc_fields(doc_id, {"status": "PENDING"})
     log.info("api.reprocess_triggered", docId=doc_id)
     return _ok({"reprocessing": True, "docId": doc_id})
 
@@ -1092,9 +1107,10 @@ def _update_document(doc_id: str, caller: Caller, event: dict[str, Any]) -> dict
             return _err(400, "title is too long (max 500 characters)", "bad_request")
         body["title"] = title
 
-    # Remember which fields a person set, so a later re-analysis keeps them.
-    edited = sorted(set(meta.get("userEdited") or []) | set(body.keys()))
-    update_doc_fields(doc_id, {**body, "userEdited": edited})
+    # Remember which fields a person set, so a later re-analysis keeps them
+    # (atomically: two edits at once both stay recorded).
+    if not edit_doc_fields(doc_id, body):
+        return _err(404, _NOT_FOUND, "not_found")
     updated = get_doc_meta(doc_id)
     log.info("api.document_updated", docId=doc_id, fields=list(body.keys()))
     return _ok({"document": _clean(dict(updated or {}, _role=meta["_role"]), caller)})

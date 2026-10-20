@@ -9,6 +9,13 @@ so the pipeline handler converts every failure into one of these:
   the user ("This file is 80 MB. The limit is 50 MB.").
 * ``PipelineStageError`` — the wrapper the handler raises for anything else,
   carrying a generic, stage-appropriate message and a reference id for support.
+  Two subclasses tell Step Functions what to do (it matches on the class NAME,
+  which Lambda reports as the errorType):
+
+  - ``PipelineTransientError``  — the AI service was unavailable or timed out;
+    the state machine retries the stage after a pause before giving up;
+  - ``PipelineSupersededError`` — another run of the same document saved its
+    version first; this run stops WITHOUT marking the document failed.
 """
 from __future__ import annotations
 
@@ -29,6 +36,26 @@ class PipelineStageError(RuntimeError):
         super().__init__(message)
         self.stage = stage
         self.code = code
+
+
+class PipelineTransientError(PipelineStageError):
+    """A stage failure worth retrying as is (the AI service was down, busy or
+    slow). Step Functions retries on this name before routing to MarkFailed."""
+
+
+class PipelineSupersededError(PipelineStageError):
+    """This run lost the race to save its version to another run of the same
+    document. Step Functions ends the run quietly: the document is not FAILED."""
+
+
+# Failure codes (see safe_message) that a retry of the stage can fix.
+TRANSIENT_CODES = frozenset({"ai_unavailable", "timeout"})
+
+
+def stage_error(message: str, *, stage: str, code: str) -> PipelineStageError:
+    """The error the pipeline handler raises for a failed stage."""
+    cls = PipelineTransientError if code in TRANSIENT_CODES else PipelineStageError
+    return cls(message, stage=stage, code=code)
 
 
 _STAGE_MESSAGES = {

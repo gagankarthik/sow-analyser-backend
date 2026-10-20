@@ -194,8 +194,10 @@ def test_embedding_outage_fails_the_stage(env, monkeypatch):
 
 def test_document_with_no_clauses(env):
     state, run = env
-    assert run([]) == {"clauseVectorIds": [], "embeddedCount": 0, "chunkCount": 0, "clauseCount": 0,
-                       "indexFailures": 0, "searchable": False}
+    out = run([])
+    assert len(out.pop("runId")) == 32                      # the version row still records its run
+    assert out == {"clauseVectorIds": [], "embeddedCount": 0, "chunkCount": 0, "clauseCount": 0,
+                   "indexFailures": 0, "searchable": False}
 
 
 # ── The OpenSearch layer itself ─────────────────────────────────────────────
@@ -410,3 +412,121 @@ def test_history_is_trimmed_and_typed():
     out = rag._history(long)
     assert len(out) == rag.MAX_HISTORY_TURNS and all(len(t["content"]) == rag.MAX_HISTORY_CHARS for t in out)
     assert rag._history("nope") == [] and rag._history([{"role": "tool", "content": "x"}]) == []
+
+
+
+def test_one_bracket_may_cite_several_clauses():
+    citations = [{"clauseNumber": "7.2"}, {"clauseNumber": "8.1"}, {"clauseNumber": "3"}]
+    assert rag._used("Both apply [§7.2, §8.1]; see also [§3; §99].", citations) == ["7.2", "8.1", "3"]
+
+
+@pytest.mark.parametrize("question,follow_up", [
+    ("And the payment terms?", True),
+    ("Is it capped?", True),
+    ("Why?", True),
+    ("What is the governing law of this agreement?", False),    # stands on its own
+    ("Who owns the intellectual property created under the agreement?", False),
+])
+def test_only_a_follow_up_is_searched_with_the_previous_question(question, follow_up):
+    history = [{"role": "user", "content": "What does the indemnity say?"}]
+    assert rag._search_text(question, history).startswith("What does the indemnity say?") is follow_up
+    assert rag._search_text(question, []) == question
+
+
+def _chat_event(owner, question):
+    return {"pathParameters": {"docId": DOC}, "body": json.dumps({"question": question}),
+            "requestContext": {"http": {"method": "POST"}, "authorizer": {"jwt": {"claims": {"sub": owner}}}}}
+
+
+def test_the_review_answers_when_no_clause_matches(monkeypatch, ddb):
+    owner = "11111111-1111-4111-8111-111111111111"
+    monkeypatch.setattr(rag, "get_doc_meta", lambda _id: {"docId": DOC, "tenantId": "acme", "ownerSub": owner})
+    monkeypatch.setattr(rag, "embed_texts", lambda texts, model=None: [[0.0]])
+    monkeypatch.setattr(rag, "clause_search", lambda **kw: [])
+    monkeypatch.setattr(rag, "_contract_brief", lambda doc_id, meta: "Recommended next step: Assign a reviewer")
+    sent = {}
+    monkeypatch.setattr(rag, "chat_text", lambda **kw: sent.update(kw) or "Assign a reviewer.\nNext step: assign one.")
+    out = json.loads(rag._http_handle(_chat_event(owner, "What should I do next?"))["body"])
+    assert out["answer"].startswith("Assign a reviewer") and out["citations"] == []
+    assert "no clause of the agreement matched" in sent["user"] and "<review>" in sent["user"]
+
+
+def test_with_no_clause_and_no_review_sonar_says_so_without_a_model_call(monkeypatch, ddb):
+    owner = "11111111-1111-4111-8111-111111111111"
+    monkeypatch.setattr(rag, "get_doc_meta", lambda _id: {"docId": DOC, "tenantId": "acme", "ownerSub": owner})
+    monkeypatch.setattr(rag, "embed_texts", lambda texts, model=None: [[0.0]])
+    monkeypatch.setattr(rag, "clause_search", lambda **kw: [])
+    monkeypatch.setattr(rag, "_contract_brief", lambda doc_id, meta: None)
+    monkeypatch.setattr(rag, "chat_text", lambda **kw: pytest.fail("no model call without any source"))
+    out = json.loads(rag._http_handle(_chat_event(owner, "Which law governs?"))["body"])
+    assert out["answer"] == rag._NO_HITS_ANSWER
+
+
+def test_the_brief_lists_only_open_blockers(monkeypatch):
+    from shared.govern import store, workflow
+
+    monkeypatch.setattr(rag.settings, "contracts_table", "govern-contracts")
+    c = {"contractId": DOC, "tenantId": "acme", "title": "MSA", "state": "in_review", "stage": "review"}
+    monkeypatch.setattr(store.contracts, "get", lambda cid: c)
+    monkeypatch.setattr(store.contracts, "get_review", lambda cid, did: {
+        "counts": {"missing": 1}, "matrixVersion": 3,
+        "clauses": [{"label": "Payment terms", "tier": "missing", "clauseNumber": None, "standard": "Net 30."}]})
+    monkeypatch.setattr(store.contracts, "blockers", lambda cid: [
+        {"status": "open", "text": "Cap the indemnity"}, {"status": "closed", "text": "Fix the notice address"}])
+    monkeypatch.setattr(workflow, "to_api", lambda contract: {"title": "MSA", "owner": {"name": "Dana Ruiz"}})
+    brief = rag._contract_brief(DOC, {})
+    assert "Cap the indemnity" in brief and "Fix the notice address" not in brief
+    assert "Owner: Dana Ruiz" in brief
+    assert "- Payment terms: missing" in brief and "[§-]" not in brief      # no clause → no fake citation
+
+
+# ── Streaming pushes reuse one AppSync connection ───────────────────────────
+
+
+class _Conn:
+    opened: list = []  # noqa: RUF012 — reset by the test; records every connection made
+
+    def __init__(self, host, timeout=None):
+        self.host, self.sent, self.closed = host, [], False
+        self.fail_next: BaseException | None = None
+        _Conn.opened.append(self)
+
+    def request(self, method, path, body=None, headers=None):
+        if self.fail_next:
+            exc, self.fail_next = self.fail_next, None
+            raise exc
+        self.sent.append((method, path, body))
+
+    def getresponse(self):
+        return type("R", (), {"read": lambda self: b"{}"})()
+
+    def close(self):
+        self.closed = True
+
+
+def test_appsync_pushes_share_one_connection_and_survive_a_stale_one(monkeypatch):
+    import http.client
+    _Conn.opened = []
+    monkeypatch.setattr(rag.http.client, "HTTPSConnection", _Conn)
+    monkeypatch.setattr(rag, "_appsync_conn", None)
+    url = "https://abc.appsync-api.us-east-2.amazonaws.com/graphql"
+    for token in (b"a", b"b", b"c"):
+        rag._post_appsync(url, token, {"Content-Type": "application/json"})
+    assert len(_Conn.opened) == 1 and _Conn.opened[0].host == "abc.appsync-api.us-east-2.amazonaws.com"
+    assert [s[2] for s in _Conn.opened[0].sent] == [b"a", b"b", b"c"] and _Conn.opened[0].sent[0][1] == "/graphql"
+    # The server closed the idle connection: reconnect and send once more.
+    _Conn.opened[0].fail_next = http.client.RemoteDisconnected("closed")
+    rag._post_appsync(url, b"d", {})
+    assert len(_Conn.opened) == 2 and _Conn.opened[0].closed and _Conn.opened[1].sent[0][2] == b"d"
+    # Any other failure is not retried (it may have been delivered) and drops the connection.
+    _Conn.opened[1].fail_next = TimeoutError("slow")
+    with pytest.raises(TimeoutError):
+        rag._post_appsync(url, b"e", {})
+    assert _Conn.opened[1].closed and rag._appsync_conn is None
+
+
+def test_boto_clients_have_a_pool_sized_for_the_stage_fan_out():
+    from shared import aws
+    cfg = aws._BOTO_CONFIG
+    assert cfg.max_pool_connections == max(10, aws.settings.llm_max_concurrency * 2 + 4)
+    assert cfg.tcp_keepalive is True

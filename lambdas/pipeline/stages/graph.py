@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from shared.config import settings
-from shared.dynamodb import get_doc_meta, put_lineage, related_doc_ids, update_status
+from shared.dynamodb import get_doc_meta, get_docs, put_lineage, related_doc_ids, update_status
 from shared.logger import get_logger
 from shared.openai_client import embed_texts
 from shared.opensearch import bm25_search, hybrid_search
@@ -174,12 +174,17 @@ def _find_parent(
 
     owner = (get_doc_meta(doc_id) or {}).get("ownerSub") if candidates else None
     shared = set(related or [])
+    metas = {m.get("docId"): m for m in get_docs(list(candidates))} if candidates else {}
     best: tuple[str | None, float, str] = (None, 0.0, "")
     for did, signals in candidates.items():
-        meta         = get_doc_meta(did) or {}
-        # Same storage tenant is not enough: the parent must be the uploader's own
-        # document or one that shares a project with this one.
-        if did not in shared and owner and meta.get("ownerSub") and meta["ownerSub"] != owner:
+        meta = metas.get(did)
+        # Fail closed. Same storage tenant is not enough: the parent must be the
+        # uploader's own document or one that shares a project with this one. A
+        # candidate that was deleted (no META) or whose owner is unknown is never
+        # chosen — its clauses would otherwise flow into this amendment's changes.
+        if not meta:
+            continue
+        if did not in shared and not (owner and meta.get("ownerSub") == owner):
             continue
         parent_title = meta.get("title", "")
         signals["title"] = title_similarity(title, parent_title) if parent_title else 0.0

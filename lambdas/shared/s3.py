@@ -79,6 +79,12 @@ def presign_put(
     )
 
 
+def copy_object(bucket: str, source_key: str, dest_key: str) -> None:
+    """Server-side copy within one bucket (nothing is downloaded)."""
+    log.debug("s3.copy_object", bucket=bucket, source=source_key, dest=dest_key)
+    s3_client().copy_object(Bucket=bucket, Key=dest_key, CopySource={"Bucket": bucket, "Key": source_key})
+
+
 def delete_object(bucket: str, key: str) -> None:
     if not key:
         return

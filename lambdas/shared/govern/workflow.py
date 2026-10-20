@@ -642,7 +642,7 @@ def auto_assignee(c: dict[str, Any], cfg: dict[str, Any]) -> tuple[dict[str, Any
 # ---------------------------------------------------------------------------
 
 
-def waiting_on(c: dict[str, Any]) -> dict[str, Any]:
+def waiting_on(c: dict[str, Any], analysis_status: str | None = None) -> dict[str, Any]:
     state = c.get("state")
     owner = c.get("owner")
     pi_request = c.get("piRequest")
@@ -652,6 +652,8 @@ def waiting_on(c: dict[str, Any]) -> dict[str, Any]:
                 "office": None, "person": None}
     if state in ("intake", "in_review"):
         if state == "intake" and c.get("stage") == "draft":
+            if str(analysis_status or "").upper() == "FAILED":
+                return {"kind": "nobody", "label": "Sonar couldn't analyze this document", "office": None, "person": None}
             return {"kind": "nobody", "label": "Sonar is still reading this agreement", "office": None, "person": None}
         if owner:
             return {"kind": "internal_reviewer", "label": f"Waiting on reviewer ({display(owner)})",
@@ -720,8 +722,10 @@ def _step_clause(c: dict[str, Any], ref: dict[str, Any]) -> dict[str, Any]:
             "suggestedLanguage": ref.get("suggestedLanguage") or rc.get("suggestedLanguage")}
 
 
-def next_step(c: dict[str, Any], analysis_status: str, now: datetime) -> dict[str, Any]:
-    """The ONE recommended next step — first rule that matches (GOVERN_API.md)."""
+def next_step(c: dict[str, Any], analysis_status: str, now: datetime,
+              analysis_error: str | None = None) -> dict[str, Any]:
+    """The ONE recommended next step — first rule that matches (GOVERN_API.md).
+    ``analysis_error`` is the document's ``errorCode`` when its analysis failed."""
     def step(action: str, headline: str, detail: str | None = None, office: str | None = None,
              clauses: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         return {"action": action, "headline": headline, "detail": detail, "office": office, "clauses": clauses or []}
@@ -745,7 +749,14 @@ def next_step(c: dict[str, Any], analysis_status: str, now: datetime) -> dict[st
             detail = f"{soon} due within 30 days or overdue." if soon else None
             return step("none", headline, detail)
         return step("none", f"{word}. No open obligations to track.")
-    # 2. Sonar still reading.
+    # 2. Sonar could not read it, or is still reading.
+    if str(analysis_status or "").upper() == "FAILED":
+        if analysis_error == "not_agreement":
+            return step("analyze_anyway", "Sonar doesn't think this is an agreement.",
+                        "Analyze it anyway if it is one (an RFQ response, a proposal or a quote is reviewed like any "
+                        "agreement), or remove it from Govern.")
+        return step("reanalyze", "Sonar couldn't finish reading this agreement.",
+                    "Analyze it again, or remove it from Govern.")
     if str(analysis_status or "").upper() != "READY":
         return step("wait", "Sonar is still reading this agreement.",
                     "The review appears here as soon as the analysis finishes.")
@@ -851,7 +862,7 @@ def to_api(c: dict[str, Any], now: datetime | None = None, cfg: dict[str, Any] |
         "college": c.get("college"),
         "stage": c.get("stage") or "draft",
         "state": c.get("state") or "intake",
-        "waitingOn": waiting_on(c),
+        "waitingOn": waiting_on(c, analysis_status),
         "owner": c.get("owner"),
         "createdAt": c.get("createdAt"),
         "updatedAt": c.get("updatedAt"),
@@ -873,7 +884,8 @@ def to_api(c: dict[str, Any], now: datetime | None = None, cfg: dict[str, Any] |
                     "counts": {**counts_default, **(matrix.get("counts") or {})}} if matrix else None),
         "overallRisk": c.get("overallRisk"),
         "openBlockers": len(c.get("openBlockerRefs") or []),
-        "nextStep": next_step(c, analysis_status, now),
+        "nextStep": next_step(c, analysis_status, now, (doc_meta or {}).get("errorCode")),
+        "analysisError": ((doc_meta or {}).get("errorCode") or "internal") if str(analysis_status).upper() == "FAILED" else None,
         "huronRecordId": c.get("huronRecordId"),
         "workdayRef": c.get("workdayRef"),
         "workdayMatch": c.get("workdayMatch") or "unmatched",
@@ -2317,6 +2329,25 @@ def _counts_text(counts: dict[str, Any]) -> str:
     if counts.get("beneficial"):
         parts.append(f"{counts['beneficial']} favourable to you")
     return "; ".join(parts)
+
+
+def remove_contract(contract_id: str, actor: dict[str, Any] | None) -> list[str]:
+    """Take a contract off the board for good: its trend counts are reversed
+    and the contract (with its blockers, obligations, income and reviews) is
+    deleted. The activity log is append-only and keeps its entries. Returns
+    the contract's document ids, for the caller to delete the documents."""
+    from . import aggregates
+
+    c = store.contracts.get(contract_id)
+    if c is None:
+        raise NotFound("Contract not found.")
+    aggregates.forget(c["tenantId"], store.activity.all_for_tenant_contracts([contract_id]))
+    store.contracts.delete(contract_id)
+    doc_ids = list(dict.fromkeys(d for d in [contract_id, *(c.get("versionDocIds") or []),
+                                             c.get("currentDocId"), c.get("pendingDocId")] if d))
+    log.info("govern.contract_removed", contractId=contract_id, tenantId=c["tenantId"],
+             by=(actor or {}).get("email"), docIds=doc_ids)
+    return doc_ids
 
 
 def rescore(contract_id: str, actor: dict[str, Any] | None, *, doc_id: str | None = None,

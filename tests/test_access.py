@@ -532,10 +532,7 @@ def test_chat_works_for_members_and_is_scoped_to_what_they_asked_about(chat):
 def test_appsync_search_passes_only_the_callers_visible_documents(chat, monkeypatch):
     monkeypatch.setattr(rag, "_push_token", lambda *a, **k: None)
 
-    class _Stream(list):
-        pass
-    monkeypatch.setattr(rag, "openai_client", lambda: type("C", (), {"chat": type("X", (), {
-        "completions": type("Y", (), {"create": staticmethod(lambda **kw: _Stream())})})})())
+    monkeypatch.setattr(rag, "chat_stream", lambda *a, **k: iter(()))
     ev = {"arguments": {"input": {"question": "fees?", "docIds": [D_OUT], "tenantId": f"u-{OUTSIDER}"}},
           "identity": {"claims": {"sub": EDITOR, "email": EMAIL[EDITOR], "email_verified": True}}}
     rag._handle(ev)
@@ -682,3 +679,32 @@ def test_migration_refuses_an_orphan_recipient_who_has_no_account(legacy):
     plan = migrate_access.build_plan(ddb, ["default"], resolve, orphans_to="ghost@nowhere.com")
     assert plan["errors"] and "no Cognito user" in plan["errors"][0]
     assert [d["docId"] for d in plan["orphanDocuments"]] == ["L3"]
+
+
+# ── Search scope reads ids and ownership, not whole documents ───────────────
+
+
+def test_visible_doc_ids_reads_a_projection_and_finds_the_same_documents(world):
+    ddb = world["ddb"]
+    owner = caller(OWNER)
+    full = set(owner.visible_documents())
+    ddb.projections.clear()
+    ids = owner.visible_doc_ids()
+    assert set(ids) == full == {D1, "own-owner"}
+    listing = ddb.projections[0]                                  # the GSI1 tenant listing
+    assert listing and "summary" not in listing
+    # every field ownership needs is projected
+    assert set(access._OWNERSHIP_FIELDS) >= {"docId", "ownerSub", "tenantId"}
+    rows = dynamodb.list_tenant_docs(f"u-{OWNER}", attributes=access._OWNERSHIP_FIELDS)
+    assert rows and all(set(r) <= set(access._OWNERSHIP_FIELDS) for r in rows)
+
+
+def test_a_tenant_listing_cut_off_at_its_limit_is_logged(world, caplog):
+    for i in range(3):
+        seed_doc(world["ddb"], f"extra-{i}", OWNER)
+    caplog.set_level("WARNING")
+    assert len(dynamodb.list_tenant_docs(f"u-{OWNER}", limit=2)) == 2
+    assert "ddb.tenant_listing_truncated" in caplog.text
+    caplog.clear()
+    assert len(dynamodb.list_tenant_docs(f"u-{OWNER}", limit=50)) == 5
+    assert "ddb.tenant_listing_truncated" not in caplog.text

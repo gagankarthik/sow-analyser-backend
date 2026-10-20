@@ -28,16 +28,18 @@ from __future__ import annotations
 from typing import Any
 
 from shared.dynamodb import (
+    VersionConflict,
     get_doc_meta,
     put_change,
     put_version,
     query_doc_versions,
+    release_superseded_run,
     update_doc_fields,
     update_status,
 )
 from shared.keydates import compact_for_record
 from shared.logger import get_logger
-from shared.s3 import processed_key
+from shared.s3 import copy_object, processed_key
 from shared.schema import ProcessingStatus, now_iso
 
 log = get_logger("blue-iq.persist")
@@ -120,26 +122,50 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
     stats          = parsed.get("stats") or {}
 
     # ── 1. Version + change rows first ───────────────────────────────────────
-    put_version({
-        "docId":             doc_id,
-        "versionNumber":     version_n,
-        "extractionMethod":  parsed.get("extraction_method"),
+    # The stages write their artefacts to fixed keys (what the API reads). Each
+    # version also keeps its own copy under versions/<n>/ (``runKeys``), so
+    # deleting the newest version can put the previous analysis back.
+    run_id = embeddings.get("runId")
+    artefact_keys = {
         "parsedKey":         processed_key(tenant_id, doc_id, "parsed.json"),
         "classificationKey": processed_key(tenant_id, doc_id, "classification.json"),
         "timelineKey":       processed_key(tenant_id, doc_id, "timeline.json") if timeline else None,
         "diffKey":           processed_key(tenant_id, doc_id, "diff.json") if diffs.get("changes") else None,
-        "createdAt":         now_iso(),
-        # Extraction report for this version (all optional for readers).
-        "checksum":           parsed.get("checksum") or None,
-        "engineVersion":      extraction.get("engineVersion"),
-        "extractionCoverage": extraction.get("coverageRatio"),
-        "segmentation":       extraction.get("segmentation"),
-        "pageCount":          stats.get("pages"),
-        "clauseCount":        clause_count,
-        "unclassifiedCount":  extraction.get("unclassifiedCount", 0),
-        "keyDateCount":       len(classification.get("keyDates") or []),
-        "indexedChunks":      embeddings.get("embeddedCount"),
-    })
+    }
+    run_keys = {field: _version_key(key, version_n) for field, key in artefact_keys.items() if key}
+    try:
+        put_version({
+            "docId":             doc_id,
+            "versionNumber":     version_n,
+            "runId":             run_id,
+            "extractionMethod":  parsed.get("extraction_method"),
+            **artefact_keys,
+            "runKeys":           run_keys,
+            "createdAt":         now_iso(),
+            # Extraction report for this version (all optional for readers).
+            "checksum":           parsed.get("checksum") or None,
+            "engineVersion":      extraction.get("engineVersion"),
+            "extractionCoverage": extraction.get("coverageRatio"),
+            "segmentation":       extraction.get("segmentation"),
+            "pageCount":          stats.get("pages"),
+            "clauseCount":        clause_count,
+            "unclassifiedCount":  extraction.get("unclassifiedCount", 0),
+            "keyDateCount":       len(classification.get("keyDates") or []),
+            "indexedChunks":      embeddings.get("embeddedCount"),
+        })
+    except VersionConflict:
+        # Another run claimed this version number first. If it was THIS run (a
+        # Lambda-level retry after the row was written), carry on; otherwise stop
+        # here, before the losing run rewrites META with its analysis.
+        existing = next((v for v in query_doc_versions(doc_id)
+                         if int(v.get("versionNumber", 0)) == version_n), None) or {}
+        if not run_id or existing.get("runId") != run_id:
+            # Our PERSISTING above may have landed after the winner's READY.
+            release_superseded_run(doc_id, version_n)
+            raise
+        log.info("persist.version_already_written", version=version_n)
+
+    _snapshot_artefacts(event.get("processedBucket", ""), run_keys, artefact_keys)
 
     n_changes = 0
     for ch in diffs.get("changes", []):
@@ -247,6 +273,28 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
         "docType":    keep_or("docType", classification.get("docType") or existing_meta.get("docType") or "OTHER"),
         "revisionOf": existing_meta.get("revisionOf"),
     }
+
+
+def _version_key(fixed_key: str, version_n: int) -> str:
+    """``<tenant>/<doc>/classification.json`` → ``<tenant>/<doc>/versions/000002/classification.json``.
+    Under the document's processed prefix, so deleting the document removes it."""
+    prefix, _, name = fixed_key.rpartition("/")
+    return f"{prefix}/versions/{version_n:06d}/{name}"
+
+
+def _snapshot_artefacts(bucket: str, run_keys: dict[str, str], artefact_keys: dict[str, str | None]) -> None:
+    """Copy this run's artefacts to its per-version keys. Best-effort: without a
+    snapshot, deleting a later version simply cannot restore this one."""
+    if not bucket:
+        return
+    for field, dest in run_keys.items():
+        source = artefact_keys.get(field)
+        if not source:
+            continue
+        try:
+            copy_object(bucket, source, dest)
+        except Exception as exc:  # noqa: BLE001 — the analysis itself is saved
+            log.warning("persist.snapshot_failed", artefact=field, error_type=type(exc).__name__)
 
 
 def _next_version(existing_versions: list[dict[str, Any]]) -> int:

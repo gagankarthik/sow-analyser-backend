@@ -31,7 +31,7 @@ from aws_lambda_powertools import Tracer
 
 from shared.config import settings
 from shared.govern import secrets, store, workflow
-from shared.logger import get_logger
+from shared.logger import get_logger, safe_trace
 
 log = get_logger("blue-iq.govern-webhooks")
 tracer = Tracer(service="blue-iq.govern-webhooks")
@@ -58,7 +58,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     try:
         return docusign(event, datetime.now(timezone.utc))
     except Exception as exc:  # noqa: BLE001 — DocuSign retries a 5xx
-        log.exception("govern_webhooks.unhandled", error_type=type(exc).__name__)
+        log.error("govern_webhooks.unhandled", error_type=type(exc).__name__, trace=safe_trace(exc))
         return _reply(500, {"error": "Internal server error", "code": "internal"})
 
 

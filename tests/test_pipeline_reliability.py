@@ -323,3 +323,254 @@ def test_updates_never_create_a_row_for_a_deleted_document(monkeypatch):
     dynamodb.update_status(DOC, "PARSING")
     dynamodb.update_doc_fields(DOC, {"title": "x"})
     assert [u["ConditionExpression"] for u in table.updates] == ["attribute_exists(PK)"] * 2
+
+
+# ── Overlapping runs: the loser of the version race stops before META ───────
+
+
+def _seed(ddb, sk="META", **fields):
+    ddb.items[(f"DOC#{DOC}", sk)] = {"PK": f"DOC#{DOC}", "SK": sk, "docId": DOC, **fields}
+
+
+def _persist_event(run_id):
+    return {"docId": DOC, "tenantId": "acme", "processedBucket": "processed",
+            "classification": {"clauses": [], "title": "Losing run"}, "embeddings": {"runId": run_id}}
+
+
+@pytest.fixture
+def persist_env(monkeypatch, ddb):
+    monkeypatch.setattr(persist, "copy_object", lambda *a: None)
+    _seed(ddb, tenantId="acme", status="PERSISTING", title="Winning run")
+    _seed(ddb, "V#000001", versionNumber=1, runId="winner")
+    # Both runs read "no versions yet" and computed version 1; the winner saved first.
+    real_query, first = persist.query_doc_versions, [True]
+
+    def stale_then_real(doc_id):
+        if first:
+            first.pop()
+            return []
+        return real_query(doc_id)
+    monkeypatch.setattr(persist, "query_doc_versions", stale_then_real)
+    return ddb
+
+
+def test_a_run_that_loses_the_version_race_does_not_overwrite_meta(persist_env):
+    with pytest.raises(dynamodb.VersionConflict):
+        persist.run(_persist_event("loser"))
+    assert persist_env.doc(DOC)["title"] == "Winning run"
+    assert persist_env.doc(DOC)["status"] == "PERSISTING"     # the winner is still saving: left to it
+
+
+def test_a_losing_run_does_not_leave_a_finished_document_stuck_persisting(persist_env):
+    persist_env.doc(DOC).update(status="READY", latestVersion=1)   # the winner finished first...
+    with pytest.raises(dynamodb.VersionConflict):
+        persist.run(_persist_event("loser"))                  # ...then the loser wrote PERSISTING
+    assert persist_env.doc(DOC)["status"] == "READY" and persist_env.doc(DOC)["title"] == "Winning run"
+    persist_env.doc(DOC).update(status="PENDING")             # a newer run's claim is never undone
+    assert dynamodb.release_superseded_run(DOC, 1) is False
+    assert persist_env.doc(DOC)["status"] == "PENDING"
+
+
+def test_a_retried_persist_of_the_same_run_is_idempotent(persist_env):
+    # A Lambda-level retry: this run's own version row is already there.
+    assert persist.run(_persist_event("winner"))["status"] == "READY"
+    assert persist_env.doc(DOC)["latestVersion"] == 1
+
+
+def test_a_superseded_run_ends_quietly_without_marking_the_document(bucket, monkeypatch):
+    noted = []
+
+    class _Persist:
+        @staticmethod
+        def run(event):
+            raise dynamodb.VersionConflict("version 3 of x was already written")
+
+    monkeypatch.setattr(pipeline.importlib, "import_module", lambda name: _Persist)
+    monkeypatch.setattr(pipeline, "update_doc_fields", lambda *a, **k: noted.append(a))
+    parked = pipeline._park({**_base_event(), "parsed": {"text": "hello"}}, None)
+    with pytest.raises(pipeline.PipelineSupersededError) as info:
+        pipeline.handler({**parked, "_stage": "07_persist"}, _Ctx())
+    assert type(info.value).__name__ == "PipelineSupersededError"     # the name Step Functions catches
+    assert noted == [] and bucket == {}                               # no error fields; state dropped
+
+
+# ── Transient AI failures are retried by Step Functions, not marked FAILED ──
+
+
+@pytest.mark.parametrize("error,transient", [
+    ("RateLimitError", True), ("APITimeoutError", True), ("DeadlineExceededError", True),
+    ("OutputTruncatedError", False), ("KeyError", False),
+])
+def test_ai_outages_raise_the_retryable_error(bucket, monkeypatch, error, transient):
+    from shared.errors import PipelineStageError, PipelineTransientError
+
+    exc_type = type(error, (Exception,), {})
+
+    class _Classify:
+        @staticmethod
+        def run(event):
+            raise exc_type("prompt text that must not leak")
+
+    monkeypatch.setattr(pipeline.importlib, "import_module", lambda name: _Classify)
+    monkeypatch.setattr(pipeline, "update_doc_fields", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "get_doc_meta", lambda _id: {"docId": DOC})
+    parked = pipeline._park({**_base_event(), "parsed": {"text": "hello"}}, None)
+    with pytest.raises(PipelineStageError) as info:
+        pipeline.handler({**parked, "_stage": "02_classify"}, _Ctx())
+    assert isinstance(info.value, PipelineTransientError) is transient
+    assert type(info.value).__name__ == ("PipelineTransientError" if transient else "PipelineStageError")
+    # A retry re-runs the stage with the same input: its parked state must still be there.
+    assert (len(bucket) == 1) is transient
+
+
+def test_the_state_machine_retries_the_transient_error_by_its_exact_name():
+    from pathlib import Path
+
+    from shared.errors import PipelineSupersededError, PipelineTransientError
+
+    tf = (Path(__file__).resolve().parents[1] / "terraform" / "step_functions.tf").read_text(encoding="utf-8")
+    retry = tf[tf.index("_retry = ["):tf.index("sfn_definition")]
+    assert f'["{PipelineTransientError.__name__}"]' in retry
+    assert retry.index(PipelineTransientError.__name__) < retry.index("Lambda.ServiceException")
+    for setting in ("IntervalSeconds = 60", "MaxAttempts     = 2", 'JitterStrategy  = "FULL"'):
+        assert setting in retry
+    catch = tf[tf.index("_catch = ["):tf.index("_task_timeout")]
+    assert catch.index(PipelineSupersededError.__name__) < catch.index("States.ALL")
+    assert "Superseded = {" in tf
+
+
+# ── Deleting the newest version restores the previous analysis ──────────────
+
+
+class _Store(dict):
+    """The processed bucket, for the S3 helpers dynamodb.py imports lazily."""
+
+    def install(self, monkeypatch):
+        from shared import s3 as shared_s3
+        monkeypatch.setattr(shared_s3, "copy_object", lambda b, src, dst: self.__setitem__(dst, self[src]))
+        monkeypatch.setattr(shared_s3, "object_exists", lambda b, key: key in self)
+        monkeypatch.setattr(shared_s3, "delete_object", lambda b, key: self.pop(key, None))
+        return self
+
+
+def _version(n, run_id, snapshot=True):
+    fixed = {"classificationKey": f"acme/{DOC}/classification.json", "parsedKey": f"acme/{DOC}/parsed.json"}
+    row = {"versionNumber": n, "runId": run_id, **fixed}
+    if snapshot:
+        row["runKeys"] = {f: k.replace(f"{DOC}/", f"{DOC}/versions/{n:06d}/") for f, k in fixed.items()}
+    return row
+
+
+def test_deleting_the_newest_version_restores_the_previous_artefacts(monkeypatch, ddb):
+    from shared import opensearch
+    store = _Store({f"acme/{DOC}/classification.json": "v2", f"acme/{DOC}/parsed.json": "p2",
+                    f"acme/{DOC}/versions/000001/classification.json": "v1",
+                    f"acme/{DOC}/versions/000001/parsed.json": "p1",
+                    f"acme/{DOC}/versions/000002/classification.json": "v2",
+                    f"acme/{DOC}/versions/000002/parsed.json": "p2"}).install(monkeypatch)
+    dropped = []
+    monkeypatch.setattr(opensearch, "delete_run", lambda doc_id, run_id: dropped.append(run_id) or 7)
+    _seed(ddb, tenantId="acme", latestVersion=2, searchable=True)
+    _seed(ddb, "V#000001", **_version(1, "run-1"))
+    _seed(ddb, "V#000002", **_version(2, "run-2"))
+
+    meta = dynamodb.delete_doc_version(DOC, 2, processed_bucket="processed")
+    assert meta["latestVersion"] == 1 and meta["searchable"] is False
+    assert store[f"acme/{DOC}/classification.json"] == "v1" and store[f"acme/{DOC}/parsed.json"] == "p1"
+    assert dropped == ["run-2"]                                   # the deleted run's search records
+    assert not any("versions/000002/" in k for k in store)        # and its own copies
+
+
+def test_deleting_a_version_saved_before_snapshots_keeps_the_old_behaviour(monkeypatch, ddb):
+    from shared import opensearch
+    store = _Store({f"acme/{DOC}/classification.json": "v2"}).install(monkeypatch)
+    monkeypatch.setattr(opensearch, "delete_run", lambda *a: pytest.fail("nothing was restored"))
+    _seed(ddb, tenantId="acme", latestVersion=2, searchable=True)
+    _seed(ddb, "V#000001", **_version(1, None, snapshot=False))
+    _seed(ddb, "V#000002", **_version(2, "run-2", snapshot=False))
+    meta = dynamodb.delete_doc_version(DOC, 2, processed_bucket="processed")
+    assert meta["latestVersion"] == 1 and meta["searchable"] is True
+    assert store == {f"acme/{DOC}/classification.json": "v2"}
+
+
+def test_version_rollback_never_recreates_a_deleted_document(monkeypatch, ddb):
+    from botocore.exceptions import ClientError
+    _Store().install(monkeypatch)
+    _seed(ddb, "V#000001", **_version(1, "run-1", snapshot=False))
+    _seed(ddb, "V#000002", **_version(2, "run-2", snapshot=False))
+    with pytest.raises(ClientError):
+        dynamodb.delete_doc_version(DOC, 2, processed_bucket="processed")
+    assert ddb.doc(DOC) is None
+
+
+def test_persist_snapshots_each_versions_artefacts(monkeypatch, ddb):
+    copies = []
+    monkeypatch.setattr(persist, "copy_object", lambda b, src, dst: copies.append((src, dst)))
+    _seed(ddb, tenantId="acme", status="PERSISTING")
+    persist.run({**_persist_event("run-9"), "timeline": {"x": 1}})
+    row = ddb.items[(f"DOC#{DOC}", "V#000001")]
+    assert row["runId"] == "run-9"
+    assert row["runKeys"]["classificationKey"] == f"acme/{DOC}/versions/000001/classification.json"
+    assert (row["classificationKey"], row["runKeys"]["classificationKey"]) in copies
+    assert {src for src, _ in copies} == {row["parsedKey"], row["classificationKey"], row["timelineKey"]}
+
+
+# ── Lineage: one parent per child, and no edges left behind ─────────────────
+
+
+def test_a_new_parent_replaces_the_old_lineage_pair_atomically(ddb):
+    dynamodb.put_lineage(parent_id="parent-old", child_id=DOC)
+    dynamodb.put_lineage(parent_id="parent-new", child_id=DOC)
+    assert ddb.keys_with_prefix(f"DOC#{DOC}") == ["LINK#parent-new"]
+    assert ddb.keys_with_prefix("DOC#parent-old") == []
+    assert ddb.keys_with_prefix("DOC#parent-new") == [f"CHILD#{DOC}"]
+    resource = dynamodb.dynamodb_resource()
+    assert [len(t) for t in resource.transactions] == [2, 4]     # writes and removals in one transaction
+    dynamodb.put_lineage(parent_id="parent-new", child_id=DOC)   # same parent again: nothing removed
+    assert ddb.keys_with_prefix("DOC#parent-new") == [f"CHILD#{DOC}"] and len(resource.transactions[-1]) == 2
+
+
+def test_deleting_a_document_removes_both_halves_of_its_lineage(ddb):
+    _seed(ddb, tenantId="acme")
+    dynamodb.put_lineage(parent_id="parent-1", child_id=DOC)
+    dynamodb.put_lineage(parent_id=DOC, child_id="child-1")
+    dynamodb.delete_doc_entirely(DOC)
+    assert ddb.keys_with_prefix(f"DOC#{DOC}") == []
+    assert ddb.keys_with_prefix("DOC#parent-1") == []            # no CHILD# for a deleted child
+    assert ddb.keys_with_prefix("DOC#child-1") == []             # no LINK# to a deleted parent
+
+
+# ── BatchGetItem: throttled keys are retried with backoff, never dropped ────
+
+
+def test_unprocessed_keys_are_retried_with_backoff_until_read(monkeypatch, ddb):
+    waits = []
+    monkeypatch.setattr(dynamodb, "_sleep", waits.append)
+    for i in range(3):
+        ddb.items[(f"DOC#d{i}", "META")] = {"PK": f"DOC#d{i}", "SK": "META", "docId": f"d{i}"}
+    resource = dynamodb.dynamodb_resource()
+    resource.batch_get_capacity = 1                         # DynamoDB reads one key per call
+    assert sorted(m["docId"] for m in dynamodb.get_docs(["d0", "d1", "d2"])) == ["d0", "d1", "d2"]
+    assert resource.batch_get_calls == 3
+    assert len(waits) == 2 and all(0 <= w <= 2.0 for w in waits)     # a jittered pause before each retry
+
+
+def test_keys_still_unread_after_every_try_raise(monkeypatch, ddb):
+    ddb.items[("DOC#d0", "META")] = {"PK": "DOC#d0", "SK": "META", "docId": "d0"}
+    resource = dynamodb.dynamodb_resource()
+    resource.batch_get_capacity = 0                         # throttled throughout
+    with pytest.raises(RuntimeError, match="unread"):
+        dynamodb.get_docs(["d0"])
+    assert resource.batch_get_calls == dynamodb._BATCH_GET_TRIES
+
+
+def test_govern_batch_reads_do_not_drop_throttled_keys(gov):
+    from shared.govern import store
+    for i in range(2):
+        gov.contracts.items[(f"CON#c{i}", "META")] = {"PK": f"CON#c{i}", "SK": "META", "contractId": f"c{i}"}
+    resource = store._resource()
+    resource.batch_get_capacity = 1
+    assert set(store.contracts.get_many(["c0", "c1"])) == {"c0", "c1"}
+    resource.batch_get_capacity = 0
+    with pytest.raises(RuntimeError):
+        store.contracts.get_many(["c0"])

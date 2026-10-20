@@ -150,6 +150,7 @@ def test_parent_search_covers_the_workspace_and_shared_project_documents(monkeyp
     monkeypatch.setattr(graph, "bm25_search", lambda **kw: seen.append(kw) or [
         {"_score": 5.0, "_source": {"docId": "shared-sow"}}])
     monkeypatch.setattr(graph, "get_doc_meta", lambda _id: {"title": "Website SOW"})
+    monkeypatch.setattr(graph, "get_docs", lambda ids: [{"docId": d, "title": "Website SOW"} for d in ids])
     linked = []
     monkeypatch.setattr(graph, "put_lineage", lambda parent_id, child_id: linked.append((parent_id, child_id)))
     event = {"docId": DOC, "tenantId": "u-uploader", "classification": {
@@ -174,6 +175,44 @@ def test_amendment_without_a_findable_parent_is_marked_unmatched(monkeypatch):
     assert out["parentDocId"] is None and out["status"] == "unmatched"
     assert graph.run({"docId": DOC, "tenantId": "acme",
                       "classification": {"docType": "SOW"}})["lineage"]["status"] == "not_applicable"
+
+
+def _candidate_scope(monkeypatch, metas, related=()):
+    """graph's search finds every id in ``metas`` (None = deleted); the amendment
+    is owned by u-me."""
+    ids = list(metas)
+    monkeypatch.setattr(graph, "update_status", lambda *a, **k: None)
+    monkeypatch.setattr(graph, "related_doc_ids", lambda doc_id: list(related))
+    monkeypatch.setattr(graph, "embed_texts", lambda texts, model=None: [[0.1]])
+    monkeypatch.setattr(graph, "hybrid_search", lambda **kw: [{"docId": d, "score": 1.0} for d in ids])
+    monkeypatch.setattr(graph, "bm25_search", lambda **kw: [{"_score": 5.0, "_source": {"docId": d}} for d in ids])
+    monkeypatch.setattr(graph, "get_doc_meta", lambda _id: {"docId": DOC, "ownerSub": "u-me"})
+    monkeypatch.setattr(graph, "get_docs", lambda wanted: [
+        {"docId": d, **metas[d]} for d in wanted if metas.get(d) is not None])
+    monkeypatch.setattr(graph, "put_lineage", lambda parent_id, child_id: None)
+    return graph._find_parent(doc_id=DOC, tenant_id="acme", related=list(related), classification={
+        "title": "Amendment 1 to Website SOW", "structuralHash": "abcdef123",
+        "identification": {"parentReference": "Website SOW"},
+        "clauses": [{"number": "1", "body": "The fee is increased.", "category": "Fees"}]})
+
+
+@pytest.mark.parametrize("meta", [
+    {"title": "Website SOW"},                              # owner unknown
+    None,                                                  # deleted since it was indexed
+    {"title": "Website SOW", "ownerSub": "u-someone-else"},
+])
+def test_a_parent_candidate_that_is_not_provably_ours_is_never_chosen(monkeypatch, meta):
+    assert _candidate_scope(monkeypatch, {"foreign-sow": meta})[0] is None
+
+
+def test_an_own_or_project_shared_parent_candidate_is_chosen(monkeypatch):
+    own = _candidate_scope(monkeypatch, {"my-sow": {"title": "Website SOW", "ownerSub": "u-me"}})
+    assert own[0] == "my-sow"
+    shared = _candidate_scope(monkeypatch, {"team-sow": {"title": "Website SOW", "ownerSub": "u-teammate"}},
+                              related=["team-sow"])
+    assert shared[0] == "team-sow"
+    # a shared id that was deleted still fails closed
+    assert _candidate_scope(monkeypatch, {"team-sow": None}, related=["team-sow"])[0] is None
 
 
 # ── Timeline ─────────────────────────────────────────────────────────────────

@@ -345,7 +345,8 @@ def _reusable(doc_id: str, bucket: str, key: str, checksum: str, fingerprint: st
         if meta.get("checksum") != checksum:
             return None
         prior = get_json(bucket, key)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 — no reuse just means a fresh analysis
+        log.warning("classify.reuse_check_failed", error_type=type(exc).__name__)
         return None
     ext = (prior or {}).get("extraction") or {}
     if ext.get("checksum") != checksum or ext.get("fingerprint") != fingerprint or not ext.get("complete"):

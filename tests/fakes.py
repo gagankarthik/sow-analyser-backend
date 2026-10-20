@@ -59,36 +59,107 @@ def _eval(cond: Any, item: dict[str, Any]) -> bool:
     raise NotImplementedError(op)
 
 
+_TOKEN = re.compile(r"\s*(<>|<=|>=|[=<>(),]|[#:]?\w+(?:\.\w+)*)")
+
+
+def _condition_holds(condition: str, item: dict[str, Any], values: dict[str, Any], names: dict[str, str]) -> bool:
+    """Evaluate a DynamoDB ConditionExpression string against an item.
+
+    Supports the grammar the code uses: attribute_exists / attribute_not_exists,
+    comparisons (= <> < <= > >=), ``IN (...)``, NOT, AND, OR and parentheses,
+    with #name and :value placeholders. A comparison on a missing attribute is
+    false, as in DynamoDB."""
+    tokens = [t for t in _TOKEN.findall(condition)]
+    if "".join(tokens).replace(" ", "") != condition.replace(" ", ""):
+        raise NotImplementedError(condition)
+    pos = 0
+    missing = object()
+
+    def peek() -> str | None:
+        return tokens[pos] if pos < len(tokens) else None
+
+    def take(expected: str | None = None) -> str:
+        nonlocal pos
+        tok = tokens[pos]
+        if expected is not None and tok.upper() != expected:
+            raise NotImplementedError(condition)
+        pos += 1
+        return tok
+
+    def operand() -> Any:
+        tok = take()
+        if tok.startswith(":"):
+            return values[tok]
+        return item.get(names.get(tok, tok), missing)
+
+    def primary() -> bool:
+        tok = peek()
+        if tok == "(":
+            take("(")
+            out = disjunction()
+            take(")")
+            return out
+        if tok and tok.upper() == "NOT":
+            take()
+            return not primary()
+        if tok in ("attribute_exists", "attribute_not_exists"):
+            take()
+            take("(")
+            name = take()
+            take(")")
+            present = names.get(name, name) in item
+            return present if tok == "attribute_exists" else not present
+        left = operand()
+        cmp = take()
+        if cmp.upper() == "IN":
+            take("(")
+            options = [operand()]
+            while peek() == ",":
+                take(",")
+                options.append(operand())
+            take(")")
+            return left is not missing and left in options
+        right = operand()
+        if left is missing or right is missing:
+            return False
+        return {"=": left == right, "<>": left != right, "<": left < right, "<=": left <= right,
+                ">": left > right, ">=": left >= right}[cmp]
+
+    def conjunction() -> bool:
+        out = primary()
+        while peek() and peek().upper() == "AND":
+            take()
+            out = primary() and out
+        return out
+
+    def disjunction() -> bool:
+        out = conjunction()
+        while peek() and peek().upper() == "OR":
+            take()
+            out = conjunction() or out
+        return out
+
+    result = disjunction()
+    if pos != len(tokens):
+        raise NotImplementedError(condition)
+    return result
+
+
 class FakeTable:
     def __init__(self) -> None:
         self.items: dict[tuple[str, str], dict[str, Any]] = {}
         self.calls: list[tuple[str, Any]] = []
+        self.projections: list[str | None] = []      # ProjectionExpression of each query
 
     # -- helpers ------------------------------------------------------------
     @staticmethod
     def _key(key: dict[str, Any]) -> tuple[str, str]:
         return key["PK"], key["SK"]
 
-    def _check(self, condition: str | None, existing: dict[str, Any] | None, values: dict[str, Any] | None) -> None:
-        if not condition:
-            return
-        for part in [c.strip() for c in condition.split(" AND ")]:
-            m = re.fullmatch(r"attribute_not_exists\((\w+)\)", part)
-            if m:
-                if existing is not None and m.group(1) in existing:
-                    raise conditional_failure()
-                continue
-            m = re.fullmatch(r"attribute_exists\((\w+)\)", part)
-            if m:
-                if existing is None or m.group(1) not in existing:
-                    raise conditional_failure("UpdateItem")
-                continue
-            m = re.fullmatch(r"(\w+) = (:\w+)", part)
-            if m:
-                if existing is None or existing.get(m.group(1)) != (values or {})[m.group(2)]:
-                    raise conditional_failure()
-                continue
-            raise NotImplementedError(part)
+    def _check(self, condition: str | None, existing: dict[str, Any] | None, values: dict[str, Any] | None,
+               names: dict[str, str] | None = None, op: str = "PutItem") -> None:
+        if condition and not _condition_holds(condition, existing or {}, values or {}, names or {}):
+            raise conditional_failure(op)
 
     # -- Table API ----------------------------------------------------------
     def get_item(self, Key: dict[str, Any], **_: Any) -> dict[str, Any]:
@@ -97,11 +168,12 @@ class FakeTable:
         return {"Item": copy.deepcopy(item)} if item else {}
 
     def put_item(self, Item: dict[str, Any], ConditionExpression: str | None = None,
-                 ExpressionAttributeValues: dict[str, Any] | None = None, **_: Any) -> dict[str, Any]:
+                 ExpressionAttributeValues: dict[str, Any] | None = None,
+                 ExpressionAttributeNames: dict[str, str] | None = None, **_: Any) -> dict[str, Any]:
         self.calls.append(("put_item", Item.get("PK")))
         key = self._key(Item)
         assert_storable(Item)
-        self._check(ConditionExpression, self.items.get(key), ExpressionAttributeValues)
+        self._check(ConditionExpression, self.items.get(key), ExpressionAttributeValues, ExpressionAttributeNames)
         self.items[key] = copy.deepcopy(Item)
         return {}
 
@@ -117,7 +189,7 @@ class FakeTable:
         self.calls.append(("update_item", Key))
         key = self._key(Key)
         existing = self.items.get(key)
-        self._check(ConditionExpression, existing, ExpressionAttributeValues)
+        self._check(ConditionExpression, existing, ExpressionAttributeValues, ExpressionAttributeNames, "UpdateItem")
         item = dict(existing) if existing else dict(Key)
         names = ExpressionAttributeNames or {}
         values = ExpressionAttributeValues or {}
@@ -144,12 +216,22 @@ class FakeTable:
 
     def query(self, KeyConditionExpression: Any, IndexName: str | None = None,
               ExclusiveStartKey: Any = None, Limit: int | None = None, ScanIndexForward: bool = True,
+              ProjectionExpression: str | None = None, ExpressionAttributeNames: dict[str, str] | None = None,
               **_: Any) -> dict[str, Any]:
         self.calls.append(("query", IndexName))
         rows = [copy.deepcopy(i) for i in self.items.values() if _eval(KeyConditionExpression, i)]
         sort_key = f"{IndexName}SK" if IndexName else "SK"
         rows.sort(key=lambda i: str(i.get(sort_key, "")), reverse=not ScanIndexForward)
-        return {"Items": rows[:Limit] if Limit else rows}
+        start = (ExclusiveStartKey or {}).get("_offset", 0)
+        rows = rows[start:]
+        if ProjectionExpression:
+            names = ExpressionAttributeNames or {}
+            keep = [names.get(a.strip(), a.strip()) for a in ProjectionExpression.split(",")]
+            rows = [{k: v for k, v in r.items() if k in keep} for r in rows]
+        self.projections.append(ProjectionExpression)
+        if Limit and len(rows) > Limit:
+            return {"Items": rows[:Limit], "LastEvaluatedKey": {"_offset": start + Limit}}
+        return {"Items": rows}
 
     def batch_writer(self, **_: Any) -> Any:
         table = self
@@ -184,20 +266,74 @@ class FakeResource:
         self.table, self.name = table, name
         # More tables by name (the Govern tables — see install_fake_govern).
         self.tables: dict[str, FakeTable] = {name: table}
+        # ``resource.meta.client`` — the low-level client (transactions).
+        self.meta = types.SimpleNamespace(client=self)
+        # Throttling: each batch_get_item call returns at most this many keys
+        # and hands the rest back as UnprocessedKeys (None = no throttling).
+        self.batch_get_capacity: int | None = None
+        self.batch_get_calls = 0
+        self.transactions: list[list[dict[str, Any]]] = []
 
     def Table(self, name: str) -> FakeTable:  # noqa: N802 — boto3 naming
         return self.tables.get(name, self.table)
 
     def batch_get_item(self, RequestItems: dict[str, Any]) -> dict[str, Any]:
+        self.batch_get_calls += 1
         responses: dict[str, list[dict[str, Any]]] = {}
+        unprocessed: dict[str, Any] = {}
+        budget = self.batch_get_capacity
         for table_name, spec in RequestItems.items():
             table = self.tables.get(table_name, self.table)
             out = responses.setdefault(table_name, [])
             for key in spec["Keys"]:
+                if budget is not None and budget <= 0:
+                    unprocessed.setdefault(table_name, {"Keys": []})["Keys"].append(key)
+                    continue
+                if budget is not None:
+                    budget -= 1
                 item = table.items.get((key["PK"], key["SK"]))
                 if item:
                     out.append(copy.deepcopy(item))
-        return {"Responses": responses, "UnprocessedKeys": {}}
+        return {"Responses": responses, "UnprocessedKeys": unprocessed}
+
+    def transact_write_items(self, TransactItems: list[dict[str, Any]]) -> dict[str, Any]:
+        """All-or-nothing Put / Delete / Update-free ConditionCheck, in the
+        low-level (typed) attribute format, like the real client."""
+        from boto3.dynamodb.types import TypeDeserializer
+
+        assert 1 <= len(TransactItems) <= 100, "a transaction holds 1-100 actions"
+        plain = TypeDeserializer().deserialize
+        staged: list[tuple[str, FakeTable, tuple[str, str], dict[str, Any] | None]] = []
+        seen: set[tuple[str, tuple[str, str]]] = set()
+        for action in TransactItems:
+            (kind, spec), = action.items()
+            table = self.tables.get(spec["TableName"], self.table)
+            raw = spec.get("Item") or spec["Key"]
+            body = {k: plain(v) for k, v in raw.items()}
+            key = (body["PK"], body["SK"])
+            assert (spec["TableName"], key) not in seen, "a transaction may touch an item only once"
+            seen.add((spec["TableName"], key))
+            values = {k: plain(v) for k, v in (spec.get("ExpressionAttributeValues") or {}).items()}
+            if spec.get("ConditionExpression") and not _condition_holds(
+                    spec["ConditionExpression"], table.items.get(key) or {}, values,
+                    spec.get("ExpressionAttributeNames") or {}):
+                raise ClientError({"Error": {"Code": "TransactionCanceledException", "Message": "cancelled"}},
+                                  "TransactWriteItems")
+            if kind == "Put":
+                assert_storable(body)
+                staged.append(("put", table, key, body))
+            elif kind == "Delete":
+                staged.append(("delete", table, key, None))
+            elif kind != "ConditionCheck":
+                raise NotImplementedError(kind)
+        self.transactions.append(copy.deepcopy(TransactItems))
+        for op, table, key, body in staged:
+            table.calls.append((f"transact_{op}", key))
+            if op == "put":
+                table.items[key] = body
+            else:
+                table.items.pop(key, None)
+        return {}
 
 
 def install_fake_dynamodb(monkeypatch: Any) -> FakeTable:

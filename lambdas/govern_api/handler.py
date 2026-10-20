@@ -61,7 +61,7 @@ from shared.config import settings
 from shared.govern import aggregates, capture, connectors, secrets, store, workflow
 from shared.govern import matrix as govern_matrix
 from shared.govern.store import ContractConflict, iso
-from shared.logger import get_logger
+from shared.logger import get_logger, safe_trace
 from shared.uploads import clean_upload_filename, pending_document_meta, upload_key
 
 log = get_logger("blue-iq.govern-api")
@@ -145,7 +145,7 @@ def dispatch(event: dict[str, Any]) -> dict[str, Any]:
     except ContractConflict:
         return _err(409, "Someone else changed this at the same time. Please try again.", "conflict")
     except Exception as exc:  # noqa: BLE001
-        log.exception("govern_api.unhandled_error", error_type=type(exc).__name__)
+        log.error("govern_api.unhandled_error", error_type=type(exc).__name__, trace=safe_trace(exc))
         return _err(500, "Internal server error", "internal")
 
 
@@ -430,6 +430,15 @@ def _post_action(event: dict[str, Any], user: GovernUser, contract_id: str) -> d
         raise _Forbidden("You can approve only for an office this contract is waiting on")
     workflow.perform_action(contract_id, action, body, user.person, cfg=cfg)
     return _contract_response(contract_id, user, role)
+
+
+def _delete_contract(event: dict[str, Any], user: GovernUser, contract_id: str) -> dict[str, Any]:
+    """Remove a contract from Govern (the document owner only). The response
+    lists its documents; the app then deletes them (DELETE /documents/{id}),
+    which removes the files and the analysis."""
+    _contract_for(contract_id, user, "delete_document")
+    doc_ids = workflow.remove_contract(contract_id, user.person)
+    return _ok({"deleted": True, "contractId": contract_id, "docIds": doc_ids})
 
 
 def _rescore(event: dict[str, Any], user: GovernUser, contract_id: str) -> dict[str, Any]:
@@ -738,6 +747,7 @@ _RAW_ROUTES: list[tuple[tuple[str, str], Callable[..., dict[str, Any]]]] = [
     (("POST", r"/contracts"), _create_contract),
     (("GET", rf"/contracts/{_SEG}"), _get_contract),
     (("PATCH", rf"/contracts/{_SEG}"), _patch_contract),
+    (("DELETE", rf"/contracts/{_SEG}"), _delete_contract),
     (("POST", rf"/contracts/{_SEG}/actions"), _post_action),
     (("POST", rf"/contracts/{_SEG}/rescore"), _rescore),
     (("POST", rf"/contracts/{_SEG}/blockers"), _add_blocker),

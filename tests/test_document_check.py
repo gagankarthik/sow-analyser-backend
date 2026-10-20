@@ -82,3 +82,32 @@ def test_an_agreement_that_mentions_education_and_invoices_still_passes():
 
 def test_short_text_is_not_judged():
     assert document_check.check("Resume. Skills: Python.", "cv.pdf") is None
+
+
+RFQ_RESPONSE = """
+RESPONSE TO REQUEST FOR QUOTATION RFQ-2026-118
+Submitted by Lakeshore Analytics, Inc. to the Department of Job and Family Services
+
+1. Scope of Work
+Lakeshore will deliver the case-management data migration described in the solicitation.
+
+2. Cost Summary
+Item                       Qty   Unit price   Subtotal
+Data migration lead         1     $18,500      $18,500
+Analyst hours             240        $95      $22,800
+Subtotal                                       $41,300
+Amount due at award: none. Balance due on acceptance of each deliverable.
+
+3. Terms and Conditions
+This quotation is valid for 90 days. Pricing is firm for the period of performance.
+""" * 3
+
+
+def test_an_rfq_response_is_reviewed_like_an_agreement():
+    # Its price table reads like an invoice, but it is the offer an agreement is made from.
+    assert document_check.check(RFQ_RESPONSE, "ODJFS RFQ response.pdf") is None
+    assert document_check.check(RFQ_RESPONSE, "response.pdf") is None
+
+
+def test_a_plain_invoice_is_still_flagged():
+    assert document_check.check(INVOICE, "invoice.pdf") is not None

@@ -474,7 +474,8 @@ locals {
       { Sid = "Config", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query"], Resource = local.govern_table_arns.config },
       { Sid = "Sync", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"],
       Resource = [local.govern_table_arns.sync, "${local.govern_table_arns.sync}/index/*"] },
-      { Sid = "MetricsRead", Effect = "Allow", Action = ["dynamodb:BatchGetItem", "dynamodb:GetItem"], Resource = local.govern_table_arns.metrics },
+      # UpdateItem: removing a contract takes its counts back out of the trends.
+      { Sid = "MetricsReadAndReverse", Effect = "Allow", Action = ["dynamodb:BatchGetItem", "dynamodb:GetItem", "dynamodb:UpdateItem"], Resource = local.govern_table_arns.metrics },
       { Sid = "ProcessedArtefacts", Effect = "Allow", Action = ["s3:GetObject", "s3:PutObject"], Resource = "${aws_s3_bucket.processed.arn}/*" },
       { Sid = "SignRevisionUploads", Effect = "Allow", Action = ["s3:PutObject"], Resource = "${aws_s3_bucket.raw.arn}/tenants/*" },
       { Sid = "IntegrationSecrets", Effect = "Allow", Action = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"],
@@ -663,7 +664,7 @@ locals {
   govern_routes = toset([
     "GET /govern/me",
     "GET /contracts", "POST /contracts", "GET /obligations",
-    "GET /contracts/{id}", "PATCH /contracts/{id}",
+    "GET /contracts/{id}", "PATCH /contracts/{id}", "DELETE /contracts/{id}",
     "POST /contracts/{id}/actions", "POST /contracts/{id}/rescore",
     "POST /contracts/{id}/blockers", "PATCH /contracts/{id}/blockers/{blockerId}",
     "POST /contracts/{id}/obligations", "PATCH /contracts/{id}/obligations/{oblId}",

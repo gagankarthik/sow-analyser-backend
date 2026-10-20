@@ -101,12 +101,14 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
     openai_client.usage_snapshot(reset=True)
     log.info("embed.start", clauses=len(clauses))
 
+    # One id per run: on every search record it writes, and on the version row
+    # persist writes (so deleting that version can remove exactly these records).
+    run_id = uuid.uuid4().hex
     if not clauses:
         event["embeddings"] = {"clauseVectorIds": [], "embeddedCount": 0, "chunkCount": 0,
-                               "clauseCount": 0, "indexFailures": 0, "searchable": False}
+                               "clauseCount": 0, "indexFailures": 0, "searchable": False, "runId": run_id}
         return event
 
-    run_id = uuid.uuid4().hex
     records = build_chunks(clauses, doc_id=doc_id, tenant_id=tenant_id, doc_type=doc_type, run_id=run_id)
 
     # Best-effort index creation / mapping update; don't fail the pipeline if

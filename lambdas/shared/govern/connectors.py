@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..config import settings
-from ..logger import get_logger
+from ..logger import get_logger, safe_trace
 from . import secrets, store, workflow
 from .store import iso
 
@@ -408,7 +408,8 @@ def run_connector(tenant_id: str, connector_id: str, trigger: str = "manual", *,
         status = "failed"
         stored["lastError"] = str(exc)[:300]
     except Exception as exc:  # noqa: BLE001 — recorded on the run, never lost
-        log.exception("govern.connector_run_failed", connector=connector_id, error_type=type(exc).__name__)
+        log.error("govern.connector_run_failed", connector=connector_id, error_type=type(exc).__name__,
+                  trace=safe_trace(exc))
         run["errors"].append({"record": "*", "message": f"Internal error ({type(exc).__name__})"})
         status = "failed"
         stored["lastError"] = "Internal error"

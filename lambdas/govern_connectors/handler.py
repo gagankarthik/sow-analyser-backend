@@ -25,7 +25,7 @@ from aws_lambda_powertools import Tracer
 
 from shared.config import settings
 from shared.govern import connectors, sqs_batch, store
-from shared.logger import get_logger
+from shared.logger import get_logger, safe_trace
 
 log = get_logger("blue-iq.govern-connectors")
 tracer = Tracer(service="blue-iq.govern-connectors")
@@ -49,7 +49,8 @@ def run_schedule() -> dict[str, Any]:
             runs += len(connectors.run_scheduled(tenant_id))
         except Exception as exc:  # noqa: BLE001 — one tenant must not stop the others
             failed += 1
-            log.exception("govern_connectors.tenant_failed", tenantId=tenant_id, error_type=type(exc).__name__)
+            log.error("govern_connectors.tenant_failed", tenantId=tenant_id, error_type=type(exc).__name__,
+                      trace=safe_trace(exc))
     log.info("govern_connectors.scheduled", runs=runs, failedTenants=failed)
     if failed:
         raise RuntimeError(f"{failed} tenant(s) failed")

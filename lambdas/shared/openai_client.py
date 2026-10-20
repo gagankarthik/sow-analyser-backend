@@ -33,7 +33,7 @@ import random
 import threading
 import time
 from functools import lru_cache
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 import httpx
 import orjson
@@ -265,8 +265,8 @@ def _audit(op: str, *texts: str) -> None:
             op=op,
             byte_count=sum(len(t.encode("utf-8")) for t in texts if t),
         )
-    except Exception:  # pragma: no cover - auditing must never break a call
-        pass
+    except Exception as exc:  # noqa: BLE001 — auditing must never break a call
+        log.warning("openai.audit_failed", op=op, error_type=type(exc).__name__)
 
 
 def _log_usage(model: str, op: str, usage: Any) -> None:
@@ -285,8 +285,8 @@ def _log_usage(model: str, op: str, usage: Any) -> None:
             completion_tokens=completion,
             total_tokens=int(getattr(usage, "total_tokens", 0) or prompt + completion),
         )
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 — accounting must never break a call
+        log.warning("openai.usage_unreadable", op=op, error_type=type(exc).__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +467,9 @@ def chat_json(
     return _with_retries("chat.json", once)
 
 
+TRUNCATION_NOTE = "\n\n(The answer was cut short. Ask a narrower question for the rest.)"
+
+
 def chat_text(
     *,
     system: str,
@@ -475,8 +478,15 @@ def chat_text(
     temperature: float = 0.0,
     max_tokens: int | None = None,
     timeout: float | None = None,
+    allow_truncated: bool = False,
 ) -> str:
-    """Free-text chat completion."""
+    """Free-text chat completion.
+
+    A reply cut off by the output limit raises ``OutputTruncatedError`` — unless
+    ``allow_truncated``: a conversational answer is still useful when cut short,
+    so it is returned with ``TRUNCATION_NOTE`` appended, telling the reader it
+    is incomplete rather than letting it pass as the whole answer.
+    """
     mdl = model or settings.chat_model
     _audit("chat.text", system, user)
 
@@ -494,7 +504,16 @@ def chat_text(
                     continue
                 raise
             _log_usage(mdl, "chat.text", getattr(resp, "usage", None))
-            return resp.choices[0].message.content or ""
+            choice = resp.choices[0]
+            text = choice.message.content or ""
+            if getattr(choice, "finish_reason", None) == "length":
+                if not allow_truncated:
+                    raise OutputTruncatedError(
+                        f"chat.text: model output hit the {max_tokens or 'default'}-token limit and was truncated"
+                    )
+                log.warning("openai.chat_text_truncated", model=mdl, max_tokens=max_tokens)
+                return text.rstrip() + TRUNCATION_NOTE
+            return text
         raise ModelOutputError("chat.text: model rejected every supported request form")  # pragma: no cover
 
     return _with_retries("chat.text", once)
@@ -505,6 +524,22 @@ def stream_kwargs(model: str, messages: list[dict[str, str]], temperature: float
     """Request arguments for a streaming chat call, in the form ``model`` accepts."""
     return {**_chat_kwargs(model, messages, temperature, max_tokens,
                            _request_timeout(settings.openai_timeout_s)), "stream": True}
+
+
+def chat_stream(model: str, messages: list[dict[str, str]], temperature: float,
+                max_tokens: int) -> Iterator[Any]:
+    """Streaming chat completion: yields the SDK's chunks.
+
+    Opening the stream goes through the same retries as every other call (a
+    rate limit or connection error before the first token is retried), and the
+    request holds one of the process-wide request slots until the stream ends,
+    so streamed answers count against LLM_MAX_CONCURRENCY like the rest.
+    """
+    stream = _with_retries("chat.stream", lambda: openai_client().chat.completions.create(
+        **stream_kwargs(model, messages, temperature, max_tokens)))
+    _count(calls=1)
+    with _request_slots():
+        yield from stream
 
 
 def embed_texts(texts: Iterable[str], model: str | None = None) -> list[list[float]]:

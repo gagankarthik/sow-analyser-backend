@@ -391,6 +391,21 @@ def delete_stale(doc_id: str, run_id: str) -> int:
     return deleted
 
 
+def delete_run(doc_id: str, run_id: str) -> int:
+    """Remove the records ONE pipeline run wrote for a document — the inverse of
+    ``delete_stale``. Used when that run's version is deleted, so the chat can
+    no longer cite an analysis the user removed."""
+    deleted = 0
+    c = client()
+    query = {"query": {"bool": {"filter": [{"term": {"docId": doc_id}}, {"term": {"runId": run_id}}]}}}
+    for index in (settings.clause_vector_index, settings.clause_text_index):
+        resp = c.delete_by_query(index=index, body=query, refresh=True, conflicts="proceed",
+                                 ignore_unavailable=True)
+        deleted += int(resp.get("deleted", 0))
+    log.info("opensearch.delete_run", docId=doc_id, deleted=deleted)
+    return deleted
+
+
 # ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
@@ -549,17 +564,23 @@ def clause_search(
     Results are de-duplicated by record id. If one channel fails (index missing,
     cluster busy) the other is still used.
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     pool = max(k * 3, 12)
-    channels: list[list[dict[str, Any]]] = []
-    for name, run in (
+    runs = (
         ("knn", lambda: knn_search(vector=vector, tenant_id=tenant_id, k=pool, doc_id=doc_id, doc_ids=doc_ids)),
         ("bm25", lambda: bm25_search(text=text, tenant_id=tenant_id, k=pool, doc_id=doc_id, doc_ids=doc_ids)),
-    ):
-        try:
-            channels.append(run())
-        except Exception as exc:
-            log.warning("opensearch.search_channel_failed", channel=name, error_type=type(exc).__name__)
-            channels.append([])
+    )
+    channels: list[list[dict[str, Any]]] = []
+    # Both channels at once: the answer waits on the slower one, not on both.
+    with ThreadPoolExecutor(max_workers=len(runs)) as ex:
+        futures = [(name, ex.submit(run)) for name, run in runs]
+        for name, fut in futures:
+            try:
+                channels.append(fut.result())
+            except Exception as exc:
+                log.warning("opensearch.search_channel_failed", channel=name, error_type=type(exc).__name__)
+                channels.append([])
     if not any(channels):
         return []
 

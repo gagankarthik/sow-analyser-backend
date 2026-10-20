@@ -130,6 +130,22 @@ def record(entry: dict[str, Any]) -> bool:
     return True
 
 
+def forget(tenant_id: str, entries: Iterable[dict[str, Any]]) -> int:
+    """Take a removed contract's entries back out of the day items, so the
+    trends stop counting it. Returns the number of days changed."""
+    per_day: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for entry in entries:
+        for k, v in deltas(entry).items():
+            per_day[day_of(entry)][k] -= v
+    changed = 0
+    for day, counters in per_day.items():
+        dec = {k: v for k, v in counters.items() if v}
+        if dec:
+            store.metrics.add(tenant_id, day, dec)
+            changed += 1
+    return changed
+
+
 # ---------------------------------------------------------------------------
 # Read side
 # ---------------------------------------------------------------------------

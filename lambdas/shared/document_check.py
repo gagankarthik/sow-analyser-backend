@@ -44,6 +44,16 @@ _KINDS: dict[str, tuple[str, list[str]]] = {
     ]),
 }
 
+# Procurement documents: an RFQ / RFP response, a bid or a quote. Their price
+# tables read like an invoice ("unit price", "qty", "subtotal"), but they are
+# the offer an agreement is made from, so Govern reviews them like one.
+_PROCUREMENT = [
+    r"\brequest for (?:quotations?|quotes?|proposals?|bids?|information)\b", r"\brf[qpi]\b",
+    r"\bsolicitation\b", r"\bofferor\b", r"\bbidder\b", r"\bquotation\b", r"\bproposal\b",
+    r"\bresponse to\b", r"\bscope of (?:work|services)\b", r"\bterms and conditions\b",
+    r"\bpurchase order\b", r"\bprocurement\b", r"\bcost (?:summary|proposal)\b",
+]
+
 # Filenames that say what the file is.
 _NAME_HINTS = {"resume": r"(?:^|[^a-z])(?:resume|résumé|cv|curriculum)(?:[^a-z]|$)", "invoice": r"invoice|receipt"}
 
@@ -65,6 +75,8 @@ def check(text: str, filename: str = "") -> Verdict | None:
         return None  # too little text to judge; the empty-text check handles blanks
     agreement = _count(_AGREEMENT, low)
     name = (filename or "").lower()
+    if _count(_PROCUREMENT, low) >= 3 or re.search(r"(?:^|[^a-z])(?:rf[qp]|bid|quote|proposal)(?:[^a-z]|$)", name):
+        return None  # a procurement document: reviewed like an agreement
     best: tuple[int, str] | None = None
     for kind, (_label, patterns) in _KINDS.items():
         score = _count(patterns, low)

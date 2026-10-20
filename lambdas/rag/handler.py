@@ -22,12 +22,14 @@ Flow
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
 import time
-import urllib.request
+import urllib.parse
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from aws_lambda_powertools import Logger, Tracer
@@ -49,7 +51,7 @@ from shared.guardrails import (
     validate_output,
 )
 from shared.logger import get_logger, safe_trace
-from shared.openai_client import openai_client, embed_texts, chat_text, stream_kwargs
+from shared.openai_client import TRUNCATION_NOTE, chat_stream, chat_text, embed_texts
 from shared.opensearch import clause_search
 
 log: Logger = get_logger("blue-iq.rag")
@@ -70,7 +72,13 @@ MAX_HISTORY_CHARS   = 1200
 # How many matrix findings the contract brief lists (most serious first).
 MAX_BRIEF_FINDINGS  = 12
 _ID_RE              = re.compile(r"[A-Za-z0-9_-]{1,64}")
-_CITE_RE            = re.compile(r"\[§\s*([^\]]{1,60})\]")
+_CITE_RE            = re.compile(r"\[\s*§([^\]]{1,160})\]")
+# "[§7.2, §8.1]", "[§3; §4]", "[§2 and §5]": one bracket may cite several clauses.
+_CITE_SPLIT_RE      = re.compile(r"\s*(?:[,;]|\band\b)\s*")
+# A question that leans on the previous one: "And the payment terms?", "Is it capped?"
+_FOLLOW_UP_RE       = re.compile(
+    r"^\s*(?:and|also|what about|how about|same for|then|why|so)\b"
+    r"|\b(?:it|its|that one|those|these|they|them|the same)\b", re.IGNORECASE)
 _NO_HITS_ANSWER     = (
     "I couldn't find any clauses relevant to that question in this document. "
     "Try rephrasing, or ask about a specific clause or topic."
@@ -165,8 +173,8 @@ def _audit_rag(red: Redaction, **keys: Any) -> None:
             redaction=red,
             **keys,
         )
-    except Exception:  # pragma: no cover - auditing must never break a call
-        pass
+    except Exception as exc:  # noqa: BLE001 — auditing must never break a call
+        log.warning("rag.audit_failed", error_type=type(exc).__name__)
 
 
 @tracer.capture_lambda_handler
@@ -201,7 +209,7 @@ def _scope_for(target_id: str, caller: Caller) -> dict[str, Any] | None:
     if meta:
         if caller.document_role(meta) is None:
             return None
-        return {"tenant_id": meta.get("tenantId"), "doc_id": target_id}
+        return {"tenant_id": meta.get("tenantId"), "doc_id": target_id, "meta": meta}
     if caller.project_role(target_id):
         project = ddb.get_project(target_id)
         doc_ids = list((project or {}).get("docIds") or [])
@@ -267,15 +275,29 @@ def _used(answer: str, citations: list[dict[str, Any]]) -> list[str]:
     offered = {str(c["clauseNumber"]).strip().lower(): c["clauseNumber"] for c in citations}
     out: list[str] = []
     for m in _CITE_RE.finditer(answer or ""):
-        key = m.group(1).strip().lower()
-        if key in offered and offered[key] not in out:
-            out.append(offered[key])
+        for part in _CITE_SPLIT_RE.split(m.group(1)):
+            key = part.strip().lstrip("§").strip().lower()
+            if key in offered and offered[key] not in out:
+                out.append(offered[key])
     return out
+
+
+def _search_text(question: str, history: list[dict[str, str]]) -> str:
+    """What to retrieve with. A follow-up ("and the payment terms?") is
+    searched together with the previous question so it keeps its subject; a
+    question that stands on its own is searched alone, so an earlier topic does
+    not crowd out the clauses it is about."""
+    prev = next((t["content"] for t in reversed(history) if t["role"] == "user"), "")
+    words = len(question.split())
+    if prev and (words <= 4 or (words <= 14 and _FOLLOW_UP_RE.search(question))):
+        return f"{prev}\n{question}"
+    return question
 
 
 def _user_message(blocks: list[str], question: str, brief: str | None = None,
                   history: list[dict[str, str]] | None = None) -> str:
-    parts = [f"<context>\n{chr(10).join(blocks)}\n</context>"]
+    body = chr(10).join(blocks) if blocks else "(no clause of the agreement matched this question)"
+    parts = [f"<context>\n{body}\n</context>"]
     if brief:
         parts.append(f"<review>\n{_as_data(brief)}\n</review>")
     if history:
@@ -318,7 +340,7 @@ def _contract_brief(doc_id: str, meta: dict[str, Any]) -> str | None:
             return None
         api = workflow.to_api(c)
         review = store.contracts.get_review(c["contractId"], c.get("reviewedDocId") or c.get("currentDocId") or c["contractId"])
-        blockers = [b for b in store.contracts.blockers(c["contractId"]) if b.get("status") != "resolved"]
+        blockers = [b for b in store.contracts.blockers(c["contractId"]) if b.get("status") == "open"]
     except Exception as exc:  # noqa: BLE001
         log.warning("rag.brief_failed", error_type=type(exc).__name__)
         return None
@@ -326,7 +348,9 @@ def _contract_brief(doc_id: str, meta: dict[str, Any]) -> str | None:
         f"Contract: {api.get('title') or 'Untitled'} ({api.get('agreementType')}, money {api.get('direction')})",
         f"Stage: {api.get('stage')}; waiting on: {(api.get('waitingOn') or {}).get('label') or 'nobody'}; "
         f"{api.get('daysInStage')} days in this stage; status: {api.get('slaStatus')}",
-        f"Value: {api.get('value')} {api.get('currency') or ''}; term: {api.get('effectiveDate') or '?'} to {api.get('termEndDate') or '?'}",
+        f"Owner: {(api.get('owner') or {}).get('name') or (api.get('owner') or {}).get('email') or 'nobody yet'}",
+        f"Value: {api.get('value') if api.get('value') is not None else 'not known'} {api.get('currency') or ''}; "
+        f"term: {api.get('effectiveDate') or 'not stated'} to {api.get('termEndDate') or 'not stated'}",
         f"Recommended next step: {(api.get('nextStep') or {}).get('headline') or 'none'}",
     ]
     if blockers:
@@ -337,7 +361,8 @@ def _contract_brief(doc_id: str, meta: dict[str, Any]) -> str | None:
                      + ", ".join(f"{_TIER_WORDS.get(k, k)} {v}" for k, v in counts.items() if v))
         findings = sorted(review["clauses"], key=lambda r: _TIER_ORDER.get(r.get("tier"), 9))
         for r in findings[:MAX_BRIEF_FINDINGS]:
-            row = (f"- {r.get('label')} [§{r.get('clauseNumber') or '-'}]: {_TIER_WORDS.get(r.get('tier'), r.get('tier'))}"
+            where = f" [§{r['clauseNumber']}]" if r.get("clauseNumber") else ""
+            row = (f"- {r.get('label')}{where}: {_TIER_WORDS.get(r.get('tier'), r.get('tier'))}"
                    + (f"; favours you: {r.get('beneficialReason')}" if r.get("beneficial") else ""))
             if r.get("tier") not in ("within",):
                 row += (f"\n  Finding: {str(r.get('reason') or '')[:240]}"
@@ -394,22 +419,25 @@ def _http_handle(event: dict[str, Any]) -> dict[str, Any]:
         return _http_resp(200, {"answer": _NO_HITS_ANSWER, "citations": [], "grounded": False})
 
     started = time.monotonic()
-    prev = next((t["content"] for t in reversed(history) if t["role"] == "user"), "")
-    search_text = f"{prev}\n{question}" if prev and len(question) < 80 else question
-    [q_vec] = embed_texts([search_text], model=settings.embedding_model)
-    # Fetch more chunks than clauses wanted: several chunks can belong to one clause.
-    hits = clause_search(text=search_text, vector=q_vec, k=min(top_k * 2, MAX_TOP_K * 2), **scope)
+    multi_doc = "doc_ids" in scope
+    search_text = _search_text(question, history)
+    # The DynamoDB reads (one agreement: its Govern review; a project: document
+    # titles) run while the question is embedded and searched.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        side = (pool.submit(lambda: {m.get("docId"): m.get("title") for m in ddb.get_docs(scope["doc_ids"])})
+                if multi_doc else pool.submit(_contract_brief, target_id, scope.get("meta") or {}))
+        [q_vec] = embed_texts([search_text], model=settings.embedding_model)
+        # Fetch more chunks than clauses wanted: several chunks can belong to one clause.
+        hits = clause_search(text=search_text, vector=q_vec, k=min(top_k * 2, MAX_TOP_K * 2),
+                             **{k: v for k, v in scope.items() if k != "meta"})
+        titles, brief = (side.result(), None) if multi_doc else (None, side.result())
 
-    if not hits:
+    # No clause matched, but the review may still answer ("what is the next step?").
+    if not hits and not brief:
         return _http_resp(200, {"answer": _NO_HITS_ANSWER, "citations": [], "grounded": False})
 
-    multi_doc = "doc_ids" in scope
-    titles = {m.get("docId"): m.get("title") for m in ddb.get_docs(scope["doc_ids"])} if multi_doc else None
     blocks, citations = _assemble(hits, multi_doc, titles)
     blocks, citations = blocks[:top_k], citations[:top_k]
-
-    # One agreement: add its Govern review (ratings, positions, next step).
-    brief = None if multi_doc else _contract_brief(target_id, get_doc_meta(target_id) or {})
     red = _redact(_user_message(blocks, question, brief, history))
     _audit_rag(red, tenantId=caller.tenant_id, targetId=target_id, clauses=len(citations))
 
@@ -419,12 +447,15 @@ def _http_handle(event: dict[str, Any]) -> dict[str, Any]:
         model=settings.model_for("rag"),
         temperature=0.0,
         max_tokens=MAX_ANSWER_TOKENS,
+        # A long answer cut at the cap is still worth showing — with a note
+        # saying so — rather than failing the question.
+        allow_truncated=True,
     )
     # Restore the real values the provider never saw, then guardrail-check the reply.
     answer = Redactor.restore(answer, red.mapping)
     validate_output(answer, red.mapping)
     used = _used(answer, citations)
-    log.info("rag.answered", chunks=len(hits), clauses=len(citations), cited=len(used),
+    log.info("rag.answered", chunks=len(hits), clauses=len(citations), cited=len(used), brief=bool(brief),
              durationMs=int((time.monotonic() - started) * 1000))
     return _http_resp(200, {
         "answer": answer,
@@ -483,20 +514,23 @@ def _handle(event: dict[str, Any]) -> dict[str, Any]:
     red = _redact(user_msg)
     _audit_rag(red, tenantId=caller.tenant_id, sessionId=session_id, clauses=len(citations[:top_k]))
 
-    # Stream response.
+    # Stream response (opened with the client's retries, inside a request slot).
     model = settings.model_for("rag")
-    stream = openai_client().chat.completions.create(**stream_kwargs(
+    stream = chat_stream(
         model,
         [{"role": "system", "content": _SYSTEM_PROMPT}, {"role": "user", "content": red.text}],
         0.0, MAX_ANSWER_TOKENS,
-    ))
+    )
 
     restorer        = StreamRestorer(red.mapping)
     buf: list[str]  = []
     full: list[str] = []
     last_flush      = time.monotonic()
+    finish: str | None = None
 
     for chunk in stream:
+        if chunk.choices and getattr(chunk.choices[0], "finish_reason", None):
+            finish = chunk.choices[0].finish_reason
         delta = (chunk.choices[0].delta.content if chunk.choices and chunk.choices[0].delta else None)
         if not delta:
             continue
@@ -516,6 +550,11 @@ def _handle(event: dict[str, Any]) -> dict[str, Any]:
     if tail:
         buf.append(tail)
         full.append(tail)
+    if finish == "length":
+        # Cut off at MAX_ANSWER_TOKENS: say so instead of ending mid-sentence.
+        log.warning("rag.stream_truncated", max_tokens=MAX_ANSWER_TOKENS)
+        buf.append(TRUNCATION_NOTE)
+        full.append(TRUNCATION_NOTE)
     if buf:
         _push_token(session_id, "".join(buf), final=False)
     _push_token(session_id, "", final=True)
@@ -568,11 +607,37 @@ def _push_token(session_id: str, token: str, *, final: bool) -> None:
 
     SigV4Auth(creds, "appsync", settings.aws_region).add_auth(req)
 
-    http_req = urllib.request.Request(
-        req.url, data=body, headers=dict(req.headers.items()), method="POST"
-    )
     try:
-        with urllib.request.urlopen(http_req, timeout=2.0) as r:
-            r.read()
+        _post_appsync(req.url, body, dict(req.headers.items()))
     except Exception as exc:
         log.warning("appsync.push.failed", error_type=type(exc).__name__, final=final)
+
+
+# One kept-alive HTTPS connection to AppSync per process: a streamed answer is
+# dozens of pushes, and opening a fresh TLS connection for each one was most of
+# the time per token. The handler is single-threaded, so no lock is needed.
+_appsync_conn: http.client.HTTPSConnection | None = None
+
+
+def _post_appsync(url: str, body: bytes, headers: dict[str, str]) -> None:
+    """POST over the shared connection. A connection the server already closed
+    (idle between invocations) fails before anything is sent; that case is
+    reconnected and sent once more. Any other failure drops the connection."""
+    global _appsync_conn
+    parts = urllib.parse.urlsplit(url)
+    for attempt in (1, 2):
+        if _appsync_conn is None:
+            _appsync_conn = http.client.HTTPSConnection(parts.netloc, timeout=2.0)
+        try:
+            _appsync_conn.request("POST", parts.path or "/", body=body, headers=headers)
+            _appsync_conn.getresponse().read()
+            return
+        except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError):
+            _appsync_conn.close()
+            _appsync_conn = None
+            if attempt == 2:
+                raise
+        except Exception:
+            _appsync_conn.close()
+            _appsync_conn = None
+            raise

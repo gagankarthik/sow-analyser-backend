@@ -22,6 +22,7 @@ Tier          = "within" | "fallback" | "deviates" | "unacceptable" | "review" |
 SlaStatus     = "on_track" | "amber" | "red" | "none"
 RejectReason  = "unacceptable_terms" | "sponsor_withdrew" | "pi_withdrew" | "duplicate" | "out_of_scope" | "other"
 NextAction    = "approve" | "send_back" | "escalate" | "reject" | "send_for_signature" | "wait" | "assign" | "add_value" | "none"
+              | "analyze_anyway" | "reanalyze"
 ObligationKind= "sponsor_report" | "milestone_payment" | "royalty_report" | "diligence_milestone"
               | "publication_review" | "term_end" | "closeout" | "other"
 IncomeKind    = "upfront" | "milestone" | "royalty" | "equity" | "sublicense" | "sponsor_funding" | "subaward" | "other"
@@ -78,6 +79,7 @@ Contract {                           # list + detail
   targetDays: number | null, slaStatus: SlaStatus,
   rounds: number,
   analysisStatus: string,                        # documents-table status of currentDocId (READY, CLASSIFYING …)
+  analysisError: string | null,                  # the document's errorCode when analysisStatus is FAILED ("not_agreement", …)
   value: number | null,                          # manualValue ?? extractedValue ?? expectedValue
   valueSource: "manual" | "extracted" | "expected" | null,
   extractedValue: number | null, manualValue: number | null, expectedValue: number | null,
@@ -157,6 +159,7 @@ ActivityEntry {
 | POST | `/contracts` | edit (on the document) | `{docId, ...any PATCH field}` — intake right after upload: creates the contract at stage `draft`, state `intake` (analysisStatus = the document's status), auto-assigns; idempotent (an existing contract is patched instead). The intake Lambda keeps these fields (user-entered intake fields are never overwritten by inference). | `{contract: ContractDetail}` (201 when created) |
 | GET | `/contracts/{id}` | view | | `{contract: ContractDetail}` |
 | PATCH | `/contracts/{id}` | edit | any of `agreementType, direction, counterparty, sponsor, piName, department, college, expectedValue, manualValue, currency, requestedDate, effectiveDate, termEndDate, huronRecordId, workdayRef, workdayMatch` | `{contract: ContractDetail}` |
+| DELETE | `/contracts/{id}` | delete_document (the document owner) | | `{deleted: true, contractId, docIds}` — removes the contract with its blockers, obligations, income and reviews, and takes its counts back out of the trends (the activity log keeps its entries). The app then deletes each of `docIds` with `DELETE /documents/{id}`. |
 | POST | `/contracts/{id}/actions` | see below | `{action, ...}` | `{contract: ContractDetail}` |
 | POST | `/contracts/{id}/rescore` | edit | `{}` | `{contract: ContractDetail}` — re-grades `currentDocId` against the CURRENT matrix version, regenerates Sonar blockers (reviewer blockers untouched) |
 | POST | `/contracts/{id}/blockers` | edit | `{text, clauseType?, office?, suggestedLanguage?}` | `{contract}` |
@@ -187,7 +190,9 @@ Actions (`POST /contracts/{id}/actions`), all write an activity entry; invalid o
 
 Recommended next step (server-computed; first rule that matches):
 1. rejected/closed → `none`; signed → `none` (headline about obligations); active → `none`.
-2. analysis not READY → `wait` ("Sonar is still reading this agreement").
+2. analysis FAILED → `analyze_anyway` when the document did not look like an agreement (`not_agreement`), else
+   `reanalyze`; the app offers the analysis (POST /documents/{id}/reprocess, `force` for `analyze_anyway`) or removal.
+   Analysis not READY otherwise → `wait` ("Sonar is still reading this agreement").
 3. no owner → `assign`.
 3b. an open `piRequest` → `wait` ("Waiting on {PI or department} to answer").
 4. any open blocker tied to an `unacceptable` clause with no fallback → `reject` (or `escalate` to its office if the matrix names one and it has not approved).

@@ -788,9 +788,9 @@ def _check_payment(text: str, th: dict[str, Any]) -> _Check:
     days = None
     for s in _sentences(text):
         low = s.lower()
-        if not re.search(r"payable|\bdue\b|\bpay\b|\bpaid\b", low):
+        net = re.search(r"\bnet\s*-?\s*(\d{1,3})\b", low)
+        if not (net or re.search(r"payable|\bdue\b|\bpay\b|\bpaid\b", low)):
             continue
-        net = re.search(r"\bnet\s*(\d{1,3})\b", low)
         cands = [int(net.group(1))] if net else [d for d, unit, _p in _durations(s) if unit in ("day", "week")]
         if cands:
             days = max(cands) if days is None else max(days, max(cands))
@@ -1822,6 +1822,16 @@ _SIGNALS: dict[str, str] = {
     "Term": r"\bterm\b|renewal",
     "AuditRights": r"\baudit",
     "DataProcessing": r"data\s+(?:protection|privacy|security)|privacy|ferpa|hipaa",
+    "Payment": r"payment|invoic|compensation|billing",
+}
+# Wording in a clause BODY that states the terms of a matrix clause type, even
+# when the clause is filed under another type the matrix grades: "Fees and
+# Payment" is classified as Fees, but its "net 30" is the payment term.
+_BODY_SIGNALS: dict[str, str] = {
+    "Payment": r"\bnet\s*-?\s*\d{1,3}\b|\bpayable\s+within\b|\b(?:paid|pay|due)\s+(?:in\s+full\s+)?within\s+"
+               r"(?:[\w\-]+\s+)?\(?\d{1,3}\)?\s*(?:calendar\s+|business\s+)?days\b"
+               r"|\bwithin\s+(?:[\w\-]+\s+)?\(?\d{1,3}\)?\s*(?:calendar\s+|business\s+)?days\s+(?:of|after|from|following)\s+"
+               r"(?:the\s+)?(?:receipt\s+of\s+)?(?:an?\s+|the\s+|each\s+)?(?:undisputed\s+|approved\s+|proper\s+|valid\s+)?invoice",
 }
 
 
@@ -1844,6 +1854,11 @@ def _match(clause_type: str, typed: list[tuple[str | None, dict[str, Any]]],
         for rule_id, c in typed:          # a clause another matrix clause grades is not borrowed
             if rule_id not in graded_types and re.search(signal, c.get("title") or "", re.IGNORECASE):
                 return [c]
+    body = _BODY_SIGNALS.get(clause_type)
+    if body:
+        found = [c for _rule_id, c in typed if re.search(body, str(c.get("body") or ""), re.IGNORECASE)]
+        if found:
+            return found
     return []
 
 

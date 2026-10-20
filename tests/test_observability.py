@@ -191,16 +191,73 @@ def test_the_whole_classify_stage_logs_no_contract_text(monkeypatch, caplog):
         assert needle not in everything, needle                           # ...the LOGS do not
 
 
-def test_no_stage_logs_exception_text():
+def test_no_lambda_logs_exception_text():
     """`error=str(exc)` puts whatever an SDK echoed back (prompt text included)
-    into CloudWatch. The pipeline and chat log the exception TYPE instead."""
+    into CloudWatch, and `log.exception` logs the message and the traceback's
+    text. Every Lambda logs the exception TYPE (and shared.logger.safe_trace)
+    instead."""
+    import ast
     from pathlib import Path
 
+    levels = {"debug", "info", "warning", "error", "exception", "critical"}
     root = Path(__file__).resolve().parents[1] / "lambdas"
     offenders = []
-    for path in list((root / "pipeline").rglob("*.py")) + list((root / "rag").rglob("*.py")) + [
-            root / "shared" / "openai_client.py", root / "shared" / "opensearch.py", root / "shared" / "playbook.py"]:
-        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if "error=str(exc)" in line or "error=str(e)" in line:
-                offenders.append(f"{path.name}:{n}")
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in levels and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in ("log", "logger", "_log")):
+                continue
+            where = f"{path.relative_to(root).as_posix()}:{node.lineno}"
+            if node.func.attr == "exception":
+                offenders.append(f"{where} log.exception")
+            for arg in [*node.args, *(k.value for k in node.keywords)]:
+                for sub in ast.walk(arg):
+                    if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id in ("str", "repr")
+                            and sub.args and isinstance(sub.args[0], ast.Name)
+                            and sub.args[0].id in ("exc", "e", "err", "error", "ex")):
+                        offenders.append(f"{where} {sub.func.id}({sub.args[0].id})")
     assert offenders == []
+
+
+# ── Best-effort steps fail visibly in the logs, never the call ───────────────
+
+
+def test_best_effort_failures_are_logged_by_type_and_do_not_break_the_call(monkeypatch, caplog):
+    from fakes import FakeOpenAI, chat_response
+    from rag import handler as rag
+    from shared import guardrails, openai_client
+
+    def broken_audit(**_k):
+        raise RuntimeError(SECRET_TEXT)
+    monkeypatch.setattr(guardrails, "audit_send", broken_audit)
+    monkeypatch.setattr(rag, "audit_send", broken_audit)
+    bad_usage = type("U", (), {"prompt_tokens": property(lambda self: 1 / 0)})()
+    reply = chat_response("fine")
+    reply.usage = bad_usage
+    client = FakeOpenAI(chat=[reply])
+    monkeypatch.setattr(openai_client, "openai_client", lambda: client)
+    caplog.set_level("WARNING")
+
+    assert openai_client.chat_text(system="s", user="u", model="m") == "fine"
+    rag._audit_rag(rag.Redaction(text="hello"))
+    everything = _dump(caplog)
+    for event, error in (("openai.audit_failed", "RuntimeError"), ("openai.usage_unreadable", "ZeroDivisionError"),
+                         ("rag.audit_failed", "RuntimeError")):
+        assert event in everything and error in everything, event
+    assert SECRET not in everything
+
+
+def test_a_failed_reuse_check_is_logged_and_falls_back_to_a_fresh_analysis(monkeypatch, caplog):
+    monkeypatch.setattr(classify.settings, "classify_reuse_unchanged", True)
+    monkeypatch.setattr(classify, "get_doc_meta", lambda _id: {"checksum": "c"})
+
+    def unreadable(bucket, key):
+        raise RuntimeError(SECRET_TEXT)
+    monkeypatch.setattr(classify, "get_json", unreadable)
+    caplog.set_level("WARNING")
+    assert classify._reusable(DOC, "p", "k", "c", "f") is None
+    everything = _dump(caplog)
+    assert "classify.reuse_check_failed" in everything and "RuntimeError" in everything
+    assert SECRET not in everything

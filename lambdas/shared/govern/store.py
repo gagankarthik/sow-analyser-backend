@@ -34,7 +34,7 @@ from botocore.exceptions import ClientError
 
 from ..aws import dynamodb_resource
 from ..config import settings
-from ..dynamodb import _from_ddb, _to_ddb
+from ..dynamodb import _from_ddb, _to_ddb, batch_get_all
 from ..logger import get_logger
 
 log = get_logger("blue-iq.govern.store")
@@ -130,17 +130,9 @@ class _Repository:
             kwargs["ExclusiveStartKey"] = last
 
     def batch_get(self, keys: list[dict[str, str]]) -> list[dict[str, Any]]:
-        """BatchGetItem, 100 keys per call, UnprocessedKeys followed."""
-        out: list[dict[str, Any]] = []
-        for start in range(0, len(keys), 100):
-            pending: dict[str, Any] = {self.name: {"Keys": keys[start:start + 100]}}
-            for _ in range(6):
-                resp = _resource().batch_get_item(RequestItems=pending)
-                out.extend((resp.get("Responses") or {}).get(self.name, []))
-                pending = resp.get("UnprocessedKeys") or {}
-                if not pending:
-                    break
-        return out
+        """BatchGetItem, 100 keys per call, UnprocessedKeys followed with
+        backoff; raises if keys stay unread (shared.dynamodb.batch_get_all)."""
+        return batch_get_all(_resource(), self.name, keys)
 
     def put_new(self, item: dict[str, Any]) -> bool:
         """PutItem only if the key is free. False when it already exists."""
@@ -239,6 +231,16 @@ class ContractRepository(_Repository):
                 raise
             return working
         raise ContractConflict(f"contract {contract_id} is being changed by someone else; try again")
+
+    def delete(self, contract_id: str) -> int:
+        """Remove the contract and everything under it (blockers, obligations,
+        income, reviews). Returns the number of items removed."""
+        from boto3.dynamodb.conditions import Key
+
+        items = self.query_all(KeyConditionExpression=Key("PK").eq(f"CON#{contract_id}"), ProjectionExpression="PK, SK")
+        for item in items:
+            self.table().delete_item(Key={"PK": item["PK"], "SK": item["SK"]})
+        return len(items)
 
     def for_tenant(self, tenant_id: str) -> list[dict[str, Any]]:
         """Every contract of a tenant — one GSI1 partition, paginated."""

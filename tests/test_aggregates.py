@@ -200,3 +200,44 @@ def test_update_can_set_and_remove_in_one_call(ddb):
     assert item["status"] == "READY" and "errorMessage" not in item
     assert item["ownerSub"] == "o" and item["projectIds"] == ["p"]
     assert float(item["contractValue"]) == -5.5
+
+
+def test_two_simultaneous_edits_both_stay_recorded(monkeypatch, ddb):
+    """Edit A reads userEdited, edit B writes in between, then A writes: A must
+    re-read and keep B's field instead of overwriting the list."""
+    from shared import dynamodb
+    ddb.items[(f"DOC#{DOC}", "META")] = {"PK": f"DOC#{DOC}", "SK": "META", "docId": DOC, "tenantId": "acme",
+                                         "updatedAt": "2026-01-01T00:00:00Z", "userEdited": []}
+    real_get, raced = dynamodb.get_doc_meta, []
+
+    def get_then_race(doc_id):
+        meta = real_get(doc_id)
+        if not raced:                                       # B lands after A's read
+            raced.append(True)
+            assert dynamodb.edit_doc_fields(doc_id, {"lifecycle": "active"})
+        return meta
+    monkeypatch.setattr(dynamodb, "get_doc_meta", get_then_race)
+    assert dynamodb.edit_doc_fields(DOC, {"title": "New"})
+    row = ddb.doc(DOC)
+    assert row["userEdited"] == ["lifecycle", "title"]      # still the sorted list persist reads
+    assert row["title"] == "New" and row["lifecycle"] == "active"
+
+
+def test_an_edit_that_keeps_losing_the_race_is_a_409_not_a_lost_write(monkeypatch, ddb):
+    import json
+
+    from api import handler as api
+    from shared import dynamodb
+    from shared.access import Caller
+    sub = "11111111-1111-4111-8111-111111111111"
+    ddb.items[(f"DOC#{DOC}", "META")] = {"PK": f"DOC#{DOC}", "SK": "META", "docId": DOC, "tenantId": f"u-{sub}",
+                                         "ownerSub": sub, "updatedAt": "t0"}
+    monkeypatch.setattr(dynamodb, "get_doc_meta", lambda _id: {"docId": DOC, "updatedAt": "stale"})
+    ev = {"rawPath": f"/documents/{DOC}", "requestContext": {"http": {"method": "PATCH"},
+          "authorizer": {"jwt": {"claims": {"sub": sub}}}}, "body": json.dumps({"title": "New"})}
+    monkeypatch.setattr(api, "_route", lambda *a: api._update_document(DOC, Caller.from_claims({"sub": sub}), ev))
+    ctx = type("Ctx", (), {"function_name": "api", "memory_limit_in_mb": 256, "aws_request_id": "r",
+                           "invoked_function_arn": "arn:aws:lambda:us-east-2:0:function:api"})()
+    resp = api.handler(ev, ctx)
+    assert resp["statusCode"] == 409 and "conflict" in resp["body"]
+    assert "title" not in ddb.doc(DOC)

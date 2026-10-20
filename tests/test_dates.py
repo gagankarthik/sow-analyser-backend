@@ -383,3 +383,40 @@ def test_property_no_input_date_is_lost():
             assert k["date"] is None or len(k["date"]) == 10
         dated = [k["date"] for k in out["keyDates"] if k["date"]]
         assert dated == sorted(dated)
+
+
+# ── Term stated as a length ──────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("This MSA shall have an initial term of thirty-six (36) months from the Effective Date.", (36, "months")),
+    ("The term of this Agreement is 36 months, commencing on the Effective Date.", (36, "months")),
+    ("This Agreement has a 36-month term.", (36, "months")),
+    ("This Agreement shall remain in effect for three (3) years.", (3, "years")),
+    ("The Agreement shall continue for a period of 24 months unless terminated earlier.", (24, "months")),
+    ("Thereafter it renews for successive renewal terms of twelve (12) months.", None),
+    ("Confidentiality obligations continue for five (5) years after termination.", None),
+    ("Payment is due within thirty (30) days.", None),
+])
+def test_stated_term_reads_the_agreement_length_only(text, expected):
+    found = dates.stated_term(text)
+    assert (found[:2] if found else None) == expected
+
+
+def test_term_end_is_counted_from_a_stated_term_when_the_model_gave_none():
+    # The MSA case: a 36-month term and no end date anywhere in the model output.
+    msa = classification(effectiveDate="2026-01-15", identification={"executionDate": None, "signatories": []},
+                         timeline={"renewalNoticeDays": None})
+    text = "This Master Services Agreement is effective January 15, 2026. It has an initial term of thirty-six (36) months."
+    out = build_key_dates(msa, CLAUSES, text)
+    end = by_kind(out, "term_end")[0]
+    assert end["date"] == "2029-01-15" and end["isDerived"] is True and end["origin"] == "derived"
+    assert (end["anchor"], end["offsetValue"], end["offsetUnit"]) == ("effective", 36, "months")
+    assert out["derived"]["termEndDate"] == "2029-01-15"
+
+
+def test_a_stated_end_date_wins_over_a_stated_length():
+    sow = classification(timeline={"endDate": "2026-05-01"})
+    out = build_key_dates(sow, CLAUSES, "The term of this SOW is 12 months.")
+    assert [k["date"] for k in by_kind(out, "term_end")] == ["2026-05-01"]
+    assert out["derived"]["termEndDate"] is None

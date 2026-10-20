@@ -357,6 +357,38 @@ def parse_offset(text: str | None) -> dict[str, Any] | None:
             "anchor": anchor_key(anchor_text) or anchor_key(text), "anchorText": anchor_text or None}
 
 
+# The agreement's own length: "an initial term of thirty-six (36) months",
+# "a 36-month term", "shall remain in effect for three (3) years".
+_TERM_QTY = rf"(?:(?:{_NUM_TOKEN}(?:[\s\-]+(?:and\s+)?{_NUM_TOKEN})*)\s*(?:\(\s*\d{{1,3}}\s*\)\s*)?|\(?\d{{1,3}}\)?)[\s\-]*(?:months?|years?)"
+_TERM_RES = [
+    re.compile(rf"\b(?:initial\s+)?term\s+(?:of\s+(?:this|the)\s+[\w\s]{{0,40}}?\s+)?(?:shall\s+be|will\s+be|is|of)\s+"
+               rf"(?:a\s+period\s+of\s+)?(?P<q>{_TERM_QTY})\b", re.IGNORECASE),
+    re.compile(rf"\b(?P<q>{_TERM_QTY})\s+(?:initial\s+)?(?:term|period\s+of\s+performance)\b", re.IGNORECASE),
+    re.compile(rf"\b(?:remain\s+in\s+(?:full\s+force\s+and\s+)?effect|continue(?:\s+in\s+effect)?|be\s+in\s+effect)\s+for\s+"
+               rf"(?:a\s+(?:period|term)\s+of\s+|an\s+initial\s+(?:period|term)\s+of\s+)?(?P<q>{_TERM_QTY})\b", re.IGNORECASE),
+]
+# Lengths that are not the agreement's term: renewals, surviving duties, notice.
+_NOT_TERM_RE = re.compile(r"renewal\s+terms?|successive|surviv|confidential|after\s+(?:the\s+)?(?:expiration|termination)"
+                          r"|notice|warrant|retain|retention", re.IGNORECASE)
+
+
+def stated_term(text: str | None) -> tuple[int, str, str] | None:
+    """The agreement's stated length as (value, "months" | "years", sentence),
+    or None. Only a whole-agreement term counts: a renewal term, a duty that
+    survives termination or a notice period is not the term."""
+    for sentence in re.split(r"(?<=[.;])\s+|\n{2,}", text or ""):
+        for pattern in _TERM_RES:
+            m = pattern.search(sentence)
+            if not m or _NOT_TERM_RE.search(sentence[:m.start("q")]):
+                continue
+            # "36-month" → "36 month", which parse_quantity reads
+            q = re.sub(r"[\s\-]+(?=months?\b|years?\b)", " ", m.group("q"), flags=re.IGNORECASE)
+            qty = parse_quantity(q)
+            if qty and qty[1] in ("months", "years") and 0 < qty[0] <= 600:
+                return qty[0], qty[1], sentence.strip()[:300]
+    return None
+
+
 def offset_days(value: int, unit: str) -> int:
     """Approximate length of an offset in days (months = 30, years = 365)."""
     return int(value) * _UNIT_DAYS.get(unit, 1)

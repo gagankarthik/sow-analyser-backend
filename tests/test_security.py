@@ -321,6 +321,57 @@ def test_stuck_document_can_be_reprocessed_after_the_grace_period():
     assert api._in_flight({"status": "PENDING", "updatedAt": api.now_iso()}) is True
 
 
+def _seed_meta(ddb, **fields):
+    ddb.items[(f"DOC#{DOC}", "META")] = {"PK": f"DOC#{DOC}", "SK": "META", "docId": DOC,
+                                         "tenantId": f"u-{SUB_A}", "ownerSub": SUB_A, **fields}
+
+
+def test_two_overlapping_reprocess_requests_start_one_run(monkeypatch, own_doc, ddb):
+    """Both requests read READY (the check-then-act gap); only the first may
+    claim the document — the second gets 409 in_progress and starts nothing."""
+    _seed_meta(ddb, status="READY", updatedAt="2020-01-01T00:00:00+00:00")
+    monkeypatch.setenv("RAW_BUCKET", "raw")
+    copies = []
+
+    class _S3:
+        def copy_object(self, **kw):
+            copies.append(kw)
+    monkeypatch.setattr(api, "s3_client", lambda: _S3())
+    first = api._reprocess_document(DOC, _caller())          # own_doc serves the stale READY read
+    second = api._reprocess_document(DOC, _caller(), force=True)
+    assert first["statusCode"] == 200 and len(copies) == 1
+    assert second["statusCode"] == 409 and _body(second)["code"] == "in_progress"
+    assert ddb.doc(DOC)["status"] == "PENDING" and "skipAgreementCheck" not in ddb.doc(DOC)
+
+
+def test_a_stale_in_flight_run_can_be_claimed_and_a_deleted_document_cannot(ddb):
+    from shared import dynamodb
+    cutoff = "2026-01-01T00:00:00Z"
+    _seed_meta(ddb, status="CLASSIFYING", updatedAt="2025-12-31T23:00:00Z")      # went quiet
+    assert dynamodb.claim_doc_run(DOC, api._IN_FLIGHT_STATUSES, cutoff, fields={"skipAgreementCheck": True})
+    assert ddb.doc(DOC)["status"] == "PENDING" and ddb.doc(DOC)["skipAgreementCheck"] is True
+    _seed_meta(ddb, status="EMBEDDING", updatedAt="2026-01-01T00:05:00Z")       # still running
+    assert not dynamodb.claim_doc_run(DOC, api._IN_FLIGHT_STATUSES, cutoff)
+    assert ddb.doc(DOC)["status"] == "EMBEDDING"
+    _seed_meta(ddb, status="FAILED", updatedAt="2026-01-01T00:05:00Z")
+    assert dynamodb.claim_doc_run(DOC, api._IN_FLIGHT_STATUSES, cutoff)
+    ddb.items.clear()
+    assert not dynamodb.claim_doc_run(DOC, api._IN_FLIGHT_STATUSES, cutoff)      # no ghost row
+    assert ddb.items == {}
+
+
+def test_a_failed_re_trigger_releases_the_claim(monkeypatch, own_doc, ddb):
+    _seed_meta(ddb, status="READY", updatedAt="2020-01-01T00:00:00+00:00")
+    monkeypatch.setenv("RAW_BUCKET", "raw")
+
+    class _S3:
+        def copy_object(self, **kw):
+            raise RuntimeError("s3 down")
+    monkeypatch.setattr(api, "s3_client", lambda: _S3())
+    assert api._reprocess_document(DOC, _caller())["statusCode"] == 500
+    assert ddb.doc(DOC)["status"] == "READY"                  # free to retry straight away
+
+
 # ── Error responses do not leak internals ────────────────────────────────────
 
 

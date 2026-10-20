@@ -8,7 +8,10 @@ Failure contract: a stage failure is re-raised as ``PipelineStageError`` whose
 message is written for the person who uploaded the document — never a stack
 trace, an SDK error body or a bucket name (the original exception is chained and
 logged). Step Functions catches it and routes to the MarkFailed state, which
-writes status=FAILED and that message to DynamoDB.
+writes status=FAILED and that message to DynamoDB. A ``PipelineTransientError``
+(AI service unavailable / timed out) is retried by the state machine first; a
+``PipelineSupersededError`` (another run saved this version) ends the run
+without marking anything failed.
 
 State size: Step Functions caps the payload passed between states at 256 KB. The
 stages hand each other the full document text and the extracted clauses, which
@@ -32,8 +35,8 @@ from typing import Any
 
 from aws_lambda_powertools import Tracer
 from shared import openai_client
-from shared.dynamodb import get_doc_meta, update_doc_fields
-from shared.errors import PipelineStageError, safe_message
+from shared.dynamodb import VersionConflict, get_doc_meta, update_doc_fields
+from shared.errors import PipelineSupersededError, PipelineTransientError, safe_message, stage_error
 from shared.logger import get_logger, safe_trace
 from shared.s3 import delete_object, delete_prefix, get_json, processed_key, put_json
 
@@ -141,6 +144,15 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             _drop_state(event, state_key)
             return result
         return _park(result, state_key)
+    except VersionConflict:
+        # Another run of this document saved the same version number first. Its
+        # analysis stands; this run stops without touching META (no FAILED, no
+        # error fields) — Step Functions ends it quietly on this error name.
+        log.warning("pipeline.run_superseded", stage=stage, docId=event.get("docId"),
+                    durationMs=int((time.monotonic() - started) * 1000))
+        _drop_state(event, state_key)
+        raise PipelineSupersededError("A newer analysis of this document was saved first.",
+                                      stage=stage, code="superseded") from None
     except Exception as exc:
         usage = openai_client.usage_snapshot()
         message, code = safe_message(stage, exc)
@@ -154,14 +166,17 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                   llmCalls=usage["calls"], retries=usage["retries"])
         _discard_if_deleted(event)
         _record_failure(event, stage, code)
-        # The run stops here (Step Functions does not retry a stage's own error),
-        # so the parked document text is no longer needed.
-        _drop_state(event, state_key)
         if request_id and code == "internal":
             message = f"{message} (ref {str(request_id)[:8]})"
+        error = stage_error(message, stage=stage, code=code)
+        # A transient failure (AI service down / too slow) is retried by Step
+        # Functions with this same input, so its parked state must survive. Any
+        # other error ends the run, and the parked document text is not needed.
+        if not isinstance(error, PipelineTransientError):
+            _drop_state(event, state_key)
         # `from None`: the Lambda runtime prints the raised error and its chain to
         # the log, and the original message is exactly what must not be printed.
-        raise PipelineStageError(message, stage=stage, code=code) from None
+        raise error from None
 
 
 def _drop_state(event: dict[str, Any], state_key: str | None) -> None:
