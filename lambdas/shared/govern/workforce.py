@@ -104,12 +104,18 @@ def check_work_for_hire(text: str, th: dict[str, Any]) -> _Check:
     under a licence to the client. Vendor ownership of deliverables deviates."""
     low = _low(text)
     vendor_owns = re.search(r"(?:vendor|contractor|supplier|consultant|provider)\s+(?:shall\s+)?(?:retain|own)s?\s+(?:all\s+)?"
-                            r"(?:right,?\s+title|ownership|intellectual\s+property)[^.]{0,80}(?:deliverable|work\s+product)", low)
+                            r"(?:right,?\s+title|ownership|intellectual\s+property)[^.]{0,80}(?:deliverable|work\s+product)"
+                            r"|(?:vendor|contractor|supplier|consultant|provider)\s+(?:shall\s+)?owns?\s+(?:all\s+)?(?:the\s+)?"
+                            r"(?:deliverables|work\s+product)", low)
     if vendor_owns:
         return _Check("deviates", "The vendor keeps ownership of the deliverables; the matrix requires the client to own the "
                                   "work product (work made for hire, with an assignment).", "vendor owns deliverables")
     wfh = re.search(r"work(?:s)?\s+made\s+for\s+hire|work[- ]for[- ]hire", low)
-    assign = re.search(r"(?:hereby\s+)?assigns?\s+(?:to\s+(?:the\s+)?(?:client|customer|company)\s+)?all\s+(?:right|rights)", low)
+    # "assigns to Client all right, title …", "irrevocably assigns to the Customer
+    # all Intellectual Property Rights", UK "… shall vest in the Customer"
+    assign = re.search(r"(?:hereby\s+)?(?:irrevocably\s+)?assigns?\s+(?:to\s+(?:the\s+)?(?:client|customer|company)\s+)?all\s+"
+                       r"(?:of\s+its\s+)?(?:right|rights|intellectual\s+property)"
+                       r"|(?:vest|vests)\s+(?:solely\s+|absolutely\s+)?(?:in|with)\s+(?:the\s+)?(?:client|customer|company|buyer)", low)
     if wfh or assign:
         ben = "The vendor's pre-existing tools are licensed to you." if re.search(r"pre[- ]existing|background|licen[cs]e\s+to\s+(?:use\s+)?(?:any|its)", low) else None
         return _Check("within", None, "work made for hire" if wfh else "assignment to the client", ben)

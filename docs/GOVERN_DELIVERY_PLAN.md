@@ -64,5 +64,5 @@ nothing later can block it.
   real one imports from Excel in minutes and old reviews keep their version.
 * **Sample data.** research and licensing samples under `samples/research/` until redacted
   agreements arrive through the sandbox.
-* **Identity.** Until the customer SSO is wired, Govern roles come from Cognito groups;
-  a sandbox runs with `GOVERN_OPEN_ADMIN=true`.
+* **Identity.** Until the customer SSO is wired, reviewer / leader come from Cognito groups;
+  admin is per organization (its creator and the admins they add).

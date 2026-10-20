@@ -241,21 +241,32 @@ def test_deployment_override_is_reported_as_such(workspace, monkeypatch):
     assert playbook._grade(playbook.resolve_positions(None)["Payment"], "Payable Net 30.")[0] == "minor"
 
 
-def _shared_call(method, path, groups, body=None):
+def _shared_call(method, path, groups, body=None, sub=SUB_A):
     """A request from a shared (custom:tenantId) workspace, with the given groups."""
-    claims = {"sub": SUB_A, "custom:tenantId": "acme-co", "cognito:groups": groups}
+    claims = {"sub": sub, "custom:tenantId": "acme-co", "cognito:groups": groups}
     ev = {"rawPath": path, "body": json.dumps(body) if body is not None else None, "queryStringParameters": None,
           "requestContext": {"authorizer": {"jwt": {"claims": claims}}}}
     resp = api._route(method, path, ev, Caller.from_claims(claims))
     return resp["statusCode"], json.loads(resp["body"])
 
 
-def test_shared_workspace_settings_need_an_admin(workspace, monkeypatch):
-    from shared.config import settings
-    monkeypatch.setattr(settings, "govern_open_admin", False)
+def test_shared_workspace_settings_need_an_admin(workspace, gov):
+    from shared.govern import org
+
     rule = {"standard": "Net 45 from invoice date."}
+    # No organization yet: nobody is its admin, whatever their groups.
+    assert _shared_call("PUT", "/playbook/rules/Payment", "[govern-admin]", rule)[0] == 403
+    # SUB_B opens Govern first and so creates the organization.
+    org.ensure("acme-co", SUB_B, "b@acme.co", "B")
     assert _shared_call("PUT", "/playbook/rules/Payment", "[govern-reviewer]", rule)[0] == 403
     assert _shared_call("DELETE", "/playbook/rules/Payment", "")[0] == 403
     assert _shared_call("POST", "/tenant/compliance", "[govern-reviewer]", {"packs": []})[0] == 403
-    assert _shared_call("PUT", "/playbook/rules/Payment", "[govern-admin]", rule)[0] == 200
-    assert _shared_call("POST", "/tenant/compliance", ["govern-admin"], {"packs": []})[0] == 200
+    assert _shared_call("PUT", "/playbook/rules/Payment", "[govern-admin]", rule)[0] == 403
+    assert _shared_call("POST", "/tenant/compliance", ["govern-admin"], {"packs": []})[0] == 403
+    assert _shared_call("PUT", "/playbook/rules/Payment", "", rule, sub=SUB_B)[0] == 200
+    assert _shared_call("POST", "/tenant/compliance", "", {"packs": []}, sub=SUB_B)[0] == 200
+    # Once SUB_B (an admin) adds SUB_A, SUB_A may change them too.
+    org.record_member("acme-co", SUB_A, "a@acme.co", "A")
+    org.add_admin("acme-co", {"sub": SUB_B, "email": "b@acme.co", "name": "B"}, "a@acme.co")
+    assert _shared_call("PUT", "/playbook/rules/Payment", "", rule)[0] == 200
+    assert _shared_call("POST", "/tenant/compliance", "", {"packs": []})[0] == 200

@@ -62,7 +62,7 @@ from aws_lambda_powertools import Tracer
 from shared import dynamodb as ddb
 from shared import playbook
 from shared.access import Caller, can, normalise_email, normalise_role, workspace_admin
-from shared.auth import AuthError, jwt_claims
+from shared.auth import AuthError
 from shared.aws import s3_client
 from shared.dynamodb import (
     claim_doc_run,
@@ -120,7 +120,10 @@ _MAX_MEMBERS = 200
 # ---------------------------------------------------------------------------
 
 
-@tracer.capture_lambda_handler
+# capture_response=False: responses carry documents, member emails and
+# presigned S3 URLs; Powertools would otherwise copy each one into X-Ray trace
+# metadata (verified live: "handler response" was being recorded).
+@tracer.capture_lambda_handler(capture_response=False)
 @log.inject_lambda_context(log_event=False)
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     method = (
@@ -335,9 +338,9 @@ def _get_compliance(tenant_id: str) -> dict[str, Any]:
 
 def _admin_only(event: dict[str, Any], caller: Caller) -> dict[str, Any] | None:
     """None when the caller may change workspace-wide settings, else a 403."""
-    if workspace_admin(jwt_claims(event), caller.tenant_id):
+    if workspace_admin(caller):
         return None
-    return _err(403, "Only a workspace admin can change this setting.", "forbidden")
+    return _err(403, "Only an admin of this organization can change this setting.", "forbidden")
 
 
 def _save_compliance(event: dict[str, Any], tenant_id: str) -> dict[str, Any]:

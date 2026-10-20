@@ -43,7 +43,9 @@ _AMOUNT_RE = re.compile(
     rf"(?P<close>\s?\))?",
     re.IGNORECASE,
 )
-_PLAIN_NUMBER_RE = re.compile(rf"(?<![\w.])({_NUMBER})(?:\s?({_SCALE}))?(?![\w])")
+_WORDS_BEFORE_RE = re.compile(r"\b(?:dollars?|euros?|pounds?(?:\s+sterling)?|sterling|francs?|yen|rupees?|cents)\s*$",
+                              re.IGNORECASE)
+_PLAIN_NUMBER_RE =re.compile(rf"(?<![\w.])({_NUMBER})(?:\s?({_SCALE}))?(?![\w])")
 
 _SCALES = {
     "k": 1e3, "thousand": 1e3, "m": 1e6, "mm": 1e6, "mn": 1e6, "million": 1e6,
@@ -118,7 +120,11 @@ def find_amounts(text: str) -> list[dict[str, Any]]:
             continue
         value *= _scale(scale)
         opened = (m.group("neg1") or "").strip()
-        negative = bool(m.group("neg2")) or opened in ("-", "−", "–") or (opened == "(" and bool(m.group("close")))
+        # "($1,000)" is an accounting negative, but "Fifty Thousand Dollars
+        # ($50,000)" restates the amount written out before it in figures.
+        restated = opened == "(" and bool(_WORDS_BEFORE_RE.search((text or "")[max(0, m.start() - 40):m.start()]))
+        negative = bool(m.group("neg2")) or opened in ("-", "−", "–") or (
+            opened == "(" and bool(m.group("close")) and not restated)
         out.append({
             "amount": -value if negative else value,
             "currency": currency_code(m.group("mark1") or m.group("mark2")),

@@ -41,7 +41,7 @@ _FUTURE_SKEW = timedelta(minutes=5)
 _ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
-@tracer.capture_lambda_handler
+@tracer.capture_lambda_handler(capture_response=False)   # no tenant data in X-Ray metadata
 @log.inject_lambda_context(log_event=False)
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     path = event.get("rawPath") or event.get("path") or ""

@@ -100,3 +100,11 @@ output "docusign_webhook_url" {
   description = "URL to configure in DocuSign Connect."
   value       = "${aws_apigatewayv2_api.documents.api_endpoint}/webhooks/docusign"
 }
+
+output "govern_realtime_domains" {
+  description = "AppSync Events domains for Govern real-time updates: set NEXT_PUBLIC_GOVERN_REALTIME_HOST (http) and NEXT_PUBLIC_GOVERN_REALTIME_WS_HOST (realtime) in the web app's build env."
+  value = {
+    http     = aws_cloudformation_stack.govern_realtime.outputs["HttpDomain"]
+    realtime = aws_cloudformation_stack.govern_realtime.outputs["RealtimeDomain"]
+  }
+}

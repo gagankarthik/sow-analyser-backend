@@ -36,14 +36,13 @@ The backend authorisation code does not change. It already reads `sub`, `email`/
 
 | the customer group (`isMemberOf`), to be named by the customer | Govern group | Govern rights |
 |---|---|---|
-| `<customer-group-path>:govern-admins` | `govern-admin` | Matrix, routing, settings, integrations |
 | `<customer-group-path>:govern-reviewers` | `govern-reviewer` | Review actions |
 | `<customer-group-path>:govern-leaders` | `govern-leader` | View, comment, approve when routed |
 | none of the above | no Govern group | **Deny at sign-in** (recommended): the trigger raises an error so the user cannot obtain a token |
 
 Notes:
 - Cognito custom attributes hold at most 2,048 characters. Ask the customer to release only the Govern-relevant `isMemberOf` values, or an `eduPersonEntitlement` (`urn:oid:1.3.6.1.4.1.5923.1.1.1.7`) value per role.
-- Set `GOVERN_OPEN_ADMIN=false` for the the customer deployment. Otherwise a user with no Govern group is treated as admin (`shared/config.py`). With `false`, an ungrouped user defaults to `reviewer` (`govern_api/handler.py`) and still sees only documents in projects they belong to. Denying ungrouped users in the trigger closes this completely.
+- Admin is not a group: the customer's organization admin is whoever signs in to Govern first in the `customer` tenant (have the intended owner do so first), plus the admins they add in Settings → Team & roles (`shared/govern/org.py`). An ungrouped user is a `reviewer` (`govern_api/handler.py`) and still sees only documents in projects they belong to. Denying ungrouped users in the trigger closes this completely.
 - All the customer users must share one workspace. The pre-token trigger sets `custom:tenantId = "customer"` for identities whose provider is `the customer`.
 - Project membership is keyed on verified email. Federated users are not automatically `email_verified`. The pre sign-up trigger sets `autoVerifyEmail = true` for the `PreSignUp_ExternalProvider` source. The email comes from the university IdP, so this is acceptable.
 
@@ -139,7 +138,6 @@ Pre token generation trigger (V2 event; sketch):
 
 ```python
 ROLE_MAP = {  # the customer-supplied group values -> Govern groups
-    "<customer-group-path>:govern-admins": "govern-admin",
     "<customer-group-path>:govern-reviewers": "govern-reviewer",
     "<customer-group-path>:govern-leaders": "govern-leader",
 }
@@ -189,7 +187,7 @@ def handler(event, _ctx):
 
 | # | Test | Expected |
 |---|---|---|
-| 1 | SP-initiated login, admin account | Token carries `cognito:groups=[govern-admin]`, `custom:tenantId=customer`; matrix settings reachable |
+| 1 | SP-initiated login, the organization's first (admin) account | Token carries `custom:tenantId=customer`; first `GET /govern/me` shows `isCreator: true`; matrix settings reachable |
 | 2 | Reviewer and leader accounts | Correct actions only (`Contract.allowedActions`); leader cannot edit the matrix (403) |
 | 3 | User in no Govern group | Sign-in refused; no token issued |
 | 4 | Remove user from group at the customer | Next sign-in or token refresh drops the role (max 60 min with the token lifetimes above) |

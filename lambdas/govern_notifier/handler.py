@@ -1,5 +1,6 @@
 """notifier Lambda — SQS ← EventBridge ``Govern.assigned | reassigned |
-sent_back | approved | office_approved | escalated | overdue``.
+sent_back | approved | office_approved | escalated | overdue |
+automation_notify``.
 
 Per the tenant's workflow settings (``notifications``) it sends
 
@@ -8,6 +9,10 @@ Per the tenant's workflow settings (``notifications``) it sends
   office it was escalated to — never to the person who acted;
 * a Microsoft Teams MessageCard to the tenant's incoming-webhook URL (kept in
   Secrets Manager).
+
+An ``automation_notify`` entry (shared/govern/automations.py) carries its
+own recipients, subject and message; the automation rule is its switch, so
+only the channel settings (email / Teams) apply to it.
 
 Then it appends ONE ``notification_sent`` entry. That action is not in the
 notifier's EventBridge rule, so a notification never triggers another.
@@ -38,11 +43,12 @@ tracer = Tracer(service="blue-iq.govern-notifier")
 # Activity action → the settings switch that controls it.
 EVENT_SWITCH = {"assigned": "assigned", "reassigned": "assigned", "sent_back": "sent_back",
                 "approved": "approved", "office_approved": "approved", "escalated": "escalated",
-                "overdue": "overdue"}
+                "overdue": "overdue", "automation_notify": "automation"}
+_AUTOMATION = "automation"
 _TEAMS_TIMEOUT_S = 10
 
 
-@tracer.capture_lambda_handler
+@tracer.capture_lambda_handler(capture_response=False)   # no tenant data in X-Ray metadata
 @log.inject_lambda_context(log_event=False)
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     return sqs_batch.process(event, handle_event, name="govern_notifier")
@@ -61,7 +67,7 @@ def handle_event(evt: dict[str, Any]) -> list[str]:
         return []
     cfg = workflow.get_settings(tenant_id)
     prefs = cfg.get("notifications") or {}
-    if not (prefs.get("events") or {}).get(switch, False):
+    if switch != _AUTOMATION and not (prefs.get("events") or {}).get(switch, False):
         return []
     contract = store.contracts.get(contract_id)
     if contract is None:
@@ -101,7 +107,9 @@ def recipients_for(entry: dict[str, Any], contract: dict[str, Any], cfg: dict[st
     detail = entry.get("detail") or {}
     action = entry.get("action")
     emails: list[str] = []
-    if action in ("assigned", "reassigned"):
+    if action == "automation_notify":
+        emails.extend(str(e or "") for e in detail.get("recipients") or [])
+    elif action in ("assigned", "reassigned"):
         emails.append(((detail.get("owner") or {}).get("email") or ""))
     elif action == "escalated":
         office = detail.get("office")
@@ -116,6 +124,12 @@ def recipients_for(entry: dict[str, Any], contract: dict[str, Any], cfg: dict[st
 
 def message_for(entry: dict[str, Any], contract: dict[str, Any]) -> tuple[str, str]:
     title = contract.get("title") or "An agreement"
+    detail = entry.get("detail") or {}
+    if entry.get("action") == "automation_notify":
+        rule = (detail.get("automation") or {}).get("ruleName") or "an automation"
+        subject = str(detail.get("subject") or f"Govern: {title}")
+        body = detail.get("message") or entry.get("summary") or ""
+        return subject[:200], f"{body}\n\n{title}\nSent by the automation “{rule}”."
     words = {"assigned": "assigned to you", "reassigned": "assigned to you", "sent_back": "sent back",
              "approved": "approved", "office_approved": "approved by an office", "escalated": "needs your office",
              "overdue": "is overdue"}

@@ -426,9 +426,6 @@ def install_fake_govern(monkeypatch: Any, docs: FakeTable) -> GovernFakes:
         resource.tables[f"{name}-table"] = table
         monkeypatch.setattr(settings, f"{name}_table", f"{name}-table")
     monkeypatch.setattr(settings, "event_bus_name", "platform-bus")
-    # The dev-stage sandbox: users in no Govern group are admins (tests that
-    # need the production default switch it off).
-    monkeypatch.setattr(settings, "govern_open_admin", True)
     monkeypatch.setattr(settings, "processed_bucket", "processed")
     monkeypatch.setattr(store, "_resource", lambda: resource)
     fakes = GovernFakes(docs, tables)

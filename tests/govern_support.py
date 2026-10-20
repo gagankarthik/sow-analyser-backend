@@ -32,10 +32,12 @@ SRA = "03-sponsored-research-agreement.txt"
 DANA = {"email": EMAIL[OWNER], "name": NAME[OWNER]}
 
 
-def claims(sub: str, groups: list[str] | None = None) -> dict[str, Any]:
+def claims(sub: str, groups: list[str] | None = None, tenant: str | None = None) -> dict[str, Any]:
     out: dict[str, Any] = {"sub": sub, "email": EMAIL[sub], "email_verified": "true", "name": NAME[sub]}
     if groups is not None:
         out["cognito:groups"] = groups
+    if tenant is not None:
+        out["custom:tenantId"] = tenant
     return out
 
 
@@ -101,11 +103,11 @@ def install_analysis(monkeypatch, ddb) -> None:
 
 
 def call(method: str, path: str, sub: str, body: Any = None, qs: dict[str, str] | None = None,
-         groups: list[str] | None = None) -> tuple[int, dict[str, Any]]:
+         groups: list[str] | None = None, tenant: str | None = None) -> tuple[int, dict[str, Any]]:
     from govern_api import handler as api
 
     event = {"rawPath": path, "queryStringParameters": qs, "body": json.dumps(body) if body is not None else None,
-             "requestContext": {"http": {"method": method}, "authorizer": {"jwt": {"claims": claims(sub, groups)}}}}
+             "requestContext": {"http": {"method": method}, "authorizer": {"jwt": {"claims": claims(sub, groups, tenant)}}}}
     resp = api.dispatch(event)
     return resp["statusCode"], json.loads(resp["body"])
 

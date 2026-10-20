@@ -1011,6 +1011,10 @@ def _activity_view(e: dict[str, Any]) -> dict[str, Any]:
             "summary": e.get("summary") or "", "detail": e.get("detail")}
 
 
+# Public name for the API's activity pages (GET /contracts/{id}/activity).
+activity_view = _activity_view
+
+
 def _blocker_view(b: dict[str, Any]) -> dict[str, Any]:
     return {k: b.get(k) for k in ("id", "text", "clauseType", "office", "suggestedLanguage", "source", "status",
                                   "createdAt", "createdBy", "closedAt", "closedBy")}
@@ -1379,9 +1383,12 @@ def _validate_body(action: str, body: dict[str, Any]) -> dict[str, Any]:
 
 def perform_action(contract_id: str, action: str, body: dict[str, Any], actor: dict[str, Any] | None,
                    *, now: datetime | None = None, cfg: dict[str, Any] | None = None,
-                   system_name: str = "Sonar") -> dict[str, Any]:
+                   system_name: str = "Sonar", detail_tag: dict[str, Any] | None = None) -> dict[str, Any]:
     """Validate and apply one action. Raises BadRequest / NotFound /
-    InvalidTransition; ``store.ContractConflict`` after repeated lost races."""
+    InvalidTransition; ``store.ContractConflict`` after repeated lost races.
+
+    ``detail_tag`` is merged into the ``detail`` of every entry the action
+    writes (automations tag their entries with the rule that made them)."""
     if not isinstance(body, dict):
         raise BadRequest("Body must be a JSON object")
     v = _validate_body(action, body)
@@ -1396,7 +1403,7 @@ def perform_action(contract_id: str, action: str, body: dict[str, Any], actor: d
         if c is None:
             raise NotFound("Contract not found")
         entry = _entry("comment", actor, f"{who} commented: “{_clip(v['text'], 160)}”", at=now_s,
-                       detail={"text": v["text"]})
+                       detail={"text": v["text"], **(detail_tag or {})})
         write_activity(c, [entry])
         return c
 
@@ -1541,7 +1548,13 @@ def perform_action(contract_id: str, action: str, body: dict[str, Any], actor: d
                                   at=now_s, detail={**detail_, "previousState": previous}))
         return None
 
-    stored, _ = _commit(contract_id, change)
+    def tagged(c: dict[str, Any], entries: list[dict[str, Any]]) -> Any:
+        result = change(c, entries)
+        for e in entries if detail_tag else ():
+            e["detail"] = {**(e.get("detail") or {}), **detail_tag}
+        return result
+
+    stored, _ = _commit(contract_id, tagged)
     if action == "mark_signed" and stored.get("state") == "signed":
         _replace_sonar_obligations(stored, extra.get("obligations") or [])
         if stored.get("parentContractId"):
@@ -2005,6 +2018,9 @@ def infer_fields(meta: dict[str, Any], classification: dict[str, Any] | None,
         counterparty = header["licensee"]
     elif header.get("sponsor") and not counterparty:
         counterparty = header["sponsor"]
+    if not counterparty and not parties:   # the analysis named no parties: read them from the preamble
+        from ..parties import counterparty_fallback
+        counterparty = counterparty_fallback(header_text, _US_RE)
     text = _texts(cls) if cls else ""
     huron = _HURON_RE.search(text)
     workday = _WORKDAY_RE.search(text)

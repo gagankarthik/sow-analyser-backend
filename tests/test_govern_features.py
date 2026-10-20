@@ -60,7 +60,8 @@ def test_me_reports_the_features_this_deployment_has_on(gov, monkeypatch):
     status, me = call("GET", "/govern/me", OWNER)
     assert status == 200
     assert me["features"] == {"routingRules": True, "docusign": False, "notifications": False,
-                              "obligations": False, "exports": True, "integrations": False}
+                              "obligations": False, "exports": True, "integrations": False,
+                              "automations": False}
 
 
 # ---------------------------------------------------------------------------

@@ -134,7 +134,10 @@ resource "aws_lambda_function" "api" {
       PROCESSED_BUCKET    = aws_s3_bucket.processed.bucket
       OPENSEARCH_ENDPOINT = aws_opensearch_domain.main.endpoint
       # Pool the invite endpoint creates users in (POST /projects/{id}/invite).
-      COGNITO_USER_POOL_ID         = var.cognito_user_pool_id
+      COGNITO_USER_POOL_ID = var.cognito_user_pool_id
+      # Who may change tenant-wide settings (playbook rules, compliance packs):
+      # the organization's admins, read from govern-config (shared/govern/org.py).
+      CONFIG_TABLE                 = aws_dynamodb_table.govern_config.name
       EMBEDDING_DIMENSIONS         = tostring(var.embedding_dimensions)
       LOG_LEVEL                    = "INFO"
       POWERTOOLS_SERVICE_NAME      = "${local.prefix}-api"
@@ -163,6 +166,23 @@ resource "aws_iam_role_policy" "api" {
           "dynamodb:BatchGetItem",
         ]
         Resource = [aws_dynamodb_table.main.arn, "${aws_dynamodb_table.main.arn}/index/*"]
+      },
+      {
+        # Read-only: the organization record (creator + admins) of a tenant, to
+        # gate PUT/DELETE /playbook/rules and POST /tenant/compliance. Only the
+        # T#<tenant>#ORG partitions; govern-api creates and changes them.
+        Sid       = "OrganizationAdminsRead"
+        Effect    = "Allow"
+        Action    = ["dynamodb:GetItem"]
+        Resource  = aws_dynamodb_table.govern_config.arn
+        Condition = { "ForAllValues:StringLike" = { "dynamodb:LeadingKeys" = ["T#*#ORG"] } }
+      },
+      {
+        Sid       = "OrganizationAdminsDecrypt"
+        Effect    = "Allow"
+        Action    = ["kms:Decrypt", "kms:DescribeKey"]
+        Resource  = aws_kms_key.govern.arn
+        Condition = { StringEquals = { "kms:ViaService" = "dynamodb.${var.aws_region}.amazonaws.com" } }
       },
       {
         # PutObject    → sign presigned PUT URLs for GET /documents/upload-url, and
@@ -506,6 +526,18 @@ resource "aws_apigatewayv2_stage" "default" {
     route_key              = aws_apigatewayv2_route.govern["POST /contracts/{id}/rescore"].route_key
     throttling_rate_limit  = 5
     throttling_burst_limit = 10
+  }
+  # The public counterparty portal (no JWT). Per-route totals; each link also
+  # caps its own views and uploads (shared/govern/portal.py).
+  route_settings {
+    route_key              = aws_apigatewayv2_route.govern_portal["GET /portal/{token}"].route_key
+    throttling_rate_limit  = 5
+    throttling_burst_limit = 10
+  }
+  route_settings {
+    route_key              = aws_apigatewayv2_route.govern_portal["POST /portal/{token}/upload-url"].route_key
+    throttling_rate_limit  = 1
+    throttling_burst_limit = 5
   }
 
   # One JSON line per request with who called (the verified JWT sub), kept

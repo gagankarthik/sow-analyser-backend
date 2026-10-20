@@ -105,7 +105,9 @@ def _counts(event: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-@tracer.capture_lambda_handler
+# capture_response=False: the stage output carries document text / clauses,
+# which must not be copied into X-Ray trace metadata.
+@tracer.capture_lambda_handler(capture_response=False)
 @log.inject_lambda_context(log_event=False)
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     stage = event.pop("_stage", None) or os.environ.get("PIPELINE_STAGE", "")

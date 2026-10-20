@@ -530,3 +530,356 @@ def test_boto_clients_have_a_pool_sized_for_the_stage_fan_out():
     cfg = aws._BOTO_CONFIG
     assert cfg.max_pool_connections == max(10, aws.settings.llm_max_concurrency * 2 + 4)
     assert cfg.tcp_keepalive is True
+
+
+# ── Query building: synonyms, clause references, rerank ─────────────────────
+
+
+def test_question_vocabulary_is_expanded_and_clause_references_are_found():
+    q = opensearch.analyze_query("When do we get paid?")
+    assert "invoice" in q["expansion"] and "Payment" in q["categories"]
+    q = opensearch.analyze_query("Who owns the work product?")
+    assert "ownership" in q["expansion"] and q["categories"][0] == "IP"
+    assert opensearch.analyze_query("How long is the contract?")["categories"] == ["Term"]
+    assert opensearch.analyze_query("Is there an NDA?")["categories"][0] == "Confidentiality"
+    assert opensearch.analyze_query("What does section 7.2 say, and § 9?")["clause_refs"] == ["7.2", "9"]
+    assert opensearch.analyze_query("Tell me a joke") == {"expansion": "", "categories": [], "clause_refs": []}
+
+
+def test_chat_keyword_query_searches_headings_with_synonyms_and_named_clauses(monkeypatch):
+    os_ = _OS()
+    monkeypatch.setattr(opensearch, "client", lambda: os_)
+    opensearch.bm25_search(text="What does section 12 say about damages?", tenant_id="acme", doc_id=DOC, k=5,
+                            expand=True)
+    q = os_.searches[0][1]["query"]["bool"]
+    assert q["minimum_should_match"] == 1 and q["filter"] == [{"term": {"tenantId": "acme"}}, {"term": {"docId": DOC}}]
+    main, synonyms = q["should"][0]["multi_match"], q["should"][1]["multi_match"]
+    assert main["fields"] == ["title^3", "section^2", "text"] and main["type"] == "best_fields"
+    assert "liability" in synonyms["query"] and synonyms["boost"] < 1
+    assert {"term": {"clauseNumber": {"value": "12", "boost": 10.0}}} in q["should"]
+    # The amendment matcher's literal query is unchanged.
+    os_.searches.clear()
+    opensearch.bm25_search(text="Master Services Agreement", tenant_id="acme", k=5)
+    assert os_.searches[0][1]["query"]["bool"]["must"] == [
+        {"multi_match": {"query": "Master Services Agreement", "fields": ["title^2", "section", "text"]}}]
+
+
+def _row(number, text, score, category="Other", chunk=0, doc=DOC):
+    return {"hit": {"_id": f"{doc}::{number}::{chunk}", "_source": {
+        "docId": doc, "clauseNumber": number, "text": text, "category": category, "chunkIndex": chunk}},
+        "score": score}
+
+
+def test_rerank_lifts_the_asked_about_category_dedupes_and_keeps_clauses_diverse():
+    ranked = [_row("1", f"Definitions part {i}.", 0.030 - i * 0.001, chunk=i) for i in range(4)]
+    ranked += [_row("9", "Old copy of the payment clause.", 0.020),
+               _row("9b", "Old copy of the payment clause.", 0.019),       # same text, renumbered: dropped
+               _row("7", "Fees are due net 30.", 0.027, category="Payment")]
+    out = opensearch._rerank(ranked, ["Payment"], k=5)
+    numbers = [r["hit"]["_source"]["clauseNumber"] for r in out]
+    assert numbers[0] == "7"                                    # intent bonus
+    assert numbers[:4] == ["7", "1", "1", "9"]                  # at most 2 chunks of one clause first
+    assert "9b" not in numbers                                  # near-identical copy dropped
+    assert len(out) == 5 and numbers[-1] == "1"                 # overflow chunks fill what is left
+
+
+# ── Fail-soft search ─────────────────────────────────────────────────────────
+
+
+class _Failing(_OS):
+    def __init__(self, vector_exc=None, text_exc=None, delay=0.0, **kw):
+        super().__init__(**kw)
+        self.vector_exc, self.text_exc, self.delay = vector_exc, text_exc, delay
+
+    def search(self, index, body):
+        import time
+        if self.delay:
+            time.sleep(self.delay)
+        vec = index == opensearch.settings.clause_vector_index
+        exc = self.vector_exc if vec else self.text_exc
+        if exc:
+            raise exc
+        return super().search(index, body)
+
+
+class NotFoundError(Exception):
+    pass
+
+
+def test_no_vector_means_keyword_search_alone(monkeypatch):
+    os_ = _OS(text_hits=[{"_id": "a", "_source": {"docId": DOC, "clauseNumber": "1"}}])
+    monkeypatch.setattr(opensearch, "client", lambda: os_)
+    assert len(opensearch.clause_search(text="fees", vector=None, tenant_id="acme", doc_id=DOC, k=4)) == 1
+    assert [i for i, _ in os_.searches] == [opensearch.settings.clause_text_index]
+
+
+def test_every_channel_failing_raises_instead_of_looking_like_no_match(monkeypatch):
+    monkeypatch.setattr(opensearch, "client", lambda: _Failing(RuntimeError("down"), RuntimeError("down")))
+    with pytest.raises(opensearch.SearchUnavailable):
+        opensearch.clause_search(text="x", vector=[0.1], tenant_id="acme", doc_id=DOC, k=4)
+    missing = NotFoundError(404, "index_not_found_exception")
+    monkeypatch.setattr(opensearch, "client", lambda: _Failing(missing, missing))
+    with pytest.raises(opensearch.SearchIndexMissing):
+        opensearch.clause_search(text="x", vector=[0.1], tenant_id="acme", doc_id=DOC, k=4)
+
+
+def test_a_vector_of_the_wrong_size_falls_back_to_keywords(monkeypatch):
+    hit = {"_id": "a", "_source": {"docId": DOC, "clauseNumber": "1"}}
+    os_ = _Failing(vector_exc=RuntimeError("query vector has invalid dimension: 3072. Dimension should be: 1536"),
+                   text_hits=[hit])
+    monkeypatch.setattr(opensearch, "client", lambda: os_)
+    out = opensearch.clause_search(text="fees", vector=[0.1] * 3072, tenant_id="acme", doc_id=DOC, k=4)
+    assert [h["_id"] for h in out] == ["a"]
+
+
+def test_a_hung_search_is_abandoned_within_the_budget(monkeypatch):
+    import time
+    monkeypatch.setattr(opensearch, "client", lambda: _Failing(delay=1.0))
+    started = time.monotonic()
+    with pytest.raises(opensearch.SearchUnavailable):
+        opensearch.clause_search(text="x", vector=[0.1], tenant_id="acme", doc_id=DOC, k=4, timeout_s=0.05)
+    assert time.monotonic() - started < 0.8
+
+
+# ── The chat endpoint's failure paths ────────────────────────────────────────
+
+OWNER = "11111111-1111-4111-8111-111111111111"
+
+
+@pytest.fixture
+def chat_env(monkeypatch, ddb):
+    st = {"search": [], "chat": [], "embed": 0, "brief": None,
+          "hits": [_hit("7.2", "Fees of $12,500 are due within thirty (30) days of invoice.", title="Payment")],
+          "answer": "Fees are due within 30 days [§7.2]."}
+    monkeypatch.setattr(rag, "get_doc_meta", lambda _id: (
+        {"docId": DOC, "tenantId": "acme", "ownerSub": OWNER} if _id == DOC else None))
+    monkeypatch.setattr(rag, "_contract_brief", lambda doc_id, meta: st["brief"])
+
+    def embed_texts(texts, model=None):
+        st["embed"] += 1
+        if isinstance(st.get("embed_fail"), BaseException):
+            raise st["embed_fail"]
+        return [[0.1]]
+    monkeypatch.setattr(rag, "embed_texts", embed_texts)
+
+    def search(**kw):
+        st["search"].append(kw)
+        if isinstance(st.get("search_fail"), BaseException):
+            raise st["search_fail"]
+        return st["hits"]
+    monkeypatch.setattr(rag, "clause_search", search)
+
+    def chat(**kw):
+        st["chat"].append(kw)
+        if isinstance(st.get("chat_fail"), BaseException):
+            raise st["chat_fail"]
+        return st["answer"]
+    monkeypatch.setattr(rag, "chat_text", chat)
+
+    def ask(question="When are fees due?", **body):
+        ev = _chat_event(OWNER, question)
+        ev["body"] = json.dumps({"question": question, **body})
+        resp = rag._http_handle(ev)
+        return resp["statusCode"], json.loads(resp["body"])
+    return st, ask
+
+
+def test_embedding_outage_still_answers_from_keyword_search(chat_env):
+    st, ask = chat_env
+    st["embed_fail"] = TimeoutError("embeddings timed out")
+    status, out = ask()
+    assert status == 200 and out["usedCitations"] == ["7.2"]
+    assert st["search"][0]["vector"] is None
+
+
+def test_a_slow_embedding_is_abandoned(chat_env, monkeypatch):
+    import time
+    st, ask = chat_env
+    monkeypatch.setattr(rag, "EMBED_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(rag, "embed_texts", lambda texts, model=None: time.sleep(0.5) or [[0.1]])
+    started = time.monotonic()
+    status, out = ask()
+    assert status == 200 and st["search"][0]["vector"] is None and time.monotonic() - started < 0.45
+
+
+def test_search_outage_is_a_clear_503_not_a_false_no_match(chat_env):
+    st, ask = chat_env
+    st["search_fail"] = opensearch.SearchUnavailable("down")
+    status, out = ask()
+    assert status == 503 and out["code"] == "search_unavailable" and "try again" in out["error"].lower()
+    assert st["chat"] == []
+    # ...but the Govern review can still answer on its own.
+    st["brief"] = "Recommended next step: Assign a reviewer"
+    st["answer"] = "Assign a reviewer.\nNext step: assign one."
+    status, out = ask("What should I do next?")
+    assert status == 200 and out["answer"].startswith("Assign a reviewer") and out["citations"] == []
+
+
+def test_unindexed_document_says_so(chat_env):
+    st, ask = chat_env
+    st["search_fail"] = opensearch.SearchIndexMissing("no index")
+    status, out = ask()
+    assert status == 200 and out["answer"] == rag._NOT_INDEXED_ANSWER and out["grounded"] is False
+    assert st["chat"] == []
+
+
+def test_model_outage_or_timeout_is_a_clear_503(chat_env):
+    st, ask = chat_env
+    st["chat_fail"] = TimeoutError("read timeout")
+    status, out = ask()
+    assert status == 503 and out["code"] == "sonar_unavailable" and "try again" in out["error"].lower()
+    # the chat call is bounded: an explicit timeout and the request deadline
+    assert st["chat"][0]["timeout"] == rag.CHAT_TIMEOUT_S
+    assert rag.CHAT_TIMEOUT_S < rag.REQUEST_BUDGET_S < 30
+
+
+def test_an_empty_model_reply_is_not_shown_as_an_answer(chat_env):
+    st, ask = chat_env
+    st["answer"] = "   "
+    status, out = ask()
+    assert status == 200 and out["answer"] == rag._EMPTY_ANSWER and out["grounded"] is False
+
+
+def test_hits_outside_the_scope_never_reach_the_prompt(chat_env):
+    st, ask = chat_env
+    st["hits"] = [_hit("7.2", "Ours.", title="Payment"),
+                  {"_id": "x", "_source": {"docId": "someone-elses-doc", "clauseNumber": "1", "text": "Theirs."}}]
+    status, out = ask()
+    assert [c["docId"] for c in out["citations"]] == [DOC]
+    assert "Theirs." not in st["chat"][0]["user"]
+
+
+def test_a_deleted_project_document_is_not_cited(chat_env, monkeypatch):
+    st, ask = chat_env
+    monkeypatch.setattr(rag, "_scope_for", lambda target, caller: {"doc_ids": [DOC, "deleted-doc"]})
+    monkeypatch.setattr(rag.ddb, "get_docs", lambda ids: [{"docId": DOC, "title": "MSA"}])
+    st["hits"] = [{"_id": "d", "_source": {"docId": "deleted-doc", "clauseNumber": "3", "text": "Gone."}},
+                  _hit("7.2", "Kept.", title="Payment")]
+    status, out = ask()
+    assert [c["docId"] for c in out["citations"]] == [DOC]
+
+
+@pytest.mark.parametrize("body,status", [({"question": "   "}, 400), ({"question": "x" * 2001}, 400),
+                                         ({"question": "fees?", "history": "not a list"}, 200)])
+def test_empty_huge_and_malformed_input(chat_env, body, status):
+    st, ask = chat_env
+    ev = _chat_event(OWNER, "x")
+    ev["body"] = json.dumps(body)
+    assert rag._http_handle(ev)["statusCode"] == status
+
+
+# ── Answer checks ────────────────────────────────────────────────────────────
+
+
+def test_invented_citations_are_removed_from_the_answer(chat_env):
+    st, ask = chat_env
+    st["answer"] = "Fees are due within 30 days [§7.2, §99]. See also [§42]."
+    status, out = ask()
+    assert out["answer"] == "Fees are due within 30 days [§7.2]. See also."
+    assert out["usedCitations"] == ["7.2"] and out["grounded"] is True
+
+
+def test_review_clause_numbers_are_kept_in_the_text():
+    citations = [{"clauseNumber": "3"}]
+    text, removed = rag._clean_citations("Fix the indemnity [§9] and the term [§3].", citations, {"9"})
+    assert text == "Fix the indemnity [§9] and the term [§3]." and removed == []
+
+
+def test_figures_the_cited_clause_does_not_contain_are_flagged(chat_env):
+    st, ask = chat_env
+    st["answer"] = "Fees of $12,500 are due within 45 days, from March 3, 2031 [§7.2]."
+    status, out = ask()
+    assert out["unverified"] == ["March 3, 2031", "45 days"]
+    st["answer"] = "Fees of $12,500 are due within thirty (30) days [§7.2]."
+    assert ask()[1]["unverified"] == []
+
+
+@pytest.mark.parametrize("answer,source,flagged", [
+    ("Capped at $1.5 million [§12].", "liability capped at $1,500,000", []),
+    ("Notice of 60 days [§6].", "on sixty days' notice", []),
+    ("Interest of 1.5% per month.", "one and a half percent (1.5%) per month", []),
+    ("It ends on 2025-12-31.", "continues until December 31, 2025", []),
+    ("It ends on 31 December 2026.", "continues until December 31, 2025", ["31 December 2026"]),
+    ("See Section 14.3 and Appendix 12; ISO 27001 applies.", "nothing numeric here", []),
+    ("There are 2 findings.", "", []),
+    ("A fee of €9,000 applies.", "a fee of €8,000", ["€9,000"]),
+    ("Pay within 90 days.", "within ninety (90) days", []),
+])
+def test_unverified_figure_check(answer, source, flagged):
+    assert rag._unverified(answer, [source]) == flagged
+
+
+def test_context_is_held_to_a_token_budget(monkeypatch):
+    monkeypatch.setattr(rag, "MAX_CONTEXT_TOKENS", 1000)
+    blocks = ["x" * 2400] * 8                              # ~600 tokens each
+    citations = [{"clauseNumber": str(i)} for i in range(8)]
+    b, c, _ = rag._fit_context(blocks, citations, blocks, top_k=8)
+    assert len(b) == len(c) == 1
+    monkeypatch.setattr(rag, "MAX_CONTEXT_TOKENS", 10)
+    assert len(rag._fit_context(blocks, citations, blocks, top_k=8)[0]) == 1    # never empty
+
+
+def test_a_follow_up_also_searches_the_clauses_the_last_answer_cited():
+    history = [{"role": "user", "content": "What does the limitation of liability clause say?"},
+               {"role": "assistant", "content": "It is capped at 12 months of fees [§12; §12.2]."}]
+    text = rag._search_text("Are there exceptions to it?", history)
+    assert text.startswith("What does the limitation") and text.endswith("§12 §12.2")
+    assert opensearch.analyze_query(text)["clause_refs"] == ["12", "12.2"]
+
+
+# ── AppSync streaming failure paths ─────────────────────────────────────────
+
+
+@pytest.fixture
+def stream_env(monkeypatch):
+    from shared.access import Caller
+    pushed = []
+    monkeypatch.setattr(rag, "_push_token", lambda sid, token, final: pushed.append((token, final)))
+    monkeypatch.setattr(Caller, "visible_doc_ids", lambda self: [DOC])
+    monkeypatch.setattr(rag, "embed_texts", lambda texts, model=None: [[0.0]])
+    monkeypatch.setattr(rag, "clause_search", lambda **kw: [_hit("4", "Fee $5.", title="Fees")])
+    monkeypatch.setattr(rag.ddb, "get_docs", lambda ids: [{"docId": DOC, "title": "SOW"}])
+    ev = {"arguments": {"input": {"question": "fees?"}}, "identity": {"claims": {"sub": OWNER}}}
+    return pushed, ev
+
+
+def _chunk(text, finish=None):
+    delta = type("D", (), {"content": text})()
+    return type("C", (), {"choices": [type("Ch", (), {"delta": delta, "finish_reason": finish})()]})()
+
+
+def test_stream_that_fails_before_any_token_ends_with_a_clear_message(stream_env, monkeypatch):
+    pushed, ev = stream_env
+
+    def broken(*a, **k):
+        raise TimeoutError("no stream")
+        yield  # pragma: no cover
+    monkeypatch.setattr(rag, "chat_stream", broken)
+    out = rag._handle(ev)
+    assert out["answer"] == rag._MODEL_DOWN_ERROR and pushed[-1] == (rag._MODEL_DOWN_ERROR, True)
+
+
+def test_stream_interrupted_midway_says_so_and_still_finishes(stream_env, monkeypatch):
+    pushed, ev = stream_env
+
+    def flaky(*a, **k):
+        yield _chunk("The fee is $5 ")
+        raise ConnectionError("reset")
+    monkeypatch.setattr(rag, "chat_stream", flaky)
+    out = rag._handle(ev)
+    assert out["answer"].startswith("The fee is $5") and out["answer"].endswith(rag._INTERRUPTED_NOTE)
+    assert pushed[-1] == ("", True)
+
+
+def test_stream_search_outage_and_missing_index(stream_env, monkeypatch):
+    pushed, ev = stream_env
+
+    def down(**kw):
+        raise opensearch.SearchUnavailable("down")
+    monkeypatch.setattr(rag, "clause_search", down)
+    assert rag._handle(ev)["answer"] == rag._SEARCH_DOWN_ERROR and pushed[-1][1] is True
+
+    def missing(**kw):
+        raise opensearch.SearchIndexMissing("none")
+    monkeypatch.setattr(rag, "clause_search", missing)
+    assert rag._handle(ev)["answer"] == rag._NOT_INDEXED_ANSWER

@@ -33,7 +33,8 @@ _AMENDMENT_TYPES = ["amendment", "change_order", "addendum", "side_letter", "non
 _CHANGE_TYPES = ["replacement", "addition", "deletion", "modification"]
 _CHANGE_CATEGORIES = ["scope", "value", "timeline", "payment", "personnel", "term", "sla", "other"]
 _CONFIDENCE = ["high", "medium", "low"]
-AGREEMENT_KINDS = ["sponsored_research", "clinical_trial", "grant", "license", "option", "mta", "data_use", "nda", "collaboration", "software", "other"]
+AGREEMENT_KINDS = ["sponsored_research", "clinical_trial", "grant", "license", "option", "mta", "data_use", "nda", "collaboration",
+                   "software", "sow", "msa", "staffing", "subcontract", "other"]
 _ORG_ROLES = ["licensor", "licensee", "customer", "vendor", "sponsor", "performer", "recipient", "provider",
               "collaborator", "other"]
 _LICENSE_MODELS = ["subscription", "saas", "perpetual", "term", "patent", "copyright", "open_source", "other"]
@@ -346,7 +347,14 @@ university, research institute or company; "the organization" below)
     nda (confidentiality / CDA), collaboration (joint research),
     software (the organization BUYS or subscribes to software, SaaS, cloud services or a
       EULA from a vendor — inbound licence; also software support/maintenance),
-    other (anything else, e.g. services, consulting, facilities).
+    sow (a statement of work or work order: defined services, deliverables, milestones
+      and fees for one engagement — e.g. website design and development, implementation,
+      consulting work — whether or not the title says "statement of work"),
+    msa (a master services / consulting agreement: the general terms that later SOWs
+      or work orders sit under),
+    staffing (temporary or contingent workers supplied by an agency),
+    subcontract (the organization passes part of a prime award or contract to another party),
+    other (anything else, e.g. facilities or venue use).
   A licence where a VENDOR grants the organization rights to its product is
   "software", not "license".
 - organizationRole: the organization's role (licensor, licensee, customer, vendor,

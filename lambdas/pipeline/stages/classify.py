@@ -47,6 +47,7 @@ from shared.keydates import ClauseIndex, build_key_dates, normalise_legacy_dates
 from shared.logger import get_logger
 from shared.money import detect_currency, find_amounts, implied_sign, quote_supports
 from shared.openai_client import DeadlineExceededError, OutputTruncatedError, chat_json
+from shared.parties import check_parties
 from shared.playbook import evaluate_clauses
 from shared.s3 import get_json, processed_key, put_json
 from shared.segment import page_for_offset, segment_document, unique_numbers
@@ -238,6 +239,9 @@ def run(event: dict[str, Any]) -> dict[str, Any]:
         result["timeline"]["endDate"] = kd["derived"]["termEndDate"]
         result["timeline"]["endDateDerived"] = True
     _add_issues(result, kd["issues"])
+
+    # ── Parties: cross-check the model's list against the preamble / signature block.
+    _check_parties(result, full_text)
 
     # ── Playbook check — surface deviations from the firm's standard positions.
     # Deterministic, runs server-side, persisted into classification.json so the
@@ -1179,6 +1183,39 @@ def _add_issues(result: dict[str, Any], issues: list[str], lower_confidence: boo
             existing.append(issue)
     if lower_confidence:
         conf["overall"] = "low"
+
+
+def _check_parties(result: dict[str, Any], text: str) -> None:
+    """Compare the model's parties with the ones read by rule from the preamble
+    and signature block (shared/parties.py). A model party that occurs nowhere
+    in the text is flagged; when the model named none, the rule result fills
+    ``parties`` (still plain strings) and ``extraction.partiesSource = "rule"``.
+    The comparison is stored as ``extraction.partyCheck``."""
+    extraction = result.setdefault("extraction", {})
+    # A reused analysis whose parties were filled by rule had none from the model.
+    from_rule = extraction.get("partiesSource") == "rule"
+    model = [] if from_rule else [p for p in result.get("parties") or [] if isinstance(p, str) and p.strip()]
+    try:
+        check = check_parties(model, text)
+    except Exception as exc:  # noqa: BLE001 — a cross-check never fails the stage
+        log.warning("classify.party_check_failed", error_type=type(exc).__name__)
+        return
+    issues: list[str] = []
+    filled = False
+    if not model and not [p for p in result.get("parties") or [] if not isinstance(p, str)] and check["extracted"]:
+        result["parties"] = [p["name"] for p in check["extracted"]]
+        extraction["partiesSource"] = "rule"
+        filled = True
+        where = "preamble" if any(p["source"] == "preamble" for p in check["extracted"]) else "signature block"
+        issues.append(f"The analysis named no parties; parties taken from the {where}: "
+                      f"{'; '.join(result['parties'])}.")
+    issues.extend(f'Party "{name}" not found in the document.' for name in check["notInText"])
+    extraction["partyCheck"] = {
+        "matched": check["matched"], "modelOnly": check["modelOnly"], "textOnly": check["textOnly"],
+        "notInText": check["notInText"], "extracted": check["extracted"],
+        "source": "rule" if filled else ("model" if model else None), "filled": filled,
+    }
+    _add_issues(result, issues)
 
 
 def _review_reasons(result: dict[str, Any], unclassified: int, parsed: dict[str, Any]) -> list[str]:

@@ -46,6 +46,24 @@ _NUMERIC_RE = re.compile(
     r"(?<![\d./\-])(\d{1,2})(?:([/\-])(\d{1,2})\2(\d{4}|\d{2})|(\.)(\d{1,2})\.(\d{4}))(?!\d)(?![./\-]\d)"
 )
 _ORDINAL_DAY_RE = re.compile(r"\b(first|last)\s+day\s+of\b", re.IGNORECASE)
+# An ISO date inside a sentence ("Effective Date: 2025-11-02", "on 2025/12/01").
+_ISO_IN_TEXT_RE = re.compile(r"(?<![\d./\-])(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?![\d/])")
+# A day written out in words, as deeds do: "this twenty-second day of November, 2025".
+_ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7,
+             "eighth": 8, "ninth": 9, "tenth": 10, "eleventh": 11, "twelfth": 12, "thirteenth": 13,
+             "fourteenth": 14, "fifteenth": 15, "sixteenth": 16, "seventeenth": 17, "eighteenth": 18,
+             "nineteenth": 19, "twentieth": 20, "thirtieth": 30}
+_ORDINAL_ALT = "|".join(sorted(_ORDINALS, key=len, reverse=True))
+_DMY_WORDS_RE = re.compile(
+    rf"\b((?:(?:twenty|thirty)[\s\-]+)?(?:{_ORDINAL_ALT}))\s+day\s+of\s+({_MONTH_ALT})\.?,?\s+(\d{{4}})\b",
+    re.IGNORECASE,
+)
+
+
+def _ordinal_day(words: str) -> int:
+    """'twenty-second' → 22, 'first' → 1 (an impossible day is left to _make)."""
+    parts = re.split(r"[\s\-]+", words.lower())
+    return sum({"twenty": 20, "thirty": 30}.get(p, 0) or _ORDINALS.get(p, 0) for p in parts)
 _MONTH_YEAR_RE = re.compile(rf"\b({_MONTH_ALT})\.?,?\s+(\d{{4}})\b", re.IGNORECASE)
 _NUM_MONTH_YEAR_RE = re.compile(r"^\s*(\d{1,2})[/\-](\d{4})\s*$")
 _QUARTER_RE = re.compile(r"\b(?:Q([1-4])|([1-4])(?:st|nd|rd|th)\s+quarter|(first|second|third|fourth)\s+quarter)"
@@ -109,14 +127,23 @@ def parse_date(raw: Any, *, day_first: bool | None = None) -> dict[str, Any]:
         iso = _make(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         return _result(date=iso, precision="day") if iso else _result(reason="invalid_date")
 
-    # Whichever written-out date comes FIRST in the text wins ("April 1, 2024
-    # through 31 March 2025" is the 1st of April).
-    dmy, mdy = _DMY_TEXT_RE.search(text), _MDY_TEXT_RE.search(text)
-    if dmy and (not mdy or dmy.start() <= mdy.start()):
-        iso = _make(_year(dmy.group(3)), _MONTHS[dmy.group(2).lower()], int(dmy.group(1)))
-        return _result(date=iso, precision="day") if iso else _result(reason="invalid_date")
-    if mdy:
-        iso = _make(int(mdy.group(3)), _MONTHS[mdy.group(1).lower()], int(mdy.group(2)))
+    # Whichever full date comes FIRST in the text wins ("April 1, 2024 through
+    # 31 March 2025" is the 1st of April). An ISO date may sit inside a sentence
+    # ("Effective Date: 2025-11-02"); the day may be written out ("the
+    # twenty-second day of November, 2025").
+    found = [(m.start(), kind, m) for kind, m in (
+        ("iso", _ISO_IN_TEXT_RE.search(text)), ("dmy", _DMY_TEXT_RE.search(text)),
+        ("mdy", _MDY_TEXT_RE.search(text)), ("words", _DMY_WORDS_RE.search(text))) if m]
+    if found:
+        _, kind, m = min(found, key=lambda f: f[0])
+        if kind == "iso":
+            iso = _make(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        elif kind == "dmy":
+            iso = _make(_year(m.group(3)), _MONTHS[m.group(2).lower()], int(m.group(1)))
+        elif kind == "mdy":
+            iso = _make(int(m.group(3)), _MONTHS[m.group(1).lower()], int(m.group(2)))
+        else:
+            iso = _make(int(m.group(3)), _MONTHS[m.group(2).lower()], _ordinal_day(m.group(1)))
         return _result(date=iso, precision="day") if iso else _result(reason="invalid_date")
 
     m = _NUMERIC_RE.search(text)
@@ -239,7 +266,13 @@ _QUANTITY_RE = re.compile(
     rf"|\(?(?<![\d.,])(\d{{1,4}})\)?\s*{_FILLER}{_UNIT_ALT}\b",
     re.IGNORECASE,
 )
-_NET_RE = re.compile(r"\bnet\s*[\-]?\s*(\d{1,3})\b", re.IGNORECASE)
+# "Net 30", "Net-45", "2/10 net 30", "net thirty (30) days", "net sixty days"
+# (never "net 3% of sales").
+_NET_RE = re.compile(
+    rf"\bnet[\s\-]*(?:(\d{{1,3}})\b(?!\s*%)|({_NUM_TOKEN}(?:[\s\-]+(?:and\s+)?{_NUM_TOKEN})*)\b"
+    rf"(?:\s*\(\s*(\d{{1,3}})\s*\)|(?=\s*(?:calendar\s+)?days?\b)))",
+    re.IGNORECASE,
+)
 _BEFORE_RE = re.compile(r"\b(before|prior\s+to|preceding|in\s+advance\s+of|ahead\s+of)\b", re.IGNORECASE)
 _AFTER_RE = re.compile(
     r"\b(after|from|following|of|upon|since|beyond|post|commencing\s+on|starting\s+on|from\s+and\s+after)\b",
@@ -312,6 +345,58 @@ def _quantity(m: re.Match[str]) -> tuple[int, str] | None:
     return (value, _unit(m.group(3))) if value is not None else None
 
 
+def _net_value(m: re.Match[str]) -> int | None:
+    if m.group(1):
+        return int(m.group(1))
+    if m.group(3):
+        return int(m.group(3))
+    return words_to_int(m.group(2) or "")
+
+
+def net_days(text: str | None) -> int | None:
+    """The days of a "Net N" payment term ("Net 30", "net thirty (30) days",
+    "2/10 net 30" → 30), or None."""
+    for m in _NET_RE.finditer(text or ""):
+        value = _net_value(m)
+        if value is not None:
+            return value
+    return None
+
+
+def find_quantities(text: str | None) -> list[tuple[int, str, int, int]]:
+    """Every duration in ``text`` as (value, unit, start, end), in order."""
+    out = []
+    for m in _QUANTITY_RE.finditer(text or ""):
+        qty = _quantity(m)
+        if qty:
+            out.append((qty[0], qty[1], m.start(), m.end()))
+    return out
+
+
+# A notice period is followed by notice wording ("ninety (90) days' written
+# notice", "60 days prior to expiration"). A renewal or extension length
+# ("renew for successive one (1) year periods") and a cure or payment window
+# ("within 30 days of notice") are not notice periods.
+_NOTICE_AFTER_RE = re.compile(r"^[^.;]{0,40}?\b(?:notice|notif\w*|prior\b|before\b|in\s+advance|preceding)",
+                              re.IGNORECASE)
+_NOT_NOTICE_BEFORE_RE = re.compile(
+    r"(?:\b(?:successive|additional|further|renew\w*|extend\w*|extension)\s+(?:for\s+)?(?:an?\s+)?"
+    r"(?:(?:additional|successive|further|renewal)\s+)?(?:(?:terms?|periods?)\s+of\s+)?|\bwithin\s+)$",
+    re.IGNORECASE,
+)
+
+
+def notice_days(text: str | None) -> int | None:
+    """The first notice period stated in ``text``, in days, or None."""
+    text = text or ""
+    for value, unit, start, end in find_quantities(text):
+        if _NOT_NOTICE_BEFORE_RE.search(text[max(0, start - 60):start]):
+            continue
+        if _NOTICE_AFTER_RE.search(text[end:end + 60]):
+            return offset_days(value, unit)
+    return None
+
+
 def anchor_key(text: str | None) -> str | None:
     """Map an anchor phrase ("the Effective Date", "receipt of invoice") to a key."""
     if not text:
@@ -334,9 +419,10 @@ def parse_offset(text: str | None) -> dict[str, Any] | None:
     if not text:
         return None
     net = _NET_RE.search(text)
-    if net:
+    days = _net_value(net) if net else None
+    if days is not None:
         tail = text[net.end():]
-        return {"value": int(net.group(1)), "unit": "days", "direction": 1,
+        return {"value": days, "unit": "days", "direction": 1,
                 "anchor": anchor_key(tail) or "invoice",
                 "anchorText": tail.strip(" .,;:") or "invoice"}
     m = _QUANTITY_RE.search(text)
@@ -364,11 +450,26 @@ _TERM_RES = [
     re.compile(rf"\b(?:initial\s+)?term\s+(?:of\s+(?:this|the)\s+[\w\s]{{0,40}}?\s+)?(?:shall\s+be|will\s+be|is|of)\s+"
                rf"(?:a\s+period\s+of\s+)?(?P<q>{_TERM_QTY})\b", re.IGNORECASE),
     re.compile(rf"\b(?P<q>{_TERM_QTY})\s+(?:initial\s+)?(?:term|period\s+of\s+performance)\b", re.IGNORECASE),
-    re.compile(rf"\b(?:remain\s+in\s+(?:full\s+force\s+and\s+)?effect|continue(?:\s+in\s+effect)?|be\s+in\s+effect)\s+for\s+"
+    re.compile(rf"\b(?:remain\s+in\s+(?:full\s+force\s+and\s+)?effect|continue(?:\s+in\s+effect)?|be\s+in\s+effect"
+               rf"|be\s+effective)\s+for\s+"
                rf"(?:a\s+(?:period|term)\s+of\s+|an\s+initial\s+(?:period|term)\s+of\s+)?(?P<q>{_TERM_QTY})\b", re.IGNORECASE),
+    # order forms and tables: "Term: 36 months", "Initial Term | 24 months",
+    # "Period of Performance: twelve (12) months"
+    re.compile(rf"\b(?:term|period\s+of\s+performance)\s*(?:[:|]|is|shall\s+be|will\s+be)\s*(?P<q>{_TERM_QTY})\b",
+               re.IGNORECASE),
+    re.compile(rf"\bexpire\w*\s+(?P<q>{_TERM_QTY})\s+(?:after|from|following)\s+(?:the\s+)?(?:effective|commencement|start)"
+               rf"\s+date\b", re.IGNORECASE),
 ]
-# Lengths that are not the agreement's term: renewals, surviving duties, notice.
-_NOT_TERM_RE = re.compile(r"renewal\s+terms?|successive|surviv|confidential|after\s+(?:the\s+)?(?:expiration|termination)"
+# "shall expire on the third anniversary of the Effective Date" → 3 years
+_ANNIVERSARY_RE = re.compile(
+    rf"\b(?:expire|terminate|end)s?\s+on\s+the\s+(?P<n>{_ORDINAL_ALT}|\d{{1,2}}(?:st|nd|rd|th))\s+"
+    rf"(?:\(\d{{1,2}}(?:st|nd|rd|th)\)\s+)?anniversary\s+of\s+the\s+(?:effective|commencement|start)\s+date\b",
+    re.IGNORECASE,
+)
+# Lengths that are not the agreement's term: renewals, extensions, surviving
+# duties, notice.
+_NOT_TERM_RE = re.compile(r"renew|successive|additional|extension|extend|option\s+period|surviv|confidential"
+                          r"|after\s+(?:the\s+)?(?:expiration|termination)"
                           r"|notice|warrant|retain|retention", re.IGNORECASE)
 
 
@@ -377,6 +478,12 @@ def stated_term(text: str | None) -> tuple[int, str, str] | None:
     or None. Only a whole-agreement term counts: a renewal term, a duty that
     survives termination or a notice period is not the term."""
     for sentence in re.split(r"(?<=[.;])\s+|\n{2,}", text or ""):
+        anniversary = _ANNIVERSARY_RE.search(sentence)
+        if anniversary:
+            raw = anniversary.group("n").lower()
+            years = _ORDINALS.get(raw) or int(re.sub(r"\D", "", raw) or 0)
+            if 0 < years <= 50:
+                return years, "years", sentence.strip()[:300]
         for pattern in _TERM_RES:
             m = pattern.search(sentence)
             if not m or _NOT_TERM_RE.search(sentence[:m.start("q")]):
@@ -431,14 +538,11 @@ def plausible(iso: str | None) -> bool:
     return d is not None and MIN_YEAR <= d.year <= MAX_YEAR
 
 
-_ISO_INLINE_RE = re.compile(r"(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)")
-
-
 def find_dates(text: str, *, day_first: bool | None = None) -> list[tuple[str, int, int]]:
     """Every unambiguous calendar date written in ``text`` as (iso, start, end),
     in order of appearance. Used to cite the clause a date came from."""
     out: list[tuple[str, int, int]] = []
-    for pattern in (_ISO_INLINE_RE, _DMY_TEXT_RE, _MDY_TEXT_RE, _NUMERIC_RE):
+    for pattern in (_ISO_IN_TEXT_RE, _DMY_TEXT_RE, _MDY_TEXT_RE, _DMY_WORDS_RE, _NUMERIC_RE):
         for m in pattern.finditer(text or ""):
             parsed = parse_date(m.group(0), day_first=day_first)
             if parsed["date"] and parsed["precision"] == "day":

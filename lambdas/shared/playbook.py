@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .clause_types import KNOWN_CATEGORIES, known_label
-from .dates import offset_days, parse_quantity
+from .dates import find_quantities, net_days, notice_days, offset_days, parse_quantity
 from .logger import get_logger
 from .money import parse_amount
 
@@ -58,7 +58,6 @@ _OUTCOME = {"ok": "within", "minor": "deviates", "moderate": "deviates", "materi
 # Money / term parsing helpers (deterministic)
 # ---------------------------------------------------------------------------
 
-_NET_DAYS_RE = re.compile(r"\bnet\s*(\d{1,3})\b", re.IGNORECASE)
 _HOURS_RE = re.compile(r"(\d{1,4})\s*hours?", re.IGNORECASE)
 _INCREASE_RE = re.compile(r"increase[ds]?\s*(?:by\s*)?(?:up to\s*)?(\d+(?:\.\d+)?)\s*%", re.IGNORECASE)
 
@@ -86,15 +85,15 @@ def parse_net_days(text: str) -> int | None:
     """Return the payment window in days from a 'Net N' phrase, or None."""
     if not text:
         return None
-    m = _NET_DAYS_RE.search(text)
-    if m:
-        return int(m.group(1))
-    # "due within 30 days", "payable in forty-five (45) days"
-    if re.search(r"\b(?:due|payable|within|paid)\b", text, re.IGNORECASE):
+    net = net_days(text)            # "Net 30", "Net-30", "net thirty (30) days", "2/10 net 30"
+    if net is not None:
+        return net
+    # "due within 30 days", "payable in forty-five (45) days", "Payment terms are 30 days"
+    if re.search(r"\b(?:due|payable|within|paid)\b|\bpayment\s+terms?\b", text, re.IGNORECASE):
         days = _duration_days(text)
         if days is not None:
             return days
-    if re.search(r"\bdue on receipt\b", text, re.IGNORECASE):
+    if re.search(r"\b(?:due|payable)\s+(?:on|upon)\s+receipt\b", text, re.IGNORECASE):
         return 0
     return None
 
@@ -169,16 +168,29 @@ def _check_liability(body: str, extra: dict[str, Any] | None = None) -> tuple[st
     if _has_any(body, ["uncapped", "unlimited liability", "without limitation as to amount", "no limitation of liability"]):
         return _R("material", f"Liability appears UNCAPPED — the standard is a cap of {cap:g}x fees paid.", "uncapped")
     if _has_any(body, ["limitation of liability", "liability cap", "aggregate liability", "total liability", "shall not exceed", "limited to"]):
-        # Look for a multiplier of fees.
-        m = re.search(r"(\d+(?:\.\d+)?)\s*(?:x|times)\s*(?:the\s*)?(?:annual\s*)?fees", low)
-        if m:
-            mult = float(m.group(1))
-            found = f"{mult:g}x fees"
+        # Look for a multiplier of fees: "2x the fees", "two times (2x) the
+        # fees", "two (2) times the annual fees".
+        m = re.search(r"\(?(\d+(?:\.\d+)?)\)?\s*(?:x|times)\)?\s*(?:the\s*)?(?:total\s*|annual\s*)?(?:fees|amounts?|charges)",
+                      low)
+        mult = float(m.group(1)) if m else None
+        # "the fees paid in the twelve (12) months preceding the claim": a
+        # look-back of N months is N/12 times the annual fees.
+        lookback = None
+        if mult is None and re.search(r"\b(?:fees|amounts?|charges)\s+(?:actually\s+)?(?:paid|payable)", low):
+            months = [v * (12 if u == "years" else 1) for v, u, _s, _e in find_quantities(low)
+                      if u in ("months", "years")]
+            if months:
+                lookback = months[0]
+                mult = lookback / 12
+            elif not re.search(r"\$|€|£|\busd\b|\beur\b|\bgbp\b|\d", low):
+                return _R("ok", "", "fees paid")              # capped at the fees paid under the agreement
+        if mult is not None:
+            found = "fees paid in the preceding 12 months" if lookback == 12 else f"{mult:g}x fees"
             if mult > cap:
                 sev = "material" if mult >= 3 * cap else "moderate"
                 return _R(sev, f"Liability cap is {mult:g}x fees; standard is {cap:g}x fees.", found)
             return _R("ok", "", found)
-        if "12 months" in low or "twelve months" in low or "preceding 12" in low:
+        if "preceding 12" in low:
             return _R("ok", "", "fees paid in the preceding 12 months")
         # A cap exists but its size can't be read deterministically.
         return _R("review", f"A liability cap is present but its magnitude could not be parsed; confirm it is ≤ {cap:g}x fees.")
@@ -227,7 +239,13 @@ def _check_termination(body: str, extra: dict[str, Any] | None = None) -> tuple[
     minimum = int(_num(extra, "minNoticeDays", 30))
     low = body.lower()
     if _has_any(body, ["for convenience", "without cause", "at any time"]):
-        days = parse_notice_days(body)
+        # Read the notice from the convenience sentence itself, not a cure
+        # period or the term length stated elsewhere in the clause.
+        conv = [s for s in re.split(r"(?<=[.;])\s+", body)
+                if _has_any(s, ["for convenience", "without cause", "at any time"])]
+        days = next((d for d in map(notice_days, conv) if d is not None), None)
+        if days is None:
+            days = parse_notice_days(conv[0] if conv else body)
         if days is not None and days < minimum:
             return _R("moderate", f"Termination-for-convenience notice is {days} days; standard is ≥ {minimum} days.", f"{days} days' notice")
         if days is None:
@@ -241,7 +259,9 @@ def _check_termination(body: str, extra: dict[str, Any] | None = None) -> tuple[
 def _check_autorenewal(body: str, extra: dict[str, Any] | None = None) -> tuple[str, str]:
     maximum = int(_num(extra, "maxOptOutDays", 30))
     if _has_any(body, ["automatically renew", "auto-renew", "auto renew", "evergreen", "renew for successive"]):
-        days = parse_notice_days(body)
+        # the opt-out notice, not the renewal period ("renew for successive one
+        # (1) year periods unless … ninety (90) days' notice")
+        days = notice_days(body)
         if days is not None and days > maximum:
             return _R("moderate", f"Auto-renewal opt-out window is {days} days; standard is ≤ {maximum} days notice.", f"{days} days' notice")
         if days is None:

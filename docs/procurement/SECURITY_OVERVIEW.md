@@ -81,8 +81,8 @@ The public website says "TLS 1.3". The minimum enforced in our configuration is 
 | Every API route requires a valid Cognito ID token (signature, issuer, audience) | Implemented | `aws_apigatewayv2_authorizer.cognito`, `authorization_type = "JWT"` on each route |
 | Identity taken only from verified claims (`sub`; `email` only when `email_verified`) | Implemented | `lambdas/shared/access.py`, `shared/auth.py` |
 | Per-project, per-document access: owner / editor / viewer; unknown ids return 404 | Implemented | `access.py` permission matrix |
-| Govern roles from Cognito groups `govern-admin`, `govern-reviewer`, `govern-leader` | Implemented in code | `lambdas/govern_api/handler.py` |
-| `GOVERN_OPEN_ADMIN` defaults to `false`; only the `dev` stage may enable it | Resolved | `shared/config.py`, `terraform/govern.tf` |
+| Govern admin is per organization (its creator plus admins they add); Cognito groups `govern-reviewer`, `govern-leader` give reviewer / leader and never admin | Implemented in code | `lambdas/shared/govern/org.py`, `lambdas/govern_api/handler.py` |
+| `GOVERN_OPEN_ADMIN` (everyone-is-admin sandbox switch) removed | Resolved | `shared/config.py`, `terraform/govern.tf` |
 | SAML SSO (Shibboleth/InCommon) | **Not yet implemented** | Planned; see `SSO_SHIBBOLETH.md` |
 | MFA | **To confirm.** The user pool is managed outside Terraform | `variables.tf` |
 | Webhooks (`/webhooks/*`) verified by HMAC with 5-minute replay window | Designed and coded | `GOVERN_ARCHITECTURE.md` §2.6, `config.py` `webhook_max_age_s` |

@@ -163,22 +163,16 @@ variable "ai_provider" {
 
 # ─── Govern ────────────────────────────────────────────────────────────────────
 
-variable "govern_open_admin" {
-  description = "Sandbox only: treat signed-in users in no Govern Cognito group as Govern admins. Honoured ONLY when stage = dev; staging / prod always require the govern-admin / govern-reviewer / govern-leader groups."
-  type        = bool
-  default     = false
-}
-
 variable "govern_features" {
-  description = "Govern \"Later\" features switched on for this deployment, as a comma list: routing_rules, docusign, notifications, obligations, exports, integrations (e.g. \"exports,docusign\"). Empty = all of them off. Reported to the web app by GET /govern/me."
+  description = "Govern \"Later\" features switched on for this deployment, as a comma list: routing_rules, docusign, notifications, obligations, exports, integrations, automations (e.g. \"exports,docusign\"). Empty = all of them off. Reported to the web app by GET /govern/me."
   type        = string
-  default     = "obligations,routing_rules,exports,notifications"
+  default     = "obligations,routing_rules,exports,notifications,automations"
   validation {
     condition = alltrue([
       for f in compact([for s in split(",", var.govern_features) : trimspace(s)]) :
-      contains(["routing_rules", "docusign", "notifications", "obligations", "exports", "integrations"], f)
+      contains(["routing_rules", "docusign", "notifications", "obligations", "exports", "integrations", "automations"], f)
     ])
-    error_message = "The govern_features list may only name routing_rules, docusign, notifications, obligations, exports and integrations."
+    error_message = "The govern_features list may only name routing_rules, docusign, notifications, obligations, exports, integrations and automations."
   }
 }
 

@@ -56,6 +56,9 @@ GOVERN_FEATURES: dict[str, str] = {
     "obligations": "obligations",
     "exports": "exports",
     "integrations": "integrations",
+    # Trigger → conditions → actions rules (shared/govern/automations.py),
+    # run by the sweeper (time) and the activity stream (events).
+    "automations": "automations",
 }
 
 
@@ -207,6 +210,9 @@ class Settings:
     intake_queue_url: str = field(default_factory=lambda: _env("INTAKE_QUEUE_URL", ""))
     # Custom EventBridge bus that carries "Document Analysed" and Govern.* events.
     event_bus_name: str = field(default_factory=lambda: _env("EVENT_BUS_NAME", ""))
+    # AppSync Events API HTTP domain the activity stream pushes "contract
+    # changed" invalidations to (shared/govern/realtime.py); empty = off.
+    govern_realtime_http_domain: str = field(default_factory=lambda: _env("GOVERN_REALTIME_HTTP_DOMAIN", ""))
     # Verified SES identity alerts are sent from; empty = email alerts disabled.
     notify_from_email: str = field(default_factory=lambda: _env("NOTIFY_FROM_EMAIL", ""))
     # SES may live in another region than the stack (sandbox / verified identity).
@@ -217,10 +223,6 @@ class Settings:
     huron_secret_arn: str = field(default_factory=lambda: _env("HURON_SECRET_ARN", ""))
     workday_secret_arn: str = field(default_factory=lambda: _env("WORKDAY_SECRET_ARN", ""))
     m365_secret_arn: str = field(default_factory=lambda: _env("M365_SECRET_ARN", ""))
-    # Sandbox only: a signed-in user in no Govern group is a Govern admin.
-    # Off by default (staging / prod require the govern-admin / -reviewer /
-    # -leader Cognito groups); Terraform turns it on for the dev stage only.
-    govern_open_admin: bool = field(default_factory=lambda: _bool("GOVERN_OPEN_ADMIN", False))
     # Link to the web app used in alert emails / Teams cards ("Open in Govern").
     app_base_url: str = field(default_factory=lambda: _env("APP_BASE_URL", "https://govern.blue-iq.ai"))
     # DocuSign Connect: reject webhook deliveries older than this (replay guard).

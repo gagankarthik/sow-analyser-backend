@@ -11,14 +11,28 @@ Flow
      is restricted to those ids inside the query itself — it is never run wide
      and filtered afterwards — so another user's clause cannot be retrieved,
      quoted or cited. No permitted document → the same "nothing found" answer,
-     without spending a model call.
-  2. Embed the question; hybrid retrieval (k-NN + BM25, reciprocal-rank fusion)
-     over the clause chunks; de-duplicate.
+     without spending a model call. (Hits are checked against the scope once
+     more on the way back, as defence in depth.)
+  2. Embed the question; hybrid retrieval (k-NN + BM25 with legal-synonym query
+     expansion, reciprocal-rank fusion, light rerank) over the clause chunks.
   3. Assemble the context: chunks of the same clause merged in document order,
-     each block labelled with its clause number, title and section.
+     each block labelled with its clause number, title and section, within a
+     token budget.
   4. Ask the model to answer ONLY from that context, cite clause numbers, and say
      so plainly when the answer is not in the document.
-  5. Return the answer with citations (shape unchanged; extra fields optional).
+  5. Check the answer: citations to clauses that were not in the context are
+     removed, and figures (amounts, percentages, periods, dates) that do not
+     appear in the cited clauses are listed as ``unverified``.
+  6. Return ``{answer, citations, usedCitations, grounded, unverified}`` (the
+     first two as before; the rest optional extras).
+
+Failure handling — every external call is bounded and fails soft:
+  * embeddings slow / down → keyword search alone (the answer still comes);
+  * one search channel down → the other; both down → HTTP 503 with a clear
+    message (or an answer from the Govern review alone, when there is one);
+  * clause indices missing → "not searchable yet";
+  * the chat model slow / down → HTTP 503 with a clear message;
+  * the whole HTTP request is held inside the API Gateway's 30-second ceiling.
 """
 from __future__ import annotations
 
@@ -30,7 +44,8 @@ import time
 import urllib.parse
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from decimal import Decimal, InvalidOperation
+from typing import Any, Callable
 
 from aws_lambda_powertools import Logger, Tracer
 from botocore.auth import SigV4Auth
@@ -51,17 +66,28 @@ from shared.guardrails import (
     validate_output,
 )
 from shared.logger import get_logger, safe_trace
-from shared.openai_client import TRUNCATION_NOTE, chat_stream, chat_text, embed_texts
-from shared.opensearch import clause_search
+from shared.openai_client import TRUNCATION_NOTE, chat_stream, chat_text, embed_texts, set_deadline
+from shared.opensearch import SearchIndexMissing, SearchUnavailable, clause_search
 
 log: Logger = get_logger("blue-iq.rag")
 tracer = Tracer(service="blue-iq.rag")
+
+
+def _env_num(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name) or default)
+    except ValueError:
+        return default
+
 
 APPSYNC_URL       = os.environ.get("APPSYNC_GRAPHQL_ENDPOINT") or os.environ.get("APPSYNC_GRAPHQL_URL", "")
 MAX_CONTEXT_CLAUSES = int(os.environ.get("RAG_MAX_CONTEXT_CLAUSES", "8") or 8)
 # Per-clause cap on what goes into the prompt. A retrieval chunk is ~1,800
 # characters, so this keeps a whole chunk (the old 1,200 cut every chunk short).
 MAX_CLAUSE_CHARS    = int(os.environ.get("RAG_MAX_CLAUSE_CHARS", "2400") or 2400)
+# Total budget for the clause context, in tokens: with topK up to 20 the count
+# cap alone allowed ~12k tokens of context.
+MAX_CONTEXT_TOKENS  = int(_env_num("RAG_MAX_CONTEXT_TOKENS", 6000))
 # Hard caps on caller-controlled input: bound prompt size (and so LLM spend).
 MAX_QUESTION_CHARS  = 2000
 MAX_TOP_K           = 20
@@ -71,6 +97,12 @@ MAX_HISTORY_TURNS   = 6
 MAX_HISTORY_CHARS   = 1200
 # How many matrix findings the contract brief lists (most serious first).
 MAX_BRIEF_FINDINGS  = 12
+# Time budget. The HTTP API gives up at 30 s, so the whole request must finish
+# inside it: the embedding and the chat call each get a bounded slice, and the
+# OpenAI client's own retries are capped by the same deadline.
+REQUEST_BUDGET_S    = _env_num("RAG_REQUEST_BUDGET_S", 28.0)
+EMBED_TIMEOUT_S     = _env_num("RAG_EMBED_TIMEOUT_S", 6.0)
+CHAT_TIMEOUT_S      = _env_num("RAG_CHAT_TIMEOUT_S", 20.0)
 _ID_RE              = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _CITE_RE            = re.compile(r"\[\s*§([^\]]{1,160})\]")
 # "[§7.2, §8.1]", "[§3; §4]", "[§2 and §5]": one bracket may cite several clauses.
@@ -83,6 +115,14 @@ _NO_HITS_ANSWER     = (
     "I couldn't find any clauses relevant to that question in this document. "
     "Try rephrasing, or ask about a specific clause or topic."
 )
+_NOT_INDEXED_ANSWER = (
+    "This agreement isn't searchable yet — it may still be processing. "
+    "Try again once the analysis has finished."
+)
+_EMPTY_ANSWER       = "Sonar couldn't produce an answer to that. Try rephrasing the question."
+_SEARCH_DOWN_ERROR  = "Sonar couldn't search this agreement just now. Please try again in a moment."
+_MODEL_DOWN_ERROR   = "Sonar couldn't get an answer from the AI service in time. Please try again in a moment."
+_INTERRUPTED_NOTE   = "\n\n(The answer was interrupted. Please ask again.)"
 
 _SYSTEM_PROMPT = """You are Sonar, the contract assistant in Blue-IQ Govern. You help
 reviewers and leaders act on an agreement: what it says, how it compares
@@ -100,8 +140,9 @@ Sources:
   the payment terms?" keeps its meaning.
 
 How to answer:
-- Start with a one- or two-sentence direct answer. Then details as short
-  bullets. No preamble, no restating the question.
+- Start with a one- or two-sentence direct answer to the question (the figure,
+  date, party or yes/no first). Then details as short bullets. No preamble,
+  no restating the question.
 - When asked what to change, fix, negotiate or send back: list each finding
   that is not within the matrix (most serious first) with its clause number,
   what the agreement says, what your matrix allows, and the suggested
@@ -114,13 +155,15 @@ How to answer:
 Rules:
 - Answer ONLY using <context> and <review>. Do not use outside
   knowledge about contracts, law or the parties.
-- If the context does not contain the answer, say plainly that the document
-  does not state it (and, if useful, what the nearest related clause does say).
-  Never guess, estimate or fill a gap with what contracts "usually" say.
+- If the context does not contain the answer, begin with "The agreement
+  doesn't say" — the document does not state it — and, if useful, name the
+  nearest related clause and what it does say. Never guess, estimate or fill a
+  gap with what contracts "usually" say.
 - Cite the clause number in square brackets, e.g. [§7.2], every time you
   reference contract language. Cite only clause numbers that appear in <context>.
 - Quote amounts, dates, percentages, notice periods and party names exactly as
-  they appear in the context. Never invent, round or convert them.
+  they appear in the context, from the clause you cite. Never invent, round,
+  convert or add them up.
 - Be concise. Use bullet lists when comparing multiple clauses.
 - Surface contradictions if multiple clauses conflict.
 - An excerpt may be one part of a longer clause; do not assume the rest.
@@ -177,18 +220,87 @@ def _audit_rag(red: Redaction, **keys: Any) -> None:
         log.warning("rag.audit_failed", error_type=type(exc).__name__)
 
 
-@tracer.capture_lambda_handler
+# X-Ray must not record the answer (it quotes contract text and the user's
+# question) or an exception message (same reason): Powertools stores both as
+# trace metadata by default, readable by anyone with xray:BatchGetTraces.
+@tracer.capture_lambda_handler(capture_response=False, capture_error=False)
 def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
     log.append_keys(invocation_id=str(uuid.uuid4()))
     is_http = isinstance(event, dict) and bool(event.get("requestContext", {}).get("http"))
     try:
-        return _http_handle(event) if is_http else _handle(event)
+        return _http_handle(event, _context) if is_http else _handle(event, _context)
     except Exception as exc:
         # no exception text: it may quote the question or a clause
         log.error("rag.handler.error", error_type=type(exc).__name__, trace=safe_trace(exc))
         if is_http:
             return _http_resp(500, {"error": "Internal server error"})
         raise
+
+
+# ---------------------------------------------------------------------------
+# Time budget and bounded external calls
+# ---------------------------------------------------------------------------
+
+# Long-lived workers for calls that must not outlive their slice of the budget:
+# a hung call is abandoned (the request answers without it), not awaited.
+_BOUNDED = ThreadPoolExecutor(max_workers=4, thread_name_prefix="rag-bounded")
+
+
+def _start_budget(context: Any) -> None:
+    """Cap every OpenAI call (and its retries) by what is left of this request."""
+    budget_ms = int(REQUEST_BUDGET_S * 1000)
+    try:
+        budget_ms = min(budget_ms, int(context.get_remaining_time_in_millis()) - 1000)
+    except Exception:  # noqa: BLE001 — no Lambda context (tests, local runs)
+        pass
+    set_deadline(max(budget_ms, 2000), reserve_s=1.0)
+
+
+def _bounded(fn: Callable[[], Any], timeout_s: float) -> Any:
+    return _BOUNDED.submit(fn).result(timeout=timeout_s)
+
+
+def _embed_question(text: str) -> list[float] | None:
+    """The question's vector, or None when the embedding service is slow or
+    down — the search then runs on keywords alone instead of failing."""
+    try:
+        vectors = _bounded(lambda: embed_texts([text], model=settings.embedding_model), EMBED_TIMEOUT_S)
+        return (vectors or [None])[0] or None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("rag.embed_failed_keyword_only", error_type=type(exc).__name__)
+        return None
+
+
+def _retrieve(text: str, vector: list[float] | None, k: int, scope: dict[str, Any]
+              ) -> tuple[list[dict[str, Any]], str]:
+    """Hybrid search inside ``scope``. Returns (hits, state): state is "ok",
+    "missing" (nothing indexed yet) or "down" (search unavailable)."""
+    try:
+        return clause_search(text=text, vector=vector, k=k,
+                             **{key: v for key, v in scope.items() if key != "meta"}), "ok"
+    except SearchIndexMissing:
+        log.warning("rag.search_index_missing")
+        return [], "missing"
+    except SearchUnavailable:
+        log.error("rag.search_unavailable")
+        return [], "down"
+    except Exception as exc:  # noqa: BLE001 — never a 500 for a search problem
+        log.error("rag.search_failed", error_type=type(exc).__name__)
+        return [], "down"
+
+
+def _in_scope(hits: list[dict[str, Any]], scope: dict[str, Any],
+              existing: set[str] | None = None) -> list[dict[str, Any]]:
+    """Defence in depth: drop any hit outside the permitted documents (the
+    search already filters in the query), and — when the live document list is
+    known — any hit of a document that has since been deleted."""
+    allowed = {scope["doc_id"]} if scope.get("doc_id") else set(scope.get("doc_ids") or [])
+    if existing:
+        allowed &= existing
+    kept = [h for h in hits if str((h.get("_source") or {}).get("docId") or "") in allowed]
+    if len(kept) != len(hits):
+        log.warning("rag.hits_out_of_scope_dropped", dropped=len(hits) - len(kept))
+    return kept
 
 
 # ---------------------------------------------------------------------------
@@ -222,15 +334,9 @@ def _scope_for(target_id: str, caller: Caller) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
-def _assemble(hits: list[dict[str, Any]], multi_doc: bool, titles: dict[str, str] | None = None
-              ) -> tuple[list[str], list[dict[str, Any]]]:
-    """Turn retrieved chunks into labelled context blocks + citations.
-
-    Chunks of the same clause are merged (in chunk order, without repeating the
-    overlap) into one block, blocks keep the retrieval ranking of their best
-    chunk, and each is labelled ``[§<number>] <title> — <section>`` so the model
-    can cite it and the reader can find it.
-    """
+def _assemble_full(hits: list[dict[str, Any]], multi_doc: bool, titles: dict[str, str] | None = None
+                   ) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+    """``_assemble`` plus each block's full clause text (for the answer checks)."""
     groups: dict[tuple[str, str], dict[str, Any]] = {}
     for rank, h in enumerate(hits):
         src = h.get("_source") or {}
@@ -240,6 +346,7 @@ def _assemble(hits: list[dict[str, Any]], multi_doc: bool, titles: dict[str, str
 
     blocks: list[str] = []
     citations: list[dict[str, Any]] = []
+    bodies: list[str] = []
     for (doc_id, number), g in sorted(groups.items(), key=lambda kv: kv[1]["rank"]):
         src = g["src"]
         pieces: list[str] = []
@@ -255,6 +362,7 @@ def _assemble(hits: list[dict[str, Any]], multi_doc: bool, titles: dict[str, str
         if multi_doc:
             label += f" (document: {(titles or {}).get(doc_id) or doc_id})"
         blocks.append(f"{_as_data(label)}\n{_as_data(body)}")
+        bodies.append(body)
         citations.append({
             "clauseNumber": number,
             "docId": doc_id,
@@ -267,7 +375,39 @@ def _assemble(hits: list[dict[str, Any]], multi_doc: bool, titles: dict[str, str
             "page": src.get("page"),
             "snippet": (pieces[0] if pieces else "")[:240],
         })
+    return blocks, citations, bodies
+
+
+def _assemble(hits: list[dict[str, Any]], multi_doc: bool, titles: dict[str, str] | None = None
+              ) -> tuple[list[str], list[dict[str, Any]]]:
+    """Turn retrieved chunks into labelled context blocks + citations.
+
+    Chunks of the same clause are merged (in chunk order, without repeating the
+    overlap) into one block, blocks keep the retrieval ranking of their best
+    chunk, and each is labelled ``[§<number>] <title> — <section>`` so the model
+    can cite it and the reader can find it.
+    """
+    blocks, citations, _ = _assemble_full(hits, multi_doc, titles)
     return blocks, citations
+
+
+def _approx_tokens(text: str) -> int:
+    """~4 characters per token. Deliberately not tiktoken: its encoding file is
+    fetched over the network on first use, which a chat request cannot afford."""
+    return (len(text or "") + 3) // 4
+
+
+def _fit_context(blocks: list[str], citations: list[dict[str, Any]], bodies: list[str], top_k: int
+                 ) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+    """The best ``top_k`` blocks that fit MAX_CONTEXT_TOKENS (always at least one)."""
+    kept, used = 0, 0
+    for block in blocks[:top_k]:
+        cost = _approx_tokens(block)
+        if kept and used + cost > MAX_CONTEXT_TOKENS:
+            break
+        used += cost
+        kept += 1
+    return blocks[:kept], citations[:kept], bodies[:kept]
 
 
 def _used(answer: str, citations: list[dict[str, Any]]) -> list[str]:
@@ -284,13 +424,19 @@ def _used(answer: str, citations: list[dict[str, Any]]) -> list[str]:
 
 def _search_text(question: str, history: list[dict[str, str]]) -> str:
     """What to retrieve with. A follow-up ("and the payment terms?") is
-    searched together with the previous question so it keeps its subject; a
-    question that stands on its own is searched alone, so an earlier topic does
-    not crowd out the clauses it is about."""
+    searched together with the previous question — and the clauses the last
+    answer cited — so it keeps its subject; a question that stands on its own is
+    searched alone, so an earlier topic does not crowd out the clauses it is
+    about."""
     prev = next((t["content"] for t in reversed(history) if t["role"] == "user"), "")
     words = len(question.split())
     if prev and (words <= 4 or (words <= 14 and _FOLLOW_UP_RE.search(question))):
-        return f"{prev}\n{question}"
+        last = next((t["content"] for t in reversed(history) if t["role"] == "assistant"), "")
+        refs = list(dict.fromkeys(
+            part.strip().lstrip("§").strip()
+            for m in _CITE_RE.finditer(last) for part in _CITE_SPLIT_RE.split(m.group(1)) if part.strip()))
+        cited = " ".join(f"§{r}" for r in refs[:3])
+        return f"{prev}\n{question}" + (f"\n{cited}" if cited else "")
     return question
 
 
@@ -318,6 +464,158 @@ def _history(raw: Any) -> list[dict[str, str]]:
             if text:
                 out.append({"role": t["role"], "content": text})
     return out
+
+
+# ---------------------------------------------------------------------------
+# Answer checks: citations and figures
+# ---------------------------------------------------------------------------
+
+
+def _clean_citations(answer: str, citations: list[dict[str, Any]], also: set[str] | None = None
+                     ) -> tuple[str, list[str]]:
+    """Remove citations of clauses that were not in the context (``[§99]`` →
+    gone, ``[§7.2, §99]`` → ``[§7.2]``). Clause numbers named in the Govern
+    review (``also``) are kept in the text. Returns (answer, removed refs)."""
+    offered = {str(c["clauseNumber"]).strip().lower() for c in citations} | {a.lower() for a in (also or set())}
+    removed: list[str] = []
+
+    def keep_known(m: re.Match[str]) -> str:
+        keep = []
+        for part in _CITE_SPLIT_RE.split(m.group(1)):
+            ref = part.strip().lstrip("§").strip()
+            if not ref:
+                continue
+            if ref.lower() in offered:
+                keep.append(f"§{ref}")
+            else:
+                removed.append(ref)
+        return f"[{', '.join(keep)}]" if keep else ""
+
+    cleaned = _CITE_RE.sub(keep_known, answer or "")
+    if removed:
+        cleaned = re.sub(r"[ \t]+([.,;:!?)])", r"\1", cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned, removed
+
+
+_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8, "sep": 9,
+           "oct": 10, "nov": 11, "dec": 12}
+_MONTH = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?"
+          r"|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)")
+_DATE_RE = re.compile(
+    rf"\b(?P<m1>{_MONTH})\.?\s+(?P<d1>\d{{1,2}})(?:st|nd|rd|th)?,?\s+(?P<y1>\d{{4}})\b"
+    rf"|\b(?P<d2>\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?(?P<m2>{_MONTH})\.?,?\s+(?P<y2>\d{{4}})\b"
+    r"|\b(?P<y3>\d{4})-(?P<m3>\d{1,2})-(?P<d3>\d{1,2})\b",
+    re.IGNORECASE)
+_FIGURE_RE = re.compile(
+    r"(?P<cur>(?:US)?\$|€|£|\b(?:USD|EUR|GBP|CAD|AUD|INR)\s?)?"
+    r"(?<![\w.,§/-])(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
+    r"(?P<mult>\s?(?:million|billion|thousand|bn|m|k)\b)?"
+    r"(?P<unit>\s?(?:%|percent\b|per\s?cent\b)"
+    r"|\s(?:business\s|calendar\s|working\s)?(?:days?|weeks?|months?|years?|hours?|minutes?)\b)?",
+    re.IGNORECASE)
+_REF_BEFORE_RE = re.compile(
+    r"(?:§|\b(?:section|sections|clause|clauses|article|schedule|exhibit|appendix|annex|paragraph|para|part"
+    r"|no\.|number|version|iso|soc)\.?)\s*(?:\d[\d.]*\s*(?:,|and|or|-|to)\s*)*$", re.IGNORECASE)
+_MULTIPLIERS = {"thousand": 1000, "k": 1000, "million": 10**6, "m": 10**6, "billion": 10**9, "bn": 10**9}
+_UNITS = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+          "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+          "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19}
+_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80,
+         "ninety": 90}
+_WORD_NUM_RE = re.compile(
+    r"\b(?:(?P<h>" + "|".join(_UNITS) + r")\s+hundred(?:\s+and)?\s*)?"
+    r"(?P<t>" + "|".join(_TENS) + r")?(?:[- ]?(?P<u>" + "|".join(_UNITS) + r"))?\b", re.IGNORECASE)
+
+
+def _date_key(m: re.Match[str]) -> tuple[int, int, int] | None:
+    try:
+        if m.group("y1"):
+            return int(m.group("y1")), _MONTHS[m.group("m1")[:3].lower()], int(m.group("d1"))
+        if m.group("y2"):
+            return int(m.group("y2")), _MONTHS[m.group("m2")[:3].lower()], int(m.group("d2"))
+        return int(m.group("y3")), int(m.group("m3")), int(m.group("d3"))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _figure_value(m: re.Match[str]) -> Decimal | None:
+    try:
+        value = Decimal(m.group("num").replace(",", ""))
+    except InvalidOperation:
+        return None
+    mult = (m.group("mult") or "").strip().lower()
+    return value * _MULTIPLIERS[mult] if mult in _MULTIPLIERS else value
+
+
+def _source_facts(texts: list[str]) -> tuple[set[Decimal], set[tuple[int, int, int]]]:
+    """Every number (digits or words) and every date in the source texts."""
+    numbers: set[Decimal] = set()
+    dates: set[tuple[int, int, int]] = set()
+    for text in texts:
+        if not text:
+            continue
+        for m in _DATE_RE.finditer(text):
+            if (key := _date_key(m)) is not None:
+                dates.add(key)
+        for m in _FIGURE_RE.finditer(text):
+            if (value := _figure_value(m)) is not None:
+                numbers.add(value)
+                numbers.add(Decimal(m.group("num").replace(",", "")))
+        for m in _WORD_NUM_RE.finditer(text):
+            if not (m.group("h") or m.group("t") or m.group("u")):
+                continue
+            total = (_UNITS[m.group("h").lower()] * 100 if m.group("h") else 0)
+            total += _TENS[m.group("t").lower()] if m.group("t") else 0
+            total += _UNITS[m.group("u").lower()] if m.group("u") else 0
+            numbers.add(Decimal(total))
+    return numbers, dates
+
+
+def _unverified(answer: str, sources: list[str]) -> list[str]:
+    """Figures in the answer — amounts, percentages, periods, dates, other
+    numbers of two or more digits — that appear nowhere in ``sources``. A cheap
+    check, not proof: it lists what a reader should verify against the clause."""
+    text = _CITE_RE.sub(" ", (answer or "").replace(TRUNCATION_NOTE, ""))
+    numbers, dates = _source_facts(sources)
+    flagged: list[str] = []
+    spans: list[tuple[int, int]] = []
+    for m in _DATE_RE.finditer(text):
+        spans.append(m.span())
+        key = _date_key(m)
+        if key is not None and key not in dates:
+            flagged.append(m.group(0).strip())
+    for m in _FIGURE_RE.finditer(text):
+        if any(a <= m.start("num") < b for a, b in spans):
+            continue
+        if _REF_BEFORE_RE.search(text[max(0, m.start() - 24):m.start()]):
+            continue                                    # "Section 7.2", "Appendix 3", "ISO 27001"
+        value = _figure_value(m)
+        if value is None:
+            continue
+        plain = not (m.group("cur") or m.group("mult") or m.group("unit"))
+        if plain and value < 10 and "." not in m.group("num"):
+            continue                                    # "2 findings", list numbering
+        if value not in numbers and Decimal(m.group("num").replace(",", "")) not in numbers:
+            flagged.append(m.group(0).strip())
+    return list(dict.fromkeys(flagged))[:10]
+
+
+def _check_answer(answer: str, citations: list[dict[str, Any]], bodies: list[str],
+                  extra_sources: list[str], review_refs: set[str]) -> dict[str, Any]:
+    """Post-process a model answer: strip citations outside the context, work
+    out which clauses it cites and whether it is grounded, and list figures that
+    the cited clauses do not contain."""
+    cleaned, removed = _clean_citations(answer, citations, review_refs)
+    if removed:
+        log.warning("rag.invented_citations_removed", count=len(removed))
+    used = _used(cleaned, citations)
+    cited_bodies = [b for c, b in zip(citations, bodies) if c["clauseNumber"] in used]
+    sources = (cited_bodies if used else bodies) + [s for s in extra_sources if s]
+    unverified = _unverified(cleaned, sources)
+    if unverified:
+        log.info("rag.unverified_figures", count=len(unverified))
+    return {"answer": cleaned, "usedCitations": used, "grounded": bool(used), "unverified": unverified}
 
 
 _TIER_ORDER = {"unacceptable": 0, "deviates": 1, "missing": 2, "review": 3, "fallback": 4, "within": 5}
@@ -373,12 +671,17 @@ def _contract_brief(doc_id: str, meta: dict[str, Any]) -> str | None:
     return "\n".join(lines)
 
 
+def _refs_in(text: str | None) -> set[str]:
+    return {part.strip().lstrip("§").strip() for m in _CITE_RE.finditer(text or "")
+            for part in _CITE_SPLIT_RE.split(m.group(1)) if part.strip()}
+
+
 # ---------------------------------------------------------------------------
 # HTTP API path — POST /documents/{docId}/chat (non-streaming JSON)
 # ---------------------------------------------------------------------------
 
 
-def _http_handle(event: dict[str, Any]) -> dict[str, Any]:
+def _http_handle(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
     method = (event.get("requestContext", {}).get("http", {}).get("method") or "POST").upper()
     if method == "OPTIONS":
         return _http_resp(200, {})
@@ -418,6 +721,7 @@ def _http_handle(event: dict[str, Any]) -> dict[str, Any]:
     if scope is None:
         return _http_resp(200, {"answer": _NO_HITS_ANSWER, "citations": [], "grounded": False})
 
+    _start_budget(context)
     started = time.monotonic()
     multi_doc = "doc_ids" in scope
     search_text = _search_text(question, history)
@@ -426,44 +730,65 @@ def _http_handle(event: dict[str, Any]) -> dict[str, Any]:
     with ThreadPoolExecutor(max_workers=1) as pool:
         side = (pool.submit(lambda: {m.get("docId"): m.get("title") for m in ddb.get_docs(scope["doc_ids"])})
                 if multi_doc else pool.submit(_contract_brief, target_id, scope.get("meta") or {}))
-        [q_vec] = embed_texts([search_text], model=settings.embedding_model)
+        q_vec = _embed_question(search_text)
         # Fetch more chunks than clauses wanted: several chunks can belong to one clause.
-        hits = clause_search(text=search_text, vector=q_vec, k=min(top_k * 2, MAX_TOP_K * 2),
-                             **{k: v for k, v in scope.items() if k != "meta"})
-        titles, brief = (side.result(), None) if multi_doc else (None, side.result())
+        hits, search_state = _retrieve(search_text, q_vec, min(top_k * 2, MAX_TOP_K * 2), scope)
+        try:
+            side_result = side.result()
+        except Exception as exc:  # noqa: BLE001 — titles / review are extras
+            log.warning("rag.side_read_failed", error_type=type(exc).__name__)
+            side_result = None
+    titles, brief = ((side_result or {}), None) if multi_doc else (None, side_result)
+    hits = _in_scope(hits, scope, set(titles) if titles else None)
 
+    if search_state == "down" and not brief:
+        return _http_resp(503, {"error": _SEARCH_DOWN_ERROR, "code": "search_unavailable"})
     # No clause matched, but the review may still answer ("what is the next step?").
     if not hits and not brief:
-        return _http_resp(200, {"answer": _NO_HITS_ANSWER, "citations": [], "grounded": False})
+        answer = _NOT_INDEXED_ANSWER if search_state == "missing" else _NO_HITS_ANSWER
+        return _http_resp(200, {"answer": answer, "citations": [], "grounded": False})
 
-    blocks, citations = _assemble(hits, multi_doc, titles)
-    blocks, citations = blocks[:top_k], citations[:top_k]
+    blocks, citations, bodies = _assemble_full(hits, multi_doc, titles)
+    blocks, citations, bodies = _fit_context(blocks, citations, bodies, top_k)
     red = _redact(_user_message(blocks, question, brief, history))
     _audit_rag(red, tenantId=caller.tenant_id, targetId=target_id, clauses=len(citations))
 
-    answer = chat_text(
-        system=_SYSTEM_PROMPT,
-        user=red.text,
-        model=settings.model_for("rag"),
-        temperature=0.0,
-        max_tokens=MAX_ANSWER_TOKENS,
-        # A long answer cut at the cap is still worth showing — with a note
-        # saying so — rather than failing the question.
-        allow_truncated=True,
-    )
+    try:
+        answer = chat_text(
+            system=_SYSTEM_PROMPT,
+            user=red.text,
+            model=settings.model_for("rag"),
+            temperature=0.0,
+            max_tokens=MAX_ANSWER_TOKENS,
+            timeout=CHAT_TIMEOUT_S,
+            # A long answer cut at the cap is still worth showing — with a note
+            # saying so — rather than failing the question.
+            allow_truncated=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — timeouts, outages, refusals: a clear 503
+        log.error("rag.chat_failed", error_type=type(exc).__name__,
+                  durationMs=int((time.monotonic() - started) * 1000))
+        return _http_resp(503, {"error": _MODEL_DOWN_ERROR, "code": "sonar_unavailable"})
     # Restore the real values the provider never saw, then guardrail-check the reply.
-    answer = Redactor.restore(answer, red.mapping)
+    answer = Redactor.restore(answer or "", red.mapping)
     validate_output(answer, red.mapping)
-    used = _used(answer, citations)
-    log.info("rag.answered", chunks=len(hits), clauses=len(citations), cited=len(used), brief=bool(brief),
-             durationMs=int((time.monotonic() - started) * 1000))
+    if not answer.strip():
+        return _http_resp(200, {"answer": _EMPTY_ANSWER, "citations": citations, "usedCitations": [],
+                                "grounded": False, "unverified": []})
+    checked = _check_answer(answer, citations, bodies,
+                            [brief or "", question, *(t["content"] for t in history if t["role"] == "user")], _refs_in(brief))
+    log.info("rag.answered", chunks=len(hits), clauses=len(citations), cited=len(checked["usedCitations"]),
+             brief=bool(brief), unverified=len(checked["unverified"]), search=search_state,
+             keywordOnly=q_vec is None, durationMs=int((time.monotonic() - started) * 1000))
     return _http_resp(200, {
-        "answer": answer,
+        "answer": checked["answer"],
         "citations": citations,
         # optional: which of the citations the answer actually refers to, and
         # whether it referred to any (false usually means "not in the document")
-        "usedCitations": used,
-        "grounded": bool(used),
+        "usedCitations": checked["usedCitations"],
+        "grounded": checked["grounded"],
+        # optional: figures in the answer that the cited clauses do not contain
+        "unverified": checked["unverified"],
     })
 
 
@@ -476,7 +801,7 @@ def _http_resp(status: int, body: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _handle(event: dict[str, Any]) -> dict[str, Any]:
+def _handle(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
     args       = event.get("arguments") or event.get("input") or event
     ai_input   = args.get("input") or args
     question   = str(ai_input.get("question") or "").strip()[:MAX_QUESTION_CHARS]
@@ -491,66 +816,83 @@ def _handle(event: dict[str, Any]) -> dict[str, Any]:
     if not question:
         return {"sessionId": session_id, "answer": "(empty question)"}
 
+    def finish(message: str) -> dict[str, Any]:
+        _push_token(session_id, message, final=True)
+        return {"sessionId": session_id, "answer": message}
+
     no_match = "I couldn't find any matching clauses. Try rephrasing or specifying a document."
     doc_ids = caller.visible_doc_ids()
     if not doc_ids:
-        _push_token(session_id, no_match, final=True)
-        return {"sessionId": session_id, "answer": no_match}
+        return finish(no_match)
 
     # Embed + retrieve — restricted, in the query, to the documents this caller may read.
-    [q_vec] = embed_texts([question], model=settings.embedding_model)
-    hits    = clause_search(text=question, vector=q_vec, k=min(top_k * 2, MAX_TOP_K * 2), doc_ids=doc_ids)
-
+    _start_budget(context)
+    scope = {"doc_ids": doc_ids}
+    q_vec = _embed_question(question)
+    hits, search_state = _retrieve(question, q_vec, min(top_k * 2, MAX_TOP_K * 2), scope)
+    if search_state == "down":
+        return finish(_SEARCH_DOWN_ERROR)
+    try:
+        titles = {m.get("docId"): m.get("title") for m in ddb.get_docs(doc_ids)}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("rag.titles_failed", error_type=type(exc).__name__)
+        titles = {}
+    hits = _in_scope(hits, scope, set(titles) if titles else None)
     if not hits:
-        _push_token(session_id, no_match, final=True)
-        return {"sessionId": session_id, "answer": no_match}
+        return finish(_NOT_INDEXED_ANSWER if search_state == "missing" else no_match)
 
     # Build grounded context.
-    titles = {m.get("docId"): m.get("title") for m in ddb.get_docs(doc_ids)}
-    blocks, citations = _assemble(hits, True, titles)
-    user_msg = _user_message(blocks[:top_k], question)
+    blocks, citations, bodies = _assemble_full(hits, True, titles)
+    blocks, citations, bodies = _fit_context(blocks, citations, bodies, top_k)
+    user_msg = _user_message(blocks, question)
 
     # Pseudonymise PII before the prompt leaves AWS; restore on the way out.
     red = _redact(user_msg)
-    _audit_rag(red, tenantId=caller.tenant_id, sessionId=session_id, clauses=len(citations[:top_k]))
+    _audit_rag(red, tenantId=caller.tenant_id, sessionId=session_id, clauses=len(citations))
 
     # Stream response (opened with the client's retries, inside a request slot).
     model = settings.model_for("rag")
-    stream = chat_stream(
-        model,
-        [{"role": "system", "content": _SYSTEM_PROMPT}, {"role": "user", "content": red.text}],
-        0.0, MAX_ANSWER_TOKENS,
-    )
-
     restorer        = StreamRestorer(red.mapping)
     buf: list[str]  = []
     full: list[str] = []
     last_flush      = time.monotonic()
-    finish: str | None = None
+    finish_reason: str | None = None
 
-    for chunk in stream:
-        if chunk.choices and getattr(chunk.choices[0], "finish_reason", None):
-            finish = chunk.choices[0].finish_reason
-        delta = (chunk.choices[0].delta.content if chunk.choices and chunk.choices[0].delta else None)
-        if not delta:
-            continue
-        # Restore placeholders before they reach the client; holds back any token
-        # straddling a chunk boundary so it is never emitted half-restored.
-        out = restorer.push(delta)
-        if not out:
-            continue
-        buf.append(out)
-        full.append(out)
-        # Flush every ~80 ms or every ~16 restored chars.
-        if time.monotonic() - last_flush > 0.08 or sum(len(x) for x in buf) >= 16:
-            _push_token(session_id, "".join(buf), final=False)
-            buf, last_flush = [], time.monotonic()
+    try:
+        stream = chat_stream(
+            model,
+            [{"role": "system", "content": _SYSTEM_PROMPT}, {"role": "user", "content": red.text}],
+            0.0, MAX_ANSWER_TOKENS,
+        )
+        for chunk in stream:
+            if chunk.choices and getattr(chunk.choices[0], "finish_reason", None):
+                finish_reason = chunk.choices[0].finish_reason
+            delta = (chunk.choices[0].delta.content if chunk.choices and chunk.choices[0].delta else None)
+            if not delta:
+                continue
+            # Restore placeholders before they reach the client; holds back any token
+            # straddling a chunk boundary so it is never emitted half-restored.
+            out = restorer.push(delta)
+            if not out:
+                continue
+            buf.append(out)
+            full.append(out)
+            # Flush every ~80 ms or every ~16 restored chars.
+            if time.monotonic() - last_flush > 0.08 or sum(len(x) for x in buf) >= 16:
+                _push_token(session_id, "".join(buf), final=False)
+                buf, last_flush = [], time.monotonic()
+    except Exception as exc:  # noqa: BLE001 — the client must always get a final token
+        log.error("rag.stream_failed", error_type=type(exc).__name__, streamed=bool(full))
+        if not full:
+            return finish(_MODEL_DOWN_ERROR)
+        buf.append(_INTERRUPTED_NOTE)
+        full.append(_INTERRUPTED_NOTE)
 
     tail = restorer.flush()
     if tail:
         buf.append(tail)
         full.append(tail)
-    if finish == "length":
+    if finish_reason == "length":
         # Cut off at MAX_ANSWER_TOKENS: say so instead of ending mid-sentence.
         log.warning("rag.stream_truncated", max_tokens=MAX_ANSWER_TOKENS)
         buf.append(TRUNCATION_NOTE)

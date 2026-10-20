@@ -11,7 +11,10 @@ For every tenant that uses Govern (govern-config ``TENANTS``):
    of the tenant that no contract accounts for (and that is not a revision
    already linked) is re-enqueued to the intake queue; FAILED and stalled
    analyses are recorded for ``GET /reports/capture`` with
-   ``lastReconciledAt``.
+   ``lastReconciledAt``;
+4. AUTOMATIONS — time-based rules (``in_stage_for``, ``obligation_due_in``,
+   ``term_ends_in``; shared/govern/automations.py) fire once per contract per
+   qualifying episode.
 
 Every write goes through workflow.py, so a sweep that overlaps a reviewer's
 click is safe; re-running a sweep writes nothing new. A failing tenant does
@@ -28,7 +31,7 @@ from aws_lambda_powertools import Tracer
 from shared import aws
 from shared.config import settings
 from shared.dynamodb import list_tenant_docs
-from shared.govern import capture, store, workflow
+from shared.govern import automations, capture, store, workflow
 from shared.logger import get_logger, safe_trace
 
 log = get_logger("blue-iq.govern-sweeper")
@@ -39,14 +42,15 @@ _MAX_REQUEUE_PER_RUN = 200
 _MAX_TENANT_DOCS = 50_000
 
 
-@tracer.capture_lambda_handler
+@tracer.capture_lambda_handler(capture_response=False)   # no tenant data in X-Ray metadata
 @log.inject_lambda_context(log_event=False)
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     return sweep(datetime.now(timezone.utc))
 
 
 def sweep(now: datetime) -> dict[str, Any]:
-    totals = {"tenants": 0, "overdue": 0, "termMoves": 0, "obligations": 0, "requeued": 0, "missed": 0, "failedTenants": 0}
+    totals = {"tenants": 0, "overdue": 0, "termMoves": 0, "obligations": 0, "requeued": 0, "missed": 0,
+              "automations": 0, "failedTenants": 0}
     for tenant_id in store.config.tenants():
         totals["tenants"] += 1
         try:
@@ -56,7 +60,7 @@ def sweep(now: datetime) -> dict[str, Any]:
                       trace=safe_trace(exc))
             totals["failedTenants"] += 1
             continue
-        for k in ("overdue", "termMoves", "obligations", "requeued", "missed"):
+        for k in ("overdue", "termMoves", "obligations", "requeued", "missed", "automations"):
             totals[k] += result[k]
     log.info("govern_sweeper.done", **totals)
     if totals["failedTenants"]:
@@ -80,7 +84,13 @@ def sweep_tenant(tenant_id: str, now: datetime) -> dict[str, int]:
             term_moves += int(workflow.advance_term(c["contractId"], now=now) is not None)
     obligations = _sweep_obligations(tenant_id, now)
     requeued, missed = reconcile(tenant_id, contracts, now)
-    return {"overdue": overdue, "termMoves": term_moves, "obligations": obligations, "requeued": requeued, "missed": missed}
+    # Last, so a failing rule never holds up the reminders and the reconciliation.
+    auto = automations.run_time_rules(tenant_id, store.contracts.for_tenant(tenant_id) if term_moves else contracts,
+                                      now, cfg)
+    if auto["failed"]:
+        raise RuntimeError(f"{auto['failed']} automation firing(s) failed; the next sweep retries them")
+    return {"overdue": overdue, "termMoves": term_moves, "obligations": obligations, "requeued": requeued,
+            "missed": missed, "automations": auto["fired"]}
 
 
 def _sweep_obligations(tenant_id: str, now: datetime) -> int:

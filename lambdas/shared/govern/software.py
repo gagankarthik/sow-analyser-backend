@@ -20,6 +20,7 @@ from typing import Any, Callable
 # matrix imports this module lazily (inside functions), so importing matrix
 # here at load time is safe.
 from . import matrix as _m
+from ..dates import notice_days
 
 _Check = _m._Check
 
@@ -99,7 +100,10 @@ def check_renewal(text: str, th: dict[str, Any]) -> _Check:
     evergreen term with no way out, deviates."""
     max_d, fb_d = _m._th(th, "maxNoticeDays"), _m._th(th, "fallbackNoticeDays")
     low = _low(text)
-    auto = re.search(r"automatic(?:ally)?\s+renew|auto[- ]?renew|renew\s+automatically|evergreen|successive\s+(?:renewal\s+)?(?:terms|periods)", low)
+    auto = re.search(r"automatic(?:ally)?\s+renew|auto[- ]?renew|renew(?:s|ed)?\s+automatically|evergreen|successive\s+(?:renewal\s+)?(?:terms|periods)", low)
+    if auto and re.search(r"(?:shall|will|does)\s+not\s+(?:be\s+)?(?:automatically\s+|auto[- ]?)?renew", low) \
+            and not re.search(r"successive|evergreen|unless", low):
+        auto = None                     # "This Agreement shall not automatically renew."
     if not auto:
         if re.search(r"renew(?:ed|al)?\s+(?:only\s+)?(?:by|upon|with)\s+(?:mutual\s+)?(?:written\s+)?agreement|shall\s+not\s+(?:automatically\s+)?renew", low):
             return _Check("within", None, "renews only by agreement", "Renewal needs your written agreement.")
@@ -107,10 +111,12 @@ def check_renewal(text: str, th: dict[str, Any]) -> _Check:
     notice = None
     for s in _m._sentences(text):
         ls = s.lower()
-        if re.search(r"notice|non[- ]?renew|prior\s+to|before\s+the\s+end", ls):
-            for days, unit, _pos in _m._durations(s):
-                if unit in ("day", "week", "month"):
-                    notice = days if notice is None else max(notice, days)
+        if re.search(r"notice|notif|non[- ]?renew|prior\s+to|before\s+the\s+end", ls):
+            # the notice period, not the renewal period ("successive twelve (12)
+            # month periods unless … sixty (60) days prior")
+            days = notice_days(s)
+            if days is not None and days <= 400:
+                notice = days if notice is None else max(notice, days)
     if notice is None:
         if "evergreen" in low or not re.search(r"terminat|non[- ]?renew|cancel", low):
             return _Check("deviates", "The term renews automatically with no clear way to stop it; the matrix requires a "
@@ -313,7 +319,8 @@ def check_termination(text: str, th: dict[str, Any]) -> _Check:
     """The university may terminate for convenience (or for non-appropriation of
     funds) and gets transition assistance and its data back."""
     low = _low(text)
-    conv = re.search(r"terminat\w*\s+(?:this\s+agreement\s+)?for\s+(?:its\s+)?convenience|non[- ]?appropriation|without\s+cause", low)
+    conv = re.search(r"terminat\w*\s+(?:this\s+agreement\s+)?(?:[^.;]{0,40}?\s)?for\s+(?:its\s+)?convenience"
+                     r"|non[- ]?appropriation|without\s+cause|for\s+any\s+reason\s+or\s+no\s+reason", low)
     trans = re.search(r"transition\s+(?:assistance|services|period)|export\s+(?:its|all)\s+data", low)
     if conv:
         return _Check("within", None, "termination for convenience",

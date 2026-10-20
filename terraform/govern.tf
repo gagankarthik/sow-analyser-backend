@@ -2,7 +2,7 @@
 # The contract-workflow bounded context (docs/GOVERN_ARCHITECTURE.md):
 #
 #   five DynamoDB tables (one per access pattern) · a platform EventBridge bus
-#   · SQS queues with DLQs · seven Lambdas · EventBridge Scheduler · Secrets
+#   · SQS queues with DLQs · eight Lambdas · EventBridge Scheduler · Secrets
 #   Manager secrets (values set out-of-band) · a customer-managed KMS key ·
 #   API Gateway routes on the existing HTTP API · DLQ alarms.
 #
@@ -11,10 +11,6 @@
 
 locals {
   govern_prefix = "${local.prefix}-govern"
-
-  # Sandbox convenience only: users in no Govern group are admins. Never on
-  # outside the dev stage, whatever the variable says.
-  govern_open_admin = var.govern_open_admin && var.stage == "dev"
 
   govern_table_names = {
     contracts = "${local.govern_prefix}-contracts"
@@ -41,7 +37,6 @@ locals {
     METRICS_TABLE                = aws_dynamodb_table.govern_metrics.name
     EVENT_BUS_NAME               = aws_cloudwatch_event_bus.platform.name
     INTAKE_QUEUE_URL             = aws_sqs_queue.govern["intake"].url
-    GOVERN_OPEN_ADMIN            = tostring(local.govern_open_admin)
     GOVERN_FEATURES              = var.govern_features
     GOVERN_DEFAULT_EDITION       = var.govern_default_edition
     NOTIFY_FROM_EMAIL            = var.notify_from_email
@@ -63,6 +58,7 @@ locals {
     sweeper    = { dir = "govern_sweeper", memory = 512, timeout = 300, description = "Hourly SLA, obligations and capture reconciliation" }
     connectors = { dir = "govern_connectors", memory = 512, timeout = 300, description = "Huron / Workday / M365 / DocuSign connector runs" }
     webhooks   = { dir = "govern_webhooks", memory = 256, timeout = 30, description = "Signed webhooks (DocuSign Connect)" }
+    portal     = { dir = "govern_portal", memory = 256, timeout = 15, description = "Counterparty portal links (public, token-authenticated)" }
   }
 
   # SQS-fed functions: queue name → consuming function, batch size
@@ -219,6 +215,9 @@ resource "aws_dynamodb_table" "govern_sync" {
     kms_key_arn = aws_kms_key.govern.arn
   }
 
+  deletion_protection_enabled = var.stage == "prod"
+  point_in_time_recovery { enabled = true }
+
   tags = { Name = local.govern_table_names.sync }
 }
 
@@ -248,6 +247,11 @@ resource "aws_dynamodb_table" "govern_metrics" {
     enabled     = true
     kms_key_arn = aws_kms_key.govern.arn
   }
+
+  # The counters rebuild from the activity log, but the SEEN# markers are what
+  # keep automations and notifications from firing twice: worth restoring.
+  deletion_protection_enabled = var.stage == "prod"
+  point_in_time_recovery { enabled = true }
 
   tags = { Name = local.govern_table_names.metrics }
 }
@@ -316,7 +320,7 @@ resource "aws_cloudwatch_event_rule" "govern_notify" {
   event_pattern = jsonencode({
     source = ["blue-iq.govern"]
     "detail-type" = ["Govern.assigned", "Govern.reassigned", "Govern.sent_back", "Govern.approved",
-    "Govern.office_approved", "Govern.escalated", "Govern.overdue"]
+    "Govern.office_approved", "Govern.escalated", "Govern.overdue", "Govern.automation_notify"]
   })
 }
 
@@ -325,8 +329,9 @@ resource "aws_cloudwatch_event_rule" "govern_connectors" {
   description    = "Govern events → connectors (Huron push-back); connector / notifier entries excluded to avoid loops"
   event_bus_name = aws_cloudwatch_event_bus.platform.name
   event_pattern = jsonencode({
-    source        = ["blue-iq.govern"]
-    "detail-type" = [{ "anything-but" = ["Govern.sync", "Govern.conflict", "Govern.notification_sent", "Govern.comment"] }]
+    source = ["blue-iq.govern"]
+    "detail-type" = [{ "anything-but" = ["Govern.sync", "Govern.conflict", "Govern.notification_sent", "Govern.comment", "Govern.automation_notify",
+    "Govern.portal_link_created", "Govern.portal_link_revoked", "Govern.portal_opened", "Govern.portal_upload"] }]
   })
 }
 
@@ -448,7 +453,9 @@ resource "aws_lambda_function" "govern" {
   layers           = [aws_lambda_layer_version.shared.arn]
 
   environment {
-    variables = merge(local.govern_env, { POWERTOOLS_SERVICE_NAME = "${local.govern_prefix}-${each.key}" })
+    variables = merge(local.govern_env, { POWERTOOLS_SERVICE_NAME = "${local.govern_prefix}-${each.key}" },
+      # Only the activity stream publishes real-time invalidations (govern_realtime.tf).
+    each.key == "stream" ? { GOVERN_REALTIME_HTTP_DOMAIN = local.govern_realtime_http_domain } : {})
   }
 
   tracing_config { mode = "Active" }
@@ -471,7 +478,11 @@ locals {
       { Sid = "Contracts", Effect = "Allow", Action = local.ddb_contracts_write,
       Resource = [local.govern_table_arns.contracts, "${local.govern_table_arns.contracts}/index/*"] },
       { Sid = "ActivityAppendAndRead", Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:Query"], Resource = local.govern_table_arns.activity },
-      { Sid = "Config", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query"], Resource = local.govern_table_arns.config },
+      # DeleteItem: DELETE /views/{id} removes a saved list view. UpdateItem / BatchGetItem:
+      # revoking and listing counterparty portal links (shared/govern/portal.py).
+      # GetItem / PutItem (conditional): the T#<tenant>#ORG record, its members and admin trail
+      # (shared/govern/org.py) — created on first sign-in, admins changed under a rev lock.
+      { Sid = "Config", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Query", "dynamodb:DeleteItem", "dynamodb:UpdateItem", "dynamodb:BatchGetItem"], Resource = local.govern_table_arns.config },
       { Sid = "Sync", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"],
       Resource = [local.govern_table_arns.sync, "${local.govern_table_arns.sync}/index/*"] },
       # UpdateItem: removing a contract takes its counts back out of the trends.
@@ -496,9 +507,19 @@ locals {
     stream = [
       { Sid = "ActivityStream", Effect = "Allow", Action = ["dynamodb:GetRecords", "dynamodb:GetShardIterator", "dynamodb:DescribeStream", "dynamodb:ListStreams"],
       Resource = aws_dynamodb_table.govern_activity.stream_arn },
-      { Sid = "MetricsCounters", Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"], Resource = local.govern_table_arns.metrics },
+      # GetItem / BatchGetItem: automation markers (shared/govern/automations.py).
+      { Sid = "MetricsCounters", Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:GetItem", "dynamodb:BatchGetItem"], Resource = local.govern_table_arns.metrics },
+      # Event-based automations: read the rules and settings, count runs, and act on the contract
+      # (escalate / assign / comment / alert) through shared/govern/workflow.py.
+      { Sid = "AutomationRules", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:UpdateItem"], Resource = local.govern_table_arns.config },
+      { Sid = "AutomationContracts", Effect = "Allow", Action = local.ddb_contracts_write,
+      Resource = [local.govern_table_arns.contracts, "${local.govern_table_arns.contracts}/index/*"] },
+      { Sid = "AutomationActivityAppend", Effect = "Allow", Action = ["dynamodb:PutItem"], Resource = local.govern_table_arns.activity },
+      { Sid = "AutomationLifecycleMirror", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:UpdateItem"], Resource = local.docs_table_arns },
       { Sid = "PublishGovernEvents", Effect = "Allow", Action = ["events:PutEvents"], Resource = aws_cloudwatch_event_bus.platform.arn },
       { Sid = "FailureDestination", Effect = "Allow", Action = ["sqs:SendMessage"], Resource = aws_sqs_queue.govern_dlq["stream"].arn },
+      # Real-time "contract changed" invalidations to the tenant channels (govern_realtime.tf).
+      { Sid = "PublishRealtime", Effect = "Allow", Action = ["appsync:EventPublish"], Resource = local.govern_realtime_namespace },
     ]
     notifier = [
       { Sid = "ContractsRead", Effect = "Allow", Action = ["dynamodb:GetItem"], Resource = local.govern_table_arns.contracts },
@@ -515,8 +536,10 @@ locals {
       { Sid = "Contracts", Effect = "Allow", Action = local.ddb_contracts_write,
       Resource = [local.govern_table_arns.contracts, "${local.govern_table_arns.contracts}/index/*"] },
       { Sid = "ActivityAppendOnly", Effect = "Allow", Action = ["dynamodb:PutItem"], Resource = local.govern_table_arns.activity },
-      { Sid = "ConfigRead", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:Query"], Resource = local.govern_table_arns.config },
+      # UpdateItem: automation run counters (runCount / lastRunAt).
+      { Sid = "ConfigRead", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:UpdateItem"], Resource = local.govern_table_arns.config },
       { Sid = "Reconcile", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem"], Resource = local.govern_table_arns.sync },
+      { Sid = "AutomationMarkers", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"], Resource = local.govern_table_arns.metrics },
       { Sid = "Requeue", Effect = "Allow", Action = ["sqs:SendMessage"], Resource = aws_sqs_queue.govern["intake"].arn },
     ]
     connectors = [
@@ -539,6 +562,25 @@ locals {
       { Sid = "ReplayMarkers", Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:DeleteItem"], Resource = local.govern_table_arns.metrics },
       { Sid = "SignedDocument", Effect = "Allow", Action = ["s3:GetObject"], Resource = "${aws_s3_bucket.processed.arn}/*" },
       { Sid = "DocuSignKey", Effect = "Allow", Action = ["secretsmanager:GetSecretValue"], Resource = local.govern_secret_arns["docusign"] },
+    ]
+    # Public and unauthenticated (the link token is the credential), so the
+    # narrowest role of all: no secrets, no processed bucket, no deletes, no
+    # indexes, and DynamoDB keys limited by prefix.
+    portal = [
+      # The link itself: read by its hash, count views / uploads, revoke check.
+      { Sid = "PortalLinks", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:UpdateItem"], Resource = local.govern_table_arns.config,
+      Condition = { "ForAllValues:StringLike" = { "dynamodb:LeadingKeys" = ["PORTAL#*"] } } },
+      # The organization's name (workflow settings), read only.
+      { Sid = "OrganizationSettingsRead", Effect = "Allow", Action = ["dynamodb:GetItem"], Resource = local.govern_table_arns.config,
+      Condition = { "ForAllValues:StringLike" = { "dynamodb:LeadingKeys" = ["T#*"] } } },
+      # The contract and its open items; PutItem links the pending revision (optimistic lock on rev).
+      { Sid = "ContractReadAndLinkRevision", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:PutItem"],
+      Resource = local.govern_table_arns.contracts, Condition = { "ForAllValues:StringLike" = { "dynamodb:LeadingKeys" = ["CON#*"] } } },
+      { Sid = "ActivityAppendOnly", Effect = "Allow", Action = ["dynamodb:PutItem"], Resource = local.govern_table_arns.activity },
+      # The revision's PENDING document and its projects' docIds (same path as a reviewer's upload).
+      { Sid = "RevisionDocument", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem"], Resource = aws_dynamodb_table.main.arn,
+      Condition = { "ForAllValues:StringLike" = { "dynamodb:LeadingKeys" = ["DOC#*", "PROJ#*"] } } },
+      { Sid = "SignRevisionUpload", Effect = "Allow", Action = ["s3:PutObject"], Resource = "${aws_s3_bucket.raw.arn}/tenants/*/uploads/*" },
     ]
   }
 }
@@ -663,17 +705,29 @@ resource "aws_apigatewayv2_integration" "govern_api" {
 locals {
   govern_routes = toset([
     "GET /govern/me",
+    # The organization's admins ({sub} is matched from the raw path; admin-only writes).
+    "GET /govern/org", "POST /govern/org/admins", "DELETE /govern/org/admins/{sub}",
     "GET /contracts", "POST /contracts", "GET /obligations",
     "GET /contracts/{id}", "PATCH /contracts/{id}", "DELETE /contracts/{id}",
     "POST /contracts/{id}/actions", "POST /contracts/{id}/rescore",
     "POST /contracts/{id}/blockers", "PATCH /contracts/{id}/blockers/{blockerId}",
     "POST /contracts/{id}/obligations", "PATCH /contracts/{id}/obligations/{oblId}",
     "PUT /contracts/{id}/income", "GET /contracts/{id}/revision-upload-url",
+    "GET /contracts/{id}/activity",
+    # Counterparty portal links, reviewer side ({linkId} is matched from the raw path).
+    "GET /contracts/{id}/portal-links", "POST /contracts/{id}/portal-links",
+    "DELETE /contracts/{id}/portal-links/{linkId}",
     "GET /matrix", "PUT /matrix", "POST /matrix/import", "GET /matrix/versions/{n}",
     "GET /workflow/settings", "PUT /workflow/settings",
     "GET /integrations", "GET /integrations/sync-log", "GET /integrations/unmatched",
     "PUT /integrations/{id}", "POST /integrations/{id}/sync",
     "GET /reports/trends", "GET /reports/capture",
+    "POST /contracts/bulk", "GET /govern/people",
+    # {id} is the view id; govern-api matches it from the raw path.
+    "GET /views", "POST /views", "PATCH /views/{id}", "DELETE /views/{id}",
+    # {id} is the rule id ("new" for a dry run of an unsaved rule).
+    "GET /automations", "POST /automations", "PATCH /automations/{id}", "DELETE /automations/{id}",
+    "POST /automations/{id}/test",
   ])
 }
 
@@ -715,6 +769,37 @@ resource "aws_lambda_permission" "apigw_govern_webhooks" {
   function_name = aws_lambda_function.govern["webhooks"].function_name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.documents.execution_arn}/*/POST/webhooks/*"
+}
+
+# Counterparty portal: NO JWT authorizer — the link token in the path is the
+# credential (hashed and looked up by key in govern-portal). Throttled per
+# route in the stage (lambda.tf); each link also caps its own views / uploads.
+# Access logs record $context.routeKey (the template), never the token.
+resource "aws_apigatewayv2_integration" "govern_portal" {
+  api_id                 = aws_apigatewayv2_api.documents.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.govern["portal"].invoke_arn
+  payload_format_version = "2.0"
+}
+
+locals {
+  govern_portal_routes = toset(["GET /portal/{token}", "POST /portal/{token}/upload-url"])
+}
+
+resource "aws_apigatewayv2_route" "govern_portal" {
+  for_each           = local.govern_portal_routes
+  api_id             = aws_apigatewayv2_api.documents.id
+  route_key          = each.value
+  target             = "integrations/${aws_apigatewayv2_integration.govern_portal.id}"
+  authorization_type = "NONE"
+}
+
+resource "aws_lambda_permission" "apigw_govern_portal" {
+  statement_id  = "AllowAPIGatewayInvokePortal"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.govern["portal"].function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.documents.execution_arn}/*/*/portal/*"
 }
 
 

@@ -30,6 +30,8 @@ querying.
 """
 from __future__ import annotations
 
+import os
+import re
 from functools import lru_cache
 from typing import Any, Iterable
 
@@ -510,6 +512,119 @@ def knn_search(
     return resp.get("hits", {}).get("hits", [])
 
 
+# ---------------------------------------------------------------------------
+# Query understanding for clause retrieval
+# ---------------------------------------------------------------------------
+#
+# People ask "when do we get paid?" of a clause titled "Invoicing and Payment"
+# and "who owns the work product?" of one that says the deliverables "belong
+# exclusively to Customer". The text index's ``english`` analyzer stems
+# ("terminate" / "termination" meet) but knows no synonyms, and the Porter
+# stemmer keeps "paid" and "payment" apart. So the keyword query is expanded
+# HERE, at query time, with a small legal vocabulary: it works the same on
+# every index ever created (old and new), needs no analyzer change, no index
+# close/reopen and no reindex, and the expansion terms go through the very same
+# analyzer as the indexed text. The same table names the clause categories a
+# question is about; the fused ranking gives those a small lift (``_rerank``).
+#
+# Each concept: (trigger pattern on the lower-cased question, expansion words,
+# categories). Expansion words carry a lower weight than the question's own
+# words, so they decide ties and rescue paraphrases without drowning the
+# question.
+
+_CONCEPTS: tuple[tuple[re.Pattern[str], str, tuple[str, ...]], ...] = tuple(
+    (re.compile(pattern), words, cats) for pattern, words, cats in (
+        (r"\b(pay|paid|paying|payments?|payable|invoic\w*|remit\w*|net \d+|late (?:fee|payment)s?)\b",
+         "payment payable invoice invoicing due days receipt", ("Payment", "Fees")),
+        (r"\b(fees?|price|pricing|costs?|charges?|compensation|how much|budget|funding|rates?|amount)\b",
+         "fees price charges compensation funding rates", ("Fees", "Payment", "Royalties")),
+        (r"\b(how long|duration|term|expir\w*|end date|when does .* end|start date|commenc\w*|effective date)\b",
+         "term duration expires expiry commences continues until effective date", ("Term",)),
+        (r"\b(renew\w*|auto-?renew\w*|extend\w*|extension|non-renewal|roll(?:s|ing)? over)\b",
+         "renewal renews automatically extension non-renewal term", ("Term",)),
+        (r"\b(terminat\w*|cancel\w*|exit|walk away|get out of|end (?:it|this|the (?:agreement|contract|sow)) early"
+         r"|breaks?|broke|breach\w*|default\w*|violat\w*)\b",
+         "termination terminate notice convenience cause breach", ("Termination",)),
+        (r"\b(liabilit\w*|liable|damages|cap(?:ped|s)?|limitations? of|consequential|exposure)\b",
+         "limitation liability damages cap aggregate exceed", ("Liability",)),
+        (r"\b(indemn\w*|hold harmless|sued|lawsuits?|third[- ]party claims?|infring\w*)\b",
+         "indemnify indemnification defend hold harmless claim infringe", ("Indemnity",)),
+        (r"\b(owns?|owned|owner(?:ship)?|intellectual property|ip|work product|copyrights?|patents?|inventions?|"
+         r"title to|belongs?)\b",
+         "intellectual property ownership owns title assigns belong vests work product deliverables inventions",
+         ("IP", "BackgroundIP")),
+        (r"\b(licen[cs]\w*|options?)\b", "license licence grant option", ("LicenseGrant", "LicenseScope", "IP")),
+        (r"\b(governing law|govern\w*|jurisdiction|venue|courts?|which law|state'?s? law|choice of law"
+         r"|forum|(?:sue|lawsuits?|claims?|cases?|actions?) (?:\w+ )?(?:be )?(?:filed|brought|heard))\b",
+         "governing law governed jurisdiction venue courts", ("GoverningLaw", "DisputeResolution")),
+        (r"\b(disputes?|arbitrat\w*|mediat\w*|escalat\w*|litigat\w*)\b",
+         "dispute resolution arbitration mediation escalation", ("DisputeResolution",)),
+        (r"\b(confidential\w*|nda|non-?disclosure|secrets?|proprietary information)\b",
+         "confidential confidentiality non-disclosure disclose", ("Confidentiality", "DataRights")),
+        (r"\b(publish\w*|publication|present(?:ation)?s?)\b", "publication publish", ("PublicationRights",)),
+        (r"\b(warrant\w*|guarantee\w*|defects?|workmanlike)\b", "warranty warrants conform remedy", ("Warranty",)),
+        (r"\b(insur\w*|coverage)\b", "insurance coverage insured", ("Insurance",)),
+        (r"\b(data breach|security incident|breach notification|personal data|privacy|data protection)\b",
+         "data protection security incident notify customer data", ("DataProtection", "BreachNotification")),
+        (r"\b(accept\w*|reject\w*|sign[- ]off)\b", "acceptance accept reject review", ("Acceptance",)),
+        (r"\b(deliverables?|milestones?|what is being delivered)\b", "deliverables milestones",
+         ("Deliverables", "ScopeOfWork")),
+        (r"\b(change orders?|change requests?|change (?:the )?(?:scope|what)|changes? to the scope|variation)\b",
+         "change control change order change request scope", ("ChangeControl",)),
+        (r"\b(expenses?|travel|reimburs\w*|out-of-pocket)\b", "expenses travel reimburse", ("Fees",)),
+        (r"\b(assign\w*|transfer the (?:agreement|contract)|hand (?:the|this|it|our) (?:agreement|contract)?\s*(?:over )?to"
+         r"|another (?:company|party|vendor)|successors?|novat\w*|change of control)\b",
+         "assignment assign transfer successor consent", ("Assignment",)),
+        (r"\b(force majeure|act of god|beyond (?:its|their|our) (?:reasonable )?control)\b",
+         "force majeure beyond reasonable control", ("ForceMajeure",)),
+        (r"\b(subcontract\w*)\b", "subcontract subcontractor", ("Subcontracting",)),
+        (r"\b(non-?solicit\w*|poach\w*|hire (?:their|our) (?:staff|employees))\b",
+         "non-solicitation solicit employment employee", ("Other",)),
+    )
+)
+
+# "section 7.2", "clause 12", "§ 9", "Article 4": a question naming a clause
+# should find that clause first.
+_CLAUSE_REF_RE = re.compile(
+    r"(?:§\s*|\b(?:section|clause|article|paragraph|para\.?)\s+)(\d{1,3}(?:\.\d{1,3}){0,3})\b", re.IGNORECASE)
+
+
+def analyze_query(text: str) -> dict[str, Any]:
+    """What a retrieval question is about: expansion words for the keyword
+    query, the clause categories it targets, and clause numbers it names."""
+    low = (text or "").lower()
+    words: list[str] = []
+    cats: list[str] = []
+    for pattern, expansion, categories in _CONCEPTS:
+        if pattern.search(low):
+            words.extend(w for w in expansion.split() if w not in words)
+            cats.extend(c for c in categories if c not in cats)
+    refs = list(dict.fromkeys(m.group(1).rstrip(".") for m in _CLAUSE_REF_RE.finditer(text or "")))
+    return {"expansion": " ".join(words), "categories": cats, "clause_refs": refs}
+
+
+# Keyword fields and their weights: a heading match says more than a body match.
+_BM25_FIELDS = ["title^3", "section^2", "text"]
+_EXPANSION_BOOST = 0.4
+_CLAUSE_REF_BOOST = 10.0
+
+
+def _bm25_query(text: str, expand: bool) -> dict[str, Any]:
+    if not expand:
+        # the amendment matcher's literal query, unchanged
+        return {"must": [{"multi_match": {"query": text, "fields": ["title^2", "section", "text"]}}]}
+    main = {"multi_match": {"query": text, "fields": _BM25_FIELDS, "type": "best_fields", "tie_breaker": 0.3}}
+    q = analyze_query(text)
+    should: list[dict[str, Any]] = [main]
+    if q["expansion"]:
+        should.append({"multi_match": {"query": q["expansion"], "fields": _BM25_FIELDS, "type": "best_fields",
+                                       "tie_breaker": 0.3, "boost": _EXPANSION_BOOST}})
+    for ref in q["clause_refs"][:4]:
+        should.append({"term": {"clauseNumber": {"value": ref, "boost": _CLAUSE_REF_BOOST}}})
+        should.append({"prefix": {"clauseNumber": {"value": f"{ref}.", "boost": _CLAUSE_REF_BOOST / 2}}})
+    return {"should": should, "minimum_should_match": 1}
+
+
 def bm25_search(
     *,
     text: str,
@@ -521,7 +636,13 @@ def bm25_search(
     doc_id: str | None = None,
     doc_ids: list[str] | None = None,
     any_of: bool = False,
+    expand: bool = False,
 ) -> list[dict[str, Any]]:
+    """Keyword search over title (x3), section heading (x2) and text.
+
+    ``expand`` (used by the chat) adds the legal-vocabulary expansion and an
+    exact match on a clause number the question names (see ``analyze_query``);
+    the amendment matcher searches with the literal text only."""
     filters = _scope_filters(tenant_id, doc_ids, doc_id, doc_types, any_of)
     if filters is None:
         return []
@@ -532,57 +653,136 @@ def bm25_search(
         must_not.append({"term": {"docId": exclude_doc_id}})
     query = {
         "size": k,
-        "query": {
-            "bool": {
-                "must": [
-                    {"multi_match": {"query": text, "fields": ["title^2", "section", "text"]}}
-                ],
-                "filter": filters,
-                "must_not": must_not,
-            }
-        },
+        "query": {"bool": {**_bm25_query(text, expand), "filter": filters, "must_not": must_not}},
     }
     resp = client().search(index=settings.clause_text_index, body=query)
     return resp.get("hits", {}).get("hits", [])
 
 
+class SearchUnavailable(RuntimeError):
+    """Every retrieval channel failed (cluster down, timed out, misconfigured)."""
+
+
+class SearchIndexMissing(SearchUnavailable):
+    """The clause indices do not exist yet: nothing has been indexed."""
+
+
+# Wall-clock bound on one hybrid search (both channels run at once). The chat
+# answers over an HTTP API with a 30-second ceiling, so a slow cluster must cost
+# a few seconds, not the whole request.
+SEARCH_TIMEOUT_S = float(os.environ.get("RAG_SEARCH_TIMEOUT_S", "8") or 8)
+# Rerank after fusion: a chunk of a clause in the category the question is about
+# gains this much (a rank-1 hit in one channel is worth 1/61 ≈ 0.016).
+_INTENT_BONUS = 0.004
+# At most this many chunks of one clause in the first pass, so one long clause
+# cannot fill every slot (its chunks are merged into one block anyway).
+_MAX_CHUNKS_PER_CLAUSE = 2
+
+
+def _is_missing_index(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    return "index_not_found" in text or (type(exc).__name__ == "NotFoundError")
+
+
+def _norm_text(text: str) -> str:
+    return re.sub(r"\W+", " ", (text or "").lower()).strip()
+
+
+def _rerank(ranked: list[dict[str, Any]], categories: list[str], k: int) -> list[dict[str, Any]]:
+    """Light rerank of fused hits: lift chunks of the clause categories the
+    question targets, drop near-duplicate chunks of the same document (a stale
+    copy of a renumbered clause), and keep clause diversity in the top ``k``."""
+    wanted = set(categories)
+    for row in ranked:
+        src = row["hit"].get("_source") or {}
+        if wanted and src.get("category") in wanted:
+            row["score"] += _INTENT_BONUS
+    ranked.sort(key=lambda r: r["score"], reverse=True)
+
+    seen_text: set[tuple[str, str]] = set()
+    per_clause: dict[tuple[str, str], int] = {}
+    first, overflow = [], []
+    for row in ranked:
+        src = row["hit"].get("_source") or {}
+        doc = str(src.get("docId") or "")
+        key = (doc, str(src.get("clauseNumber") or ""))
+        norm = _norm_text(src.get("text") or "")
+        if norm and (doc, norm) in seen_text:
+            continue
+        if norm:
+            seen_text.add((doc, norm))
+        per_clause[key] = per_clause.get(key, 0) + 1
+        (first if per_clause[key] <= _MAX_CHUNKS_PER_CLAUSE else overflow).append(row)
+    return (first + overflow)[:k]
+
+
 def clause_search(
     *,
     text: str,
-    vector: list[float],
+    vector: list[float] | None,
     tenant_id: str | None = None,
     k: int = 8,
     doc_id: str | None = None,
     doc_ids: list[str] | None = None,
+    timeout_s: float | None = None,
 ) -> list[dict[str, Any]]:
     """Hybrid retrieval for RAG: up to ``k`` clause chunks, best first.
 
     Semantic (k-NN) and keyword (BM25) results are fused by reciprocal rank
     (RRF, 1 / (60 + rank)) — a chunk found by both channels outranks one found
     by either alone, and an exact term the embedding missed (a clause number, a
-    defined term, an amount) is no longer crowded out by k semantic hits.
-    Results are de-duplicated by record id. If one channel fails (index missing,
-    cluster busy) the other is still used.
+    defined term, an amount) is no longer crowded out by k semantic hits. The
+    keyword query is expanded with legal synonyms, and the fused list gets a
+    light rerank (``_rerank``). Results are de-duplicated by record id.
+
+    Fails soft: a channel that errors or exceeds ``timeout_s`` is dropped and
+    the other is used; ``vector=None`` (the embedding service was unavailable)
+    runs keyword search alone. Only when EVERY channel failed does it raise —
+    ``SearchIndexMissing`` if the indices do not exist (nothing indexed yet),
+    ``SearchUnavailable`` otherwise — so "no matching clause" (``[]``) and
+    "search is down" are never confused.
     """
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, wait
 
     pool = max(k * 3, 12)
-    runs = (
-        ("knn", lambda: knn_search(vector=vector, tenant_id=tenant_id, k=pool, doc_id=doc_id, doc_ids=doc_ids)),
-        ("bm25", lambda: bm25_search(text=text, tenant_id=tenant_id, k=pool, doc_id=doc_id, doc_ids=doc_ids)),
-    )
-    channels: list[list[dict[str, Any]]] = []
-    # Both channels at once: the answer waits on the slower one, not on both.
-    with ThreadPoolExecutor(max_workers=len(runs)) as ex:
-        futures = [(name, ex.submit(run)) for name, run in runs]
-        for name, fut in futures:
-            try:
-                channels.append(fut.result())
-            except Exception as exc:
-                log.warning("opensearch.search_channel_failed", channel=name, error_type=type(exc).__name__)
-                channels.append([])
-    if not any(channels):
+    runs = [("bm25", lambda: bm25_search(text=text, tenant_id=tenant_id, k=pool, doc_id=doc_id,
+                                         doc_ids=doc_ids, expand=True))]
+    if vector:
+        runs.insert(0, ("knn", lambda: knn_search(vector=vector, tenant_id=tenant_id, k=pool,
+                                                   doc_id=doc_id, doc_ids=doc_ids)))
+    if _scope_filters(tenant_id, doc_ids, doc_id) is None:
         return []
+    budget = SEARCH_TIMEOUT_S if timeout_s is None else timeout_s
+    channels: list[list[dict[str, Any]]] = []
+    errors: list[BaseException] = []
+    # Both channels at once: the answer waits on the slower one, not on both —
+    # and never longer than the budget (a hung request is abandoned, not awaited).
+    ex = ThreadPoolExecutor(max_workers=len(runs))
+    try:
+        futures = [(name, ex.submit(run)) for name, run in runs]
+        wait([f for _, f in futures], timeout=budget)
+        for name, fut in futures:
+            if not fut.done():
+                log.warning("opensearch.search_channel_timeout", channel=name, timeout_s=budget)
+                errors.append(TimeoutError(f"{name} search exceeded {budget}s"))
+                continue
+            exc = fut.exception()
+            if exc is None:
+                channels.append(fut.result() or [])
+                continue
+            errors.append(exc)
+            msg = str(exc).lower()
+            if name == "knn" and "dimension" in msg:
+                log.error("opensearch.vector_dimension_mismatch", error_type=type(exc).__name__,
+                          vectorSize=len(vector or []))
+            else:
+                log.warning("opensearch.search_channel_failed", channel=name, error_type=type(exc).__name__)
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    if not channels:
+        if errors and all(_is_missing_index(e) for e in errors):
+            raise SearchIndexMissing("the clause search indices do not exist yet")
+        raise SearchUnavailable(f"every search channel failed ({len(errors)})")
 
     fused: dict[str, dict[str, Any]] = {}
     for hits in channels:
@@ -592,7 +792,7 @@ def clause_search(
             row["score"] += 1.0 / (60 + rank)
     ranked = sorted(fused.values(), key=lambda r: r["score"], reverse=True)
     out = []
-    for row in ranked[:k]:
+    for row in _rerank(ranked, analyze_query(text)["categories"], k):
         hit = dict(row["hit"])
         hit["_rrf"] = round(row["score"], 6)
         out.append(hit)

@@ -75,7 +75,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, NamedTuple
 
 from ..clause_types import KNOWN_CATEGORIES, known_label, normalise_type
-from ..dates import add_offset, find_dates, parse_quantity
+from ..dates import add_offset, find_dates, net_days, notice_days, parse_quantity
 from ..money import find_amounts
 from ..playbook import rule_id_for_clause, valid_rule_id
 
@@ -199,6 +199,8 @@ _DUR_RE = re.compile(
     re.IGNORECASE,
 )
 _UNIT_DAYS = {"day": 1, "week": 7, "month": 30, "year": 365}
+_AUTO_RENEW_RE = re.compile(r"automatic(?:ally)?\s+renew|auto[- ]?renew|renew(?:s|ed)?\s+automatically|evergreen",
+                            re.IGNORECASE)
 
 
 def _sentences(text: str) -> list[str]:
@@ -280,6 +282,10 @@ def _th(thresholds: dict[str, Any], key: str) -> float:
 _US = r"(?:the\s+)?(?:university|institution|college|our\s+organi[sz]ation)"
 _OTHER = (r"(?:the\s+)?(?:sponsor|licensee|optionee|company|recipient|subrecipient|provider|collaborator|"
           r"pass-through\s+entity|contractor)")
+
+
+# "Licensee shall, at its own expense, defend …"
+_AT_COST = r"(?:,?\s*at\s+its\s+(?:own\s+|sole\s+)?(?:cost|expense)(?:\s+and\s+(?:cost|expense))?\s*,?)?"
 
 
 class _Check(NamedTuple):
@@ -471,7 +477,7 @@ def _check_indemnity(text: str, th: dict[str, Any]) -> _Check:
     other = own = False
     for s in _sentences(text):
         low = s.lower()
-        ours = re.search(rf"\b{_US}\s+(?:shall|will|agrees\s+to|hereby\s+agrees\s+to)\s+(?:defend,?\s+)?"
+        ours = re.search(rf"\b{_US}\s+(?:shall|will|agrees\s+to|hereby\s+agrees\s+to){_AT_COST}\s+(?:defend,?\s+)?"
                         r"(?:indemnify|hold\s+harmless)", low)
         mutual = re.search(r"\beach\s+party\s+(?:shall|will|agrees\s+to)\s+(?:defend,?\s+)?"
                            r"(?:indemnify|hold\s+harmless)"
@@ -489,7 +495,7 @@ def _check_indemnity(text: str, th: dict[str, Any]) -> _Check:
                               "Your organization indemnifies " + ("each party (mutual)" if mutual and not ours else "the other party"))
             if worst is None or _TIER_RANK[cand.tier] > _TIER_RANK[worst.tier]:
                 worst = cand
-        if re.search(rf"\b{_OTHER}\s+(?:shall|will|agrees\s+to|hereby\s+agrees\s+to)\s+(?:defend,?\s+)?"
+        if re.search(rf"\b{_OTHER}\s+(?:shall|will|agrees\s+to|hereby\s+agrees\s+to){_AT_COST}\s+(?:defend,?\s+)?"
                      r"(?:indemnify|hold\s+harmless)", low):
             other = True
         if re.search(r"responsible\s+for\s+(?:its|their)\s+own"
@@ -529,7 +535,7 @@ def _check_governing_law(text: str, th: dict[str, Any]) -> _Check:
     state's law deviates; a waiver of immunity is unacceptable; silence on
     governing law is the fallback. With no home state set, a stated law is
     left for a reviewer to check."""
-    home = str(th.get("homeState") or "").strip().title() or None
+    home = home_state(th.get("homeState")) or str(th.get("homeState") or "").strip().title() or None
     waived = False
     for s in _sentences(text):
         low = s.lower()
@@ -539,11 +545,21 @@ def _check_governing_law(text: str, th: dict[str, Any]) -> _Check:
         if m and not re.search(r"\b(?:nothing|not|no|neither|never|without)\b[^.;]{0,140}waive", low) \
                 and not re.search(r"waive\w*\s+(?:nor\s+|or\s+)?(?:shall\s+)?not\b", low):
             waived = True
-    states = []
-    for m in _STATE_RE.finditer(re.sub(r"\s+", " ", text or "")):
-        name = m.group(1).title()
-        if name not in states:
-            states.append(name)
+    flat = re.sub(r"\s+", " ", text or "")
+    # A state named as the governing law ("laws of the State of Ohio", "Delaware
+    # law", "Governing Law: Texas") counts before one named only as the venue or
+    # in a party's name ("courts located in Wilmington, Delaware", "the
+    # University of Michigan").
+    named, as_law = [], []
+    for m in _STATE_RE.finditer(flat):
+        name = next(s for s in _US_STATES if s.lower() == m.group(1).lower())
+        before, after = flat[max(0, m.start() - 40):m.start()], flat[m.end():m.end() + 6]
+        if re.search(r"(?:laws?\s+of|governed\s+by|governing\s+law\s*[:|\-]?)\s+(?:the\s+)?"
+                     r"(?:(?:state|commonwealth)\s+of\s+)?$", before, re.IGNORECASE) \
+                or re.match(r"\s+law\b", after, re.IGNORECASE):
+            as_law.append(name)
+        named.append(name)
+    states = list(dict.fromkeys(as_law or named))
     others = [s for s in states if s != home]
     law = ", ".join(states) + " law" if states else "no governing law stated"
     required = f"the laws of {home}" if home else "your home-state law"
@@ -551,6 +567,12 @@ def _check_governing_law(text: str, th: dict[str, Any]) -> _Check:
         what = f"Governing law is {', '.join(others)} and your organization" if others else "Your organization"
         return _Check("unacceptable", f"{what} would waive its sovereign immunity; the matrix requires {required} "
                                       "and no waiver of immunity.", f"{law}; sovereign immunity waived")
+    if not states and re.search(r"\bgoverned\s+by\b|\blaws?\s+of\b|\bgoverning\s+law\b|\b\w+\s+law\s+(?:shall\s+)?governs?\b",
+                                flat, re.IGNORECASE):
+        # a law that is not a US state's ("the laws of the Province of Ontario",
+        # "federal law of the United States"): a reviewer must read it
+        return _Check("review", "The governing law is not a US state's law; check it against the matrix.",
+                      "governing law not a US state")
     if not home and states:
         return _Check("review", f"Governing law is {', '.join(states)}. Set the home state on this clause in the "
                                 "matrix so Sonar can check it.", law)
@@ -589,7 +611,7 @@ def _check_export_control(text: str, th: dict[str, Any]) -> _Check:
                                                      r"before\s+(?:providing|disclosing|delivering)|first\s+giving|"
                                                      r"written\s+notice\s+and", low):
             within = True
-        if re.search(r"comply\s+with\s+(?:all\s+)?(?:applicable\s+)?(?:u\.?s\.?\s+|united\s+states\s+)?export", low):
+        if re.search(r"comply\s+with\s+(?:all\s+|the\s+|any\s+)?(?:applicable\s+)?(?:u\.?s\.?\s+|united\s+states\s+)?export", low):
             within = True
         if re.search(r"(?:shall|will)\s+not\s+(?:provide|disclose|deliver|transfer)[^.;]{0,80}"
                      r"(?:export[- ]controlled|itar|\bear\b|export\s+administration|international\s+traffic)", low):
@@ -687,7 +709,8 @@ def _check_data_rights(text: str, th: dict[str, Any]) -> _Check:
 _FREQ: list[tuple[str, int, str]] = [
     ("weekly", 52, "weekly"), ("monthly", 12, "monthly"), ("each month", 12, "monthly"),
     ("every month", 12, "monthly"), ("quarterly", 4, "quarterly"), ("each calendar quarter", 4, "quarterly"),
-    ("each quarter", 4, "quarterly"), ("every three months", 4, "quarterly"), ("semi-annual", 2, "semi-annual"),
+    ("each quarter", 4, "quarterly"), ("fiscal quarter", 4, "quarterly"), ("every quarter", 4, "quarterly"),
+    ("per quarter", 4, "quarterly"), ("every three months", 4, "quarterly"), ("semi-annual", 2, "semi-annual"),
     ("semiannual", 2, "semi-annual"), ("biannual", 2, "semi-annual"), ("every six months", 2, "semi-annual"),
     ("annual", 1, "annual"), ("each year", 1, "annual"), ("yearly", 1, "annual"),
 ]
@@ -788,10 +811,15 @@ def _check_payment(text: str, th: dict[str, Any]) -> _Check:
     days = None
     for s in _sentences(text):
         low = s.lower()
-        net = re.search(r"\bnet\s*-?\s*(\d{1,3})\b", low)
-        if not (net or re.search(r"payable|\bdue\b|\bpay\b|\bpaid\b", low)):
+        net = net_days(low)              # "Net 30", "net thirty (30) days", "2/10 net 30"
+        if net is None and not re.search(r"payable|\bdue\b|\bpay\b|\bpaid\b|\bpayments?\b|\bremit", low):
             continue
-        cands = [int(net.group(1))] if net else [d for d, unit, _p in _durations(s) if unit in ("day", "week")]
+        if net is not None:
+            cands = [net]
+        elif re.search(r"\b(?:due|payable)\s+(?:on|upon)\s+receipt\b", low):
+            cands = [0]
+        else:
+            cands = [d for d, unit, _p in _durations(s) if unit in ("day", "week")]
         if cands:
             days = max(cands) if days is None else max(days, max(cands))
     in_advance = re.search(r"in\s+advance|advance\s+payment", text or "", re.IGNORECASE)
@@ -833,7 +861,7 @@ def _check_liability(text: str, th: dict[str, Any]) -> _Check:
 def _check_insurance(text: str, th: dict[str, Any]) -> _Check:
     """The other party carries insurance; Your organization is self-insured under home-state law."""
     low = re.sub(r"\s+", " ", (text or "").lower())
-    if re.search(rf"{_OTHER}\s+shall\s+(?:maintain|procure|obtain|carry)", low):
+    if re.search(rf"{_OTHER}\s+(?:shall|will|agrees\s+to){_AT_COST}\s+(?:maintain|procure|obtain|carry)", low):
         ben = "Your organization is named as an additional insured." if "additional insured" in low else None
         return _Check("within", None, "other party insured", ben)
     if re.search(rf"{_US}\s+shall\s+(?:maintain|procure|obtain|carry)", low) and "self-insur" not in low:
@@ -2203,11 +2231,12 @@ def _notice_days(timeline: dict[str, Any], classification: dict[str, Any]) -> in
     for clause, sentences in _clause_sentences(classification):
         for sentence in sentences:
             low = sentence.lower()
-            if re.search(r"automatic(?:ally)?\s+renew|auto[- ]?renew|renew\s+automatically", low) or \
-                    (re.search(r"non[- ]?renew", low) and "notice" in low):
-                days = [d for d, unit, _p in _durations(sentence) if unit in ("day", "week", "month") and d <= 400]
-                if days and "notice" in low:
-                    return max(days)
+            if _AUTO_RENEW_RE.search(low) or re.search(r"non[- ]?renew", low):
+                # the notice period, not the renewal period ("successive twelve
+                # (12) month periods unless … sixty (60) days prior")
+                days = notice_days(sentence)
+                if days is not None and 0 < days <= 400:
+                    return days
     return None
 
 
@@ -2387,6 +2416,10 @@ def extract_obligations(classification: dict[str, Any] | None, agreement_type: s
                     n, word = freq
                     value, unit = periods.get(n, (12, "months"))
                     due = add_offset(signed, value, unit) if signed else None
+                    # "within thirty (30) days after the end of each calendar quarter"
+                    if signed and n == 4 and within and re.search(r"end\s+of\s+(?:each|every|the)\s+(?:calendar\s+|fiscal\s+)?quarter", low):
+                        q_end = _next_quarter_end(signed)
+                        due = (q_end + timedelta(days=int(within.group(1)))).isoformat() if q_end else due
                     if agreement_type in ("license", "option"):
                         add("other", f"{word.capitalize()} diligence / progress report to your organization", due)
                     else:
@@ -2415,7 +2448,7 @@ def extract_obligations(classification: dict[str, Any] | None, agreement_type: s
                 years = re.search(r"(\d{1,2}|three|five|seven)\s*\)?\s*years?", low)
                 add("royalty_audit", "Keep royalty records open to audit" + (f" ({years.group(1)} years)" if years else ""))
                 continue
-            if agreement_type in ("sow", "subcontract") and re.search(r"\bdeliver(?:able|y)\b", low):
+            if agreement_type in ("sow", "subcontract") and re.search(r"\bdeliver(?:ables?|y|ed)\b", low):
                 due = _expected_date(s, effective)
                 if due:
                     add("deliverable_due", _short(s), due, amounts[0] if amounts else None)

@@ -29,7 +29,6 @@ Terraform variables that matter for Govern:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `govern_open_admin` | `false` | Honoured **only** when `stage = dev`. The workflow sets it `true` for dev. Staging / prod always need the Cognito groups (§4). |
 | `notify_from_email` | `""` | Sender for alert email. Set to create the SES identity (§3). Empty = email off. |
 | `app_base_url` | `https://govern.blue-iq.ai` | Links in alerts. |
 | `ai_provider` | `openai` | `openai-zdr` once Zero Data Retention is approved (guardrails fail closed on anything else). |
@@ -83,13 +82,20 @@ text field `contractId` = the Govern contract id when sending.
 Each Govern event is notified at most once (a marker per activity entry). If
 every channel fails, the message is retried and then lands in the notify DLQ.
 
-## 4. Roles (Cognito groups)
+## 4. Roles
 
-| Group | Can |
+**Admin is per organization, not a Cognito group** (docs/GOVERN_ARCHITECTURE.md §2.6). The
+creator of an organization (tenant) is its admin; admins add others in Settings → Team & roles.
+A personal workspace's user is its admin. To provision a shared tenant (`custom:tenantId`), have
+its intended owner sign in to Govern **first**: their first `GET /govern/me` creates the
+organization with them as creator (`govern_org.created` in the govern-api logs). Anyone who signs
+in later is a member, not an admin, until an admin adds them.
+
+| Group | Means |
 |---|---|
-| `govern-admin` | everything, plus the matrix, routing / settings and integrations |
 | `govern-reviewer` | act on contracts they may edit (document owner / project editor) |
 | `govern-leader` | view, comment, and approve for an office they are listed under in settings |
+| `govern-admin` | legacy: treated as reviewer; grants **no** admin rights in any tenant |
 
 ```bash
 POOL=us-east-2_xxxxxxxxx

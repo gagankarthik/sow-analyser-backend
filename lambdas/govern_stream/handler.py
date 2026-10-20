@@ -8,12 +8,20 @@ every new entry this Lambda
 1. adds its counters to the tenant's day item in govern-metrics
    (shared/govern/aggregates.py — counted once, guarded by a SEEN marker);
 2. publishes it to the platform bus, where rules route it to the notifier and
-   the connectors (Huron push-back).
+   the connectors (Huron push-back);
+3. runs the event-based automation rules it matches
+   (shared/govern/automations.py). Entries an automation writes are tagged
+   and never match a rule, so automations cannot loop.
+
+Before any of that it pushes a small "contract changed" invalidation to the
+tenant's real-time channel (shared/govern/realtime.py), so open boards and
+contract pages re-read within a second or two. That push is best effort: it
+never raises, so it can never fail or retry the batch.
 
 Failures are reported per record (``batchItemFailures`` with the sequence
 number of the first failed record): the stream retries from there, so
-counting is protected by the marker and consumers of the events de-duplicate
-by entry id.
+counting is protected by the marker, consumers of the events de-duplicate
+by entry id, and automation actions by their own markers.
 """
 from __future__ import annotations
 
@@ -26,7 +34,7 @@ from boto3.dynamodb.types import TypeDeserializer
 from shared import aws
 from shared.config import settings
 from shared.dynamodb import _from_ddb
-from shared.govern import aggregates
+from shared.govern import aggregates, automations, realtime
 from shared.logger import get_logger
 
 log = get_logger("blue-iq.govern-stream")
@@ -37,7 +45,7 @@ _MAX_DETAIL_BYTES = 200_000
 _deserialise = TypeDeserializer().deserialize
 
 
-@tracer.capture_lambda_handler
+@tracer.capture_lambda_handler(capture_response=False)   # no tenant data in X-Ray metadata
 @log.inject_lambda_context(log_event=False)
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     for record in (event or {}).get("Records") or []:
@@ -46,8 +54,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         sequence = (record.get("dynamodb") or {}).get("SequenceNumber") or ""
         try:
             entry = entry_of(record)
+            realtime.publish(entry)          # best effort, never raises
             aggregates.record(entry)
             publish(entry)
+            automations.on_entry(entry)
         except Exception as exc:  # noqa: BLE001 — retried from this record
             log.error("govern_stream.record_failed", sequence=sequence, error_type=type(exc).__name__)
             return {"batchItemFailures": [{"itemIdentifier": sequence}]}

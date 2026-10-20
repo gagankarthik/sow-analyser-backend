@@ -48,7 +48,7 @@ From the code and Terraform (details and file references in `SECURITY_OVERVIEW.m
 2. `AI_PROVIDER` is not set, so it defaults to `openai` (not zero-retention).
 3. PII pseudonymisation runs only on the chat and drafting paths, not on extraction.
 4. ~~Govern infrastructure not in Terraform~~ — resolved 2026-10-08: `terraform/govern.tf` defines the 5 tables (customer-managed KMS key with rotation, PITR on contracts/activity/config), queues + DLQs, event bus, schedules, secrets and per-function least-privilege roles (activity writers are PutItem-only).
-5. ~~`GOVERN_OPEN_ADMIN` defaults to `true`~~ — resolved: defaults to `false`; only the `dev` stage can enable it (`var.govern_open_admin`).
+5. ~~`GOVERN_OPEN_ADMIN` defaults to `true`~~ — resolved: removed; admin is per organization (its creator and the admins they add).
 6. No WAF, CloudTrail, GuardDuty or alarms are in Terraform. OpenSearch is single-node and outside a VPC.
 7. CI uses long-lived AWS keys and auto-applies to the target stage with no approval gate. There is no SAST or dependency scanning.
 8. The API access log has no caller identity. Log retention is 30 days.
@@ -60,7 +60,7 @@ From the code and Terraform (details and file references in `SECURITY_OVERVIEW.m
 1. **Sign the OpenAI DPA and enable Zero Data Retention.** Then set `AI_PROVIDER=openai-zdr`, move the key to Secrets Manager, apply the AWS AI-services opt-out for Textract, and correct the public "not retained" claims.
 2. **Correct the public security and legal pages** (table above), so that nothing claims SOC 2, reports, audits or WCAG conformance that do not exist.
 3. **Commission an external penetration test, and start SOC 2 Type I readiness.** Write the IR, BC/DR and core security policies. Enable CloudTrail, GuardDuty, WAF and alarms, and add a production approval gate in CI.
-4. **Build Shibboleth/InCommon SAML SSO with role mapping.** Send the customer IAM the metadata and attribute request now. (`GOVERN_OPEN_ADMIN` now defaults to false and Govern is in Terraform; the Cognito user pool is still outside Terraform.)
+4. **Build Shibboleth/InCommon SAML SSO with role mapping.** Send the customer IAM the metadata and attribute request now. (`GOVERN_OPEN_ADMIN` is removed and Govern is in Terraform; the Cognito user pool is still outside Terraform.)
 5. **Start the accessibility programme.** Add an axe CI gate, do an internal NVDA/JAWS/VoiceOver-iPad pass, book a third-party WCAG 2.1 AA audit, and commit to an ACR (VPAT 2.5 INT) by March 2027 with a contractual remediation SLA.
 
 ## Questions to ask the customer

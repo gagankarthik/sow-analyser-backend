@@ -5,7 +5,11 @@
       "Bash(echo \"EXIT: $?\")",
       "Bash(python -m compileall -q lambdas)",
       "Bash(echo \"PY_EXIT: $?\")",
-      "Bash(python -m pip --version)"
+      "Bash(python -m pip --version)",
+      "PowerShell(python -m pytest tests/test_guardrails.py -q 2>&1 | Select-Object -Last 40)",
+      "PowerShell(python -m pytest tests/test_extraction.py -q 2>&1 | Select-Object -Last 15)",
+      "PowerShell(if \\(-not \\(Test-Path .venv_test\\)\\) { python -m venv .venv_test }; .venv_test\\\\Scripts\\\\python -m pip install -q -r tests/requirements.txt 2>&1 | Select-Object -Last 5; \"---installed---\")",
+      "Bash(git --no-pager diff --stat)"
     ]
   }
 }

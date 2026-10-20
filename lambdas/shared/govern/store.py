@@ -7,6 +7,11 @@
     activity   govern-activity   CON#<id> / <iso>#<appendNs>#<eventId>  append-only (PutItem only)
     config     govern-config     T#<tenant> / MATRIX#<v:06d> · MATRIX#CURRENT · SETTINGS · CONN#<id>
                                  TENANTS / T#<tenant>               tenants that use Govern (sweeper)
+                                 T#<tenant>#VIEWS / V#<module>#<id> saved list views (shared/govern/views.py)
+                                 T#<tenant>#AUTOMATIONS / A#<id>    automation rules (shared/govern/automations.py)
+                                 T#<tenant>#ORG / ORG · MEMBER#<sub> · AUDIT#<iso>#<id>  the organization:
+                                                                    creator, admins, members, admin changes (shared/govern/org.py)
+                                 PORTAL#<sha256> / LINK · CON#<id>#PORTAL / L#<linkId>  portal links (shared/govern/portal.py)
     sync       govern-sync       T#<tenant> / RUN#<iso>#<runId> (TTL) · RECONCILE
                                  CON#<id> / EXT#<system>            GSI1 EXT#<tenant>#<system>#<extId> / CON#<id>
     metrics    govern-metrics    T#<tenant> / D#<yyyy-mm-dd>        daily trend counters (atomic ADD)
@@ -78,6 +83,16 @@ def clean_item(item: dict[str, Any] | None) -> dict[str, Any] | None:
     if not item:
         return None
     return {k: _from_ddb(v) for k, v in item.items() if k not in _KEY_ATTRS}
+
+
+_last_ns = 0
+
+
+def _rising_ns() -> int:
+    """time.time_ns(), but strictly greater than the previous call's value."""
+    global _last_ns
+    _last_ns = max(time.time_ns(), _last_ns + 1)
+    return _last_ns
 
 
 def ttl_in(days: int) -> int:
@@ -387,6 +402,48 @@ class ActivityLog(_Repository):
                                   ScanIndexForward=False, Limit=limit)
         return [{k: _from_ddb(v) for k, v in i.items() if k not in ("PK", "SK")} for i in resp.get("Items", [])]
 
+    def page(self, contract_id: str, *, before: str | None = None,
+             limit: int = 50) -> tuple[list[dict[str, Any]], str | None]:
+        """One page of entries, newest first, strictly older than the ``before``
+        sort-key cursor. Returns (entries, cursor for the next page or None).
+
+        A key-condition query on the contract's partition (never a scan). One
+        extra item is read so "is there more?" is exact: DynamoDB can return a
+        LastEvaluatedKey on a page that happens to end the partition.
+        """
+        items, more = self._newest(contract_id, before, limit)
+        cursor = str(items[-1]["SK"]) if more and items else None
+        return [self._entry(i) for i in items], cursor
+
+    def head(self, contract_id: str, *, show: int = 20, count_up_to: int = 200) -> dict[str, Any]:
+        """The newest ``show`` entries for the contract page, with a count.
+
+        One query of at most ``count_up_to + 1`` items (what the page always
+        read): ``count`` is exact up to ``count_up_to``; ``hasMore`` says the
+        log is longer. ``cursor`` continues after the shown entries (see
+        :meth:`page`); ``window`` is every entry read, newest first.
+        """
+        items, more = self._newest(contract_id, None, count_up_to)
+        shown = items[:show]
+        return {"entries": [self._entry(i) for i in shown],
+                "window": [self._entry(i) for i in items],
+                "cursor": str(shown[-1]["SK"]) if len(items) > show and shown else None,
+                "count": len(items), "hasMore": more}
+
+    def _newest(self, contract_id: str, before: str | None, limit: int) -> tuple[list[dict[str, Any]], bool]:
+        from boto3.dynamodb.conditions import Key
+
+        cond = Key("PK").eq(f"CON#{contract_id}")
+        if before:
+            cond = cond & Key("SK").lt(before)
+        resp = self.table().query(KeyConditionExpression=cond, ScanIndexForward=False, Limit=limit + 1)
+        items = resp.get("Items", [])
+        return items[:limit], len(items) > limit
+
+    @staticmethod
+    def _entry(item: dict[str, Any]) -> dict[str, Any]:
+        return {k: _from_ddb(v) for k, v in item.items() if k not in ("PK", "SK")}
+
     def all_for_tenant_contracts(self, contract_ids: Iterable[str]) -> Iterable[dict[str, Any]]:
         """Every entry of the given contracts, oldest first (backfill)."""
         from boto3.dynamodb.conditions import Key
@@ -402,8 +459,8 @@ class ActivityLog(_Repository):
 
 
 class ConfigRepository(_Repository):
-    """Per-tenant configuration: matrix versions, settings, connectors; and
-    the registry of tenants that use Govern."""
+    """Per-tenant configuration: matrix versions, settings, connectors, saved
+    list views; and the registry of tenants that use Govern."""
 
     table_setting = "config_table"
 
@@ -558,6 +615,169 @@ class ConfigRepository(_Repository):
         self.table().put_item(Item=_to_ddb({**connector, "PK": f"T#{tenant_id}", "SK": f"CONN#{connector['id']}",
                                             "entityType": "CONNECTOR", "tenantId": tenant_id}))
 
+    # -- saved list views -----------------------------------------------------
+    # One partition per tenant, so listing a module's views is one Query; who
+    # may see which view is decided by the caller (shared/govern/views.py).
+    @staticmethod
+    def _view_key(tenant_id: str, module: str, view_id: str) -> dict[str, str]:
+        return {"PK": f"T#{tenant_id}#VIEWS", "SK": f"V#{module}#{view_id}"}
+
+    def views(self, tenant_id: str, module: str) -> list[dict[str, Any]]:
+        """Every saved view of ``module`` in the tenant (visible or not)."""
+        return self.children(f"T#{tenant_id}#VIEWS", f"V#{module}#")
+
+    def view(self, tenant_id: str, module: str, view_id: str) -> dict[str, Any] | None:
+        return clean_item(self.table().get_item(Key=self._view_key(tenant_id, module, view_id)).get("Item"))
+
+    def create_view(self, tenant_id: str, view: dict[str, Any]) -> bool:
+        """Write a new view (``rev`` 1). False if the id is already taken."""
+        return self.put_new({**view, **self._view_key(tenant_id, view["module"], view["id"]),
+                             "entityType": "VIEW", "tenantId": tenant_id, "rev": 1})
+
+    def mutate_view(self, tenant_id: str, module: str, view_id: str,
+                    change: Callable[[dict[str, Any]], Any]) -> dict[str, Any] | None:
+        """Read-modify-write under optimistic locking on ``rev`` (as
+        ``contracts.mutate``). Returns the stored view, or None if it is gone."""
+        key = self._view_key(tenant_id, module, view_id)
+        for _ in range(_MAX_WRITE_RETRIES):
+            current = self.view(tenant_id, module, view_id)
+            if current is None:
+                return None
+            working = copy.deepcopy(current)
+            rev = int(current.get("rev") or 0)
+            if change(working) is False:
+                return current
+            working["rev"] = rev + 1
+            try:
+                self.table().put_item(Item=_to_ddb({**working, **key, "entityType": "VIEW"}),
+                                      ConditionExpression="rev = :rev", ExpressionAttributeValues={":rev": rev})
+            except ClientError as exc:
+                if _is_conditional_failure(exc):
+                    continue
+                raise
+            return working
+        raise ContractConflict(f"view {view_id} is being changed by someone else; try again")
+
+    def delete_view(self, tenant_id: str, module: str, view_id: str) -> None:
+        self.table().delete_item(Key=self._view_key(tenant_id, module, view_id))
+
+    # -- automation rules -----------------------------------------------------
+    # One partition per tenant (shared/govern/automations.py), so the sweeper
+    # and the activity stream read a tenant's rules with one Query.
+    @staticmethod
+    def _automation_key(tenant_id: str, rule_id: str) -> dict[str, str]:
+        return {"PK": f"T#{tenant_id}#AUTOMATIONS", "SK": f"A#{rule_id}"}
+
+    def automations(self, tenant_id: str) -> list[dict[str, Any]]:
+        """Every automation rule of the tenant (enabled or not)."""
+        return self.children(f"T#{tenant_id}#AUTOMATIONS", "A#")
+
+    def automation(self, tenant_id: str, rule_id: str) -> dict[str, Any] | None:
+        return clean_item(self.table().get_item(Key=self._automation_key(tenant_id, rule_id)).get("Item"))
+
+    def create_automation(self, tenant_id: str, rule: dict[str, Any]) -> bool:
+        """Write a new rule (``rev`` 1). False if the id is already taken."""
+        return self.put_new({**rule, **self._automation_key(tenant_id, rule["id"]),
+                             "entityType": "AUTOMATION", "tenantId": tenant_id, "rev": 1})
+
+    def mutate_automation(self, tenant_id: str, rule_id: str,
+                          change: Callable[[dict[str, Any]], Any]) -> dict[str, Any] | None:
+        """Read-modify-write under optimistic locking on ``rev`` (as
+        ``contracts.mutate``). Returns the stored rule, or None if it is gone."""
+        key = self._automation_key(tenant_id, rule_id)
+        for _ in range(_MAX_WRITE_RETRIES):
+            current = self.automation(tenant_id, rule_id)
+            if current is None:
+                return None
+            working = copy.deepcopy(current)
+            rev = int(current.get("rev") or 0)
+            if change(working) is False:
+                return current
+            working["rev"] = rev + 1
+            try:
+                self.table().put_item(Item=_to_ddb({**working, **key, "entityType": "AUTOMATION"}),
+                                      ConditionExpression="rev = :rev", ExpressionAttributeValues={":rev": rev})
+            except ClientError as exc:
+                if _is_conditional_failure(exc):
+                    continue
+                raise
+            return working
+        raise ContractConflict(f"automation {rule_id} is being changed by someone else; try again")
+
+    def delete_automation(self, tenant_id: str, rule_id: str) -> None:
+        self.table().delete_item(Key=self._automation_key(tenant_id, rule_id))
+
+    # -- the organization (shared/govern/org.py) ------------------------------
+    # One partition per tenant: the ORG record (creator, admins, rev), one
+    # MEMBER#<sub> row per person who has signed in to Govern in the tenant,
+    # and an append-only AUDIT# trail of admin changes.
+    @staticmethod
+    def org_pk(tenant_id: str) -> str:
+        return f"T#{tenant_id}#ORG"
+
+    def org(self, tenant_id: str) -> dict[str, Any] | None:
+        return clean_item(self.table().get_item(Key={"PK": self.org_pk(tenant_id), "SK": "ORG"}).get("Item"))
+
+    def create_org(self, tenant_id: str, org: dict[str, Any]) -> bool:
+        """Write the ORG record (``rev`` 1) only if none exists. False when
+        another request created it first — exactly one creator per tenant."""
+        return self.put_new({**org, "PK": self.org_pk(tenant_id), "SK": "ORG", "entityType": "ORG",
+                             "tenantId": tenant_id, "rev": 1})
+
+    def put_org(self, tenant_id: str, org: dict[str, Any], expected_rev: int) -> bool:
+        """Replace the ORG record if its ``rev`` is still ``expected_rev``
+        (optimistic lock). False when someone else changed it meanwhile."""
+        try:
+            self.table().put_item(
+                Item=_to_ddb({**org, "PK": self.org_pk(tenant_id), "SK": "ORG", "entityType": "ORG",
+                              "tenantId": tenant_id, "rev": expected_rev + 1}),
+                ConditionExpression="rev = :rev", ExpressionAttributeValues={":rev": expected_rev})
+            return True
+        except ClientError as exc:
+            if _is_conditional_failure(exc):
+                return False
+            raise
+
+    def org_member(self, tenant_id: str, sub: str) -> dict[str, Any] | None:
+        return clean_item(self.table().get_item(Key={"PK": self.org_pk(tenant_id), "SK": f"MEMBER#{sub}"}).get("Item"))
+
+    def put_org_member(self, tenant_id: str, member: dict[str, Any]) -> None:
+        self.table().put_item(Item=_to_ddb({**member, "PK": self.org_pk(tenant_id), "SK": f"MEMBER#{member['sub']}",
+                                            "entityType": "ORG_MEMBER", "tenantId": tenant_id}))
+
+    def org_members(self, tenant_id: str) -> list[dict[str, Any]]:
+        return self.children(self.org_pk(tenant_id), "MEMBER#")
+
+    def append_org_audit(self, tenant_id: str, entry: dict[str, Any]) -> None:
+        self.table().put_item(Item=_to_ddb({**entry, "PK": self.org_pk(tenant_id),
+                                            # A strictly rising ns stamp orders entries of the same second.
+                                            "SK": f"AUDIT#{entry['at']}#{_rising_ns():020d}#{uuid.uuid4().hex[:8]}",
+                                            "entityType": "ORG_AUDIT", "tenantId": tenant_id}))
+
+    def org_audit(self, tenant_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        """The newest ``limit`` admin changes, newest first."""
+        from boto3.dynamodb.conditions import Key
+
+        resp = self.table().query(
+            KeyConditionExpression=Key("PK").eq(self.org_pk(tenant_id)) & Key("SK").begins_with("AUDIT#"),
+            ScanIndexForward=False, Limit=limit)
+        return [c for c in (clean_item(i) for i in resp.get("Items", [])) if c]
+
+    def record_automation_run(self, tenant_id: str, rule_id: str, at: str) -> None:
+        """``runCount`` + 1 and ``lastRunAt``, atomically and without touching
+        ``rev`` (an admin editing the rule meanwhile never conflicts). A rule
+        deleted meanwhile is left deleted."""
+        try:
+            self.table().update_item(
+                Key=self._automation_key(tenant_id, rule_id),
+                UpdateExpression="SET #l = :at ADD #n :one",
+                ConditionExpression="attribute_exists(PK)",
+                ExpressionAttributeNames={"#l": "lastRunAt", "#n": "runCount"},
+                ExpressionAttributeValues={":at": at, ":one": 1})
+        except ClientError as exc:
+            if not _is_conditional_failure(exc):
+                raise
+
 
 # ---------------------------------------------------------------------------
 # govern-sync
@@ -626,6 +846,15 @@ class MetricsRepository(_Repository):
 
     def release(self, scope: str, marker_id: str) -> None:
         self.table().delete_item(Key={"PK": scope, "SK": f"SEEN#{marker_id}"})
+
+    def seen(self, scope: str, marker_ids: Iterable[str]) -> set[str]:
+        """The markers of ``marker_ids`` already claimed (one BatchGetItem per
+        100) — a read, so a check that finds nothing new writes nothing."""
+        ids = [m for m in dict.fromkeys(marker_ids) if m]
+        if not ids:
+            return set()
+        items = self.batch_get([{"PK": scope, "SK": f"SEEN#{m}"} for m in ids])
+        return {str(i["SK"])[5:] for i in items if str(i.get("SK") or "").startswith("SEEN#")}
 
     def add(self, tenant_id: str, day: str, increments: dict[str, float]) -> None:
         """Atomic ADD of ``increments`` onto the tenant's day item."""

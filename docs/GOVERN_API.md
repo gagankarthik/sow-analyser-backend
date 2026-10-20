@@ -1,7 +1,8 @@
 # Govern API contract (v1)
 
 The single source of truth shared by `govern-api` (Python) and the Next.js client
-(`sow-analyzer/lib/govern/*`). All routes need the Cognito JWT except `/webhooks/*`.
+(`sow-analyzer/lib/govern/*`). All routes need the Cognito JWT except `/webhooks/*`
+and `/portal/*` (the counterparty portal: the link token is the credential).
 Errors use the existing body `{"error": "<message>", "code": "<reason>"}`
 (`bad_request`, `not_found`, `forbidden`, `conflict`, `invalid_transition`,
 `feature_disabled` — see "Later" features under Me).
@@ -140,7 +141,8 @@ ActivityEntry {
         | "rejected" | "comment" | "stage_changed" | "blocker_added" | "blocker_closed" | "blocker_edited"
         | "blocker_reopened" | "rescored" | "signature_sent" | "signed" | "activated" | "closed" | "reopened"
         | "revision_received" | "field_updated" | "overdue" | "notification_sent" | "sync" | "conflict"
-        | "obligation_added" | "obligation_done" | "pi_requested" | "pi_answered",
+        | "obligation_added" | "obligation_done" | "pi_requested" | "pi_answered"
+        | "automation_notify",               # an automation's alert (see Automations); detail.automation names the rule
   fromStage: Stage | null, toStage: Stage | null,
   summary: string,                          # plain sentence for the log
   detail: object | null
@@ -157,7 +159,8 @@ ActivityEntry {
 |---|---|---|---|---|
 | GET | `/contracts` | view | `?includeClosed=true` | `{contracts: Contract[], count, generatedAt}` |
 | POST | `/contracts` | edit (on the document) | `{docId, ...any PATCH field}` — intake right after upload: creates the contract at stage `draft`, state `intake` (analysisStatus = the document's status), auto-assigns; idempotent (an existing contract is patched instead). The intake Lambda keeps these fields (user-entered intake fields are never overwritten by inference). | `{contract: ContractDetail}` (201 when created) |
-| GET | `/contracts/{id}` | view | | `{contract: ContractDetail}` |
+| GET | `/contracts/{id}` | view | | `{contract: ContractDetail}` — `activity` holds the newest 20 entries (plus the latest `sent_back`, when older); `activityCount` is exact up to 200, `activityHasMore` says the log is longer, `activityCursor` continues after the shown entries (null when there are no older ones) |
+| GET | `/contracts/{id}/activity` | view | `?before=<cursor>&limit=1-100` (default 50) | `{entries: ActivityEntry[], nextCursor: string \| null}` — newest first, strictly older than `before`; one key-condition query on the contract's log |
 | PATCH | `/contracts/{id}` | edit | any of `agreementType, direction, counterparty, sponsor, piName, department, college, expectedValue, manualValue, currency, requestedDate, effectiveDate, termEndDate, huronRecordId, workdayRef, workdayMatch` | `{contract: ContractDetail}` |
 | DELETE | `/contracts/{id}` | delete_document (the document owner) | | `{deleted: true, contractId, docIds}` — removes the contract with its blockers, obligations, income and reviews, and takes its counts back out of the trends (the activity log keeps its entries). The app then deletes each of `docIds` with `DELETE /documents/{id}`. |
 | POST | `/contracts/{id}/actions` | see below | `{action, ...}` | `{contract: ContractDetail}` |
@@ -168,6 +171,7 @@ ActivityEntry {
 | PATCH | `/contracts/{id}/obligations/{oblId}` | edit | `{status?, dueDate?, title?, amount?}` | `{contract}` |
 | PUT | `/contracts/{id}/income` | edit | `{items: IncomeItem[]}` (ids optional for new) | `{contract}` |
 | GET | `/contracts/{id}/revision-upload-url` | edit | `?filename=` | `{uploadUrl, docId}` — new document linked to the contract; intake rescoring it moves the contract back to `in_review`, `rounds` unchanged |
+| POST | `/contracts/bulk` | edit, per contract (leaders read-only, as PATCH) | `{contractIds: string[] (1–200, unique), fields?: {...any PATCH field}, owner?: Person}` — at least one of `fields` / `owner`. The body (including `fields`, with PATCH's validation) is checked once up front: a bad one is 400 and nothing changes. Each contract then gets the PATCH (`fields`) and the `assign` action (`owner`; checked before the fields are written); a failure is reported per contract and the rest continue. | `{results: ({contractId, ok: true} \| {contractId, ok: false, error: {code, message}})[], updated: number}` — `code` is `not_found` for a contract the caller cannot see (never leaks), `forbidden`, `invalid_transition` (e.g. assigning a closed contract), `bad_request`, `conflict` |
 
 Actions (`POST /contracts/{id}/actions`), all write an activity entry; invalid ones answer 409 `invalid_transition`:
 
@@ -298,18 +302,146 @@ Connector credential keys (PUT `credentials`, stored in Secrets Manager, never r
 (`connectHmacKey` is the key `/webhooks/docusign` verifies with).
 
 ### Me
-| GET | `/govern/me` | `{email, name, role: GovernRole, tenantId, features: GovernFeatures}` |
+| GET | `/govern/me` | `{email, name, role: GovernRole, tenantId, isAdmin, isCreator, isLeader, features: GovernFeatures, …}` — `isAdmin` / `isCreator` are for THIS organization (tenant). `role` is `admin` when `isAdmin`, else from the Cognito groups (`govern-leader` → leader, otherwise reviewer). The first call in a tenant with no organization record creates it with the caller as creator and admin (conditional put: exactly one creator), and every call records the caller as a member of the tenant. |
+| GET | `/govern/people` | `{people: {email, name: string \| null, sources: ("project" \| "reviewer" \| "owner")[]}[]}` — people the caller can assign or share with: owners and members of the caller's projects (`project`), `settings.reviewers` (`reviewer`), owners of contracts the caller can see (`owner`), and the caller (whose `sources` may be empty). One entry per lower-cased email, sorted by name (unnamed last) then email, at most 500. |
+
+### Organization and admins — any member reads, admins write
+"Admin" in this document means an admin of the caller's organization (tenant): its creator plus the admins
+they added. Cognito groups never grant admin. A personal workspace (`u-<sub>`) has exactly one admin, its user.
+
+| Method | Path | Body / query | Returns |
+|---|---|---|---|
+| GET | `/govern/org` | — | `Organization` |
+| POST | `/govern/org/admins` | `{email, rev?}` (admin) | `Organization` — the person must have signed in to Govern in this tenant (a `MEMBER` row), else 404 `not_found` "No one with that email has signed in to this organization yet."; already an admin → unchanged. 400 in a personal workspace. |
+| DELETE | `/govern/org/admins/{sub}` | `?rev=` (admin) | `Organization` — 404 if `{sub}` is not an admin of this tenant; 409 `conflict` for the creator or the last admin. |
+
+```
+Organization {
+  tenantId, name: string | null (settings.organization.name), personal: boolean,
+  createdBy: {sub, email, name} | null, createdAt, rev: number,
+  admins: {sub, email, name, addedAt, isCreator, addedBy: {email, name} | null}[]   # creator first
+  you: {isAdmin, isCreator}
+  # admins only:
+  members?: {sub, email, name}[]                                 # people who signed in here (the picker)
+  activity?: {action: "org_created" | "admin_added" | "admin_removed", at, actor: {email, name}, target: {email, name}}[]  # newest 20
+}
+```
+`rev` is optional on writes; when sent and stale the answer is 409 `conflict` (reload and retry). Non-admins get 403 `forbidden`
+on the writes. Admin changes are logged (`govern_org.admin_added` / `govern_org.admin_removed`) and kept in `activity`.
+
+### Automations — any Govern user reads, admins write
+Rules that run on their own: **when** a trigger happens, **only if** every condition holds, **then** the actions run.
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/automations` | | `{automations: Automation[], count, limit: 50, enabled}` — oldest first; `enabled` = the `automations` feature is on for this deployment and organization |
+| POST | `/automations` | `{name, enabled?, trigger, conditions?, actions}` | 201 `{automation}`; 400 `limit` past 50 rules per organization; 409 `feature_disabled` while off |
+| PATCH | `/automations/{id}` | any of `{name, enabled, trigger, conditions, actions}` + optional `rev` | `{automation}`; the merged rule is validated whole; a stale `rev` → 409 `conflict`; 409 `feature_disabled` while off |
+| DELETE | `/automations/{id}` | | `{deleted: true, id}` |
+| POST | `/automations/{id}/test` | `{contractId, rule?}` | `{result: AutomationTest}` — a dry run on a contract the caller can view (404 otherwise): nothing is written. `rule` tests unsaved edits; `{id}` = `new` tests a rule that is not saved (then `rule` is required) |
+
+```
+Automation {
+  id,                                   # 32 hex characters
+  name,                                 # 1–120 characters
+  enabled: boolean,
+  trigger: AutomationTrigger,
+  conditions: AutomationCondition[],    # ≤ 10, all must hold
+  actions: AutomationAction[],          # 1–5, run in order
+  createdBy: Person, createdAt, updatedBy: Person, updatedAt,
+  lastRunAt: string | null, runCount: number, rev: number
+}
+AutomationTrigger =                     # time-based: evaluated by govern-sweeper every hour
+    { type: "in_stage_for", stage: Stage, days: 1–3650 }   # open in that stage for ≥ days (not rejected / closed)
+  | { type: "obligation_due_in", days: 0–3650 }           # an open obligation due within days (needs `obligations`)
+  | { type: "term_ends_in", days: 0–3650 }                # a signed / active agreement whose term ends within days
+                                        # event-based: evaluated by govern-stream on every new activity entry
+  | { type: "contract_received" }                          # the intake entry
+  | { type: "stage_changed", to?: Stage | null }           # any entry that moves the stage (to that stage)
+  | { type: "sent_back" }
+  | { type: "blocker_added", tier?: "unacceptable" | "deviates" | null }
+                                        # no tier: any new open item (a reviewer's or Sonar's);
+                                        # tier: Sonar found new items and the review has that tier ("deviates" = deviates or worse)
+  | { type: "signed" }
+AutomationCondition =
+    { field: "agreementType", op: "in", value: AgreementType[] }
+  | { field: "direction", op: "is", value: Direction }
+  | { field: "value", op: "gte" | "lte", value: number }   # the contract value (manual, else extracted, else expected); unknown never matches
+  | { field: "department", op: "is", value: string }       # case and spacing ignored
+  | { field: "owner", op: "set" | "unset" }
+  | { field: "counterparty", op: "contains", value: string }  # counterparty or sponsor, case ignored
+AutomationAction =
+    { type: "notify", to: "owner" | "office" | "emails", office?: Office, emails?: string[], message?: string }
+        # office: the reviewers of that office (settings.reviewers); emails: 1–20 addresses; message ≤ 500
+  | { type: "escalate", office: Office }                   # the escalate action; skipped when already waiting on it
+  | { type: "assign", owner?: Person }                      # no owner: the assignment rules pick one (auto_assignee)
+  | { type: "comment", text: string }                       # ≤ 2000
+# message / text placeholders: {contract} {stage} {days} {due} {owner} {counterparty} {rule}; any other {…} → 400
+AutomationTest {
+  ruleId: string | null, contractId, contractTitle, wouldFire: boolean, enabled: boolean, featureEnabled: boolean,
+  alreadyRan: boolean,                  # this episode / entry has already fired
+  trigger: { matched: boolean, detail: string },   # event triggers look for the newest matching entry in recent activity
+  conditions: (AutomationCondition & { matched: boolean, actual: any })[],
+  actions: { type, summary: string, wouldRun: boolean, reason: string | null, recipients?: string[] }[]
+}
+```
+Validation (400 `bad_request`): unknown keys anywhere (rule, trigger, condition, action, person, test body),
+unknown trigger / field / operator / action types, keys that do not belong to the chosen type, out-of-range days.
+
+How rules run. Every automated change goes through `shared/govern/workflow.py` as the system actor
+**"Automation: <rule name>"** and its activity entry carries `detail.automation = {ruleId, ruleName}`; entries so
+tagged never trigger a rule, so automations neither loop nor chain. `notify` writes an `automation_notify` entry
+(recipients, subject, message) that the notifier delivers by SES / Teams under the channel settings (the rule is its
+switch; the `notifications` feature must be on) and then logs `notification_sent`. A time rule fires once per
+contract per qualifying episode (key: stage entry `<contractId>#<stageEnteredAt>`, term `#term#<termEndDate>`,
+obligation `#obl#<id>#<dueDate>`); an event rule once per activity entry. Each action claims a govern-metrics
+marker (`AUTO#<tenant> / SEEN#<ruleId>#<key>#<n>`) before it runs, so a retry never repeats an action; an action
+the contract's state does not allow is skipped. `runCount` / `lastRunAt` count completed firings. Stored in
+govern-config `T#<tenant>#AUTOMATIONS / A#<id>`.
+
+### Saved views (list views for `contracts` and `obligations`) — any Govern user, leaders included
+| Method | Path | Body / query | Returns |
+|---|---|---|---|
+| GET | `/views` | `?module=contracts\|obligations` (required) | `{views: View[]}` — the caller's own views (any visibility), `everyone` views, and `specific` views whose `sharedWith` holds the caller's verified email; own first, then by name |
+| POST | `/views` | `{module, name, visibility, sharedWith?, config}` | 201 `{view}`; 400 `limit` past 100 views per creator per module |
+| PATCH | `/views/{id}` | any of `{name, visibility, sharedWith, config}` | `{view}` — creator only: 403 `forbidden` if the caller can see the view but did not create it, 404 if they cannot see it |
+| DELETE | `/views/{id}` | | `{deleted: true, id}` — same creator rule |
+
+```
+View {
+  id,                                   # 32 hex characters
+  module: "contracts" | "obligations",
+  name,                                 # 1–80 characters, trimmed
+  visibility: "private" | "everyone" | "specific",
+  sharedWith: string[],                 # lower-cased emails, max 50; required (non-empty) for "specific", stored empty otherwise
+  createdBy: Person, createdAt, updatedAt,
+  canEdit: boolean,                     # the caller created it
+  config: ViewConfig
+}
+ViewConfig {                            # every key optional on write (defaults shown); always complete on read
+  base: string | null,                  # null
+  filters: { match: "all" | "any", rules: { field: string, op: string, value: any }[] },   # {match: "all", rules: []}
+  columns: { order: string[], hidden: string[] },                                          # {order: [], hidden: []}
+  groupBy: string | null,               # null
+  sort: { key: string, dir: "asc" | "desc" } | null,                                       # null
+  density: "comfortable" | "compact" | null                                                # null
+}
+```
+Validation (400 `bad_request`): unknown keys anywhere; `base`, `groupBy`, `field`, `op`, `sort.key` and column names
+≤ 64 of `A-Z a-z 0-9 _ . : -`; ≤ 25 rules; ≤ 40 entries in each of `order` / `hidden`; a rule `value` is a string
+(≤ 200), finite number, boolean, null, or a list of ≤ 50 of those; the whole `config` ≤ 16 KB as JSON.
+Stored in govern-config `T#<tenant>#VIEWS / V#<module>#<id>`.
 
 ```
 GovernFeatures { routingRules: boolean, docusign: boolean, notifications: boolean,
-                 obligations: boolean, exports: boolean, integrations: boolean }
+                 obligations: boolean, exports: boolean, integrations: boolean, automations: boolean }
 ```
 
 #### "Later" features (`GOVERN_FEATURES`)
 Built but not part of this release. A deployment switches them on with the
 `GOVERN_FEATURES` environment variable on the Govern Lambdas (Terraform
 `govern_features`), a comma list of `routing_rules`, `docusign`,
-`notifications`, `obligations`, `exports`, `integrations` (camelCase accepted).
+`notifications`, `obligations`, `exports`, `integrations`, `automations` (camelCase accepted).
 Empty (the default) = all off. `features` reports the result; the web app
 prefers it over its own build-time list (`NEXT_PUBLIC_GOVERN_FEATURES`) —
 when the server says off, the feature is off. While a feature is off:
@@ -322,6 +454,66 @@ when the server says off, the feature is off. While a feature is off:
 | `obligations` | Obligations may still be stored, but `obligationsDue` is always 0, the next step does not mention them, and the sweeper writes no due / overdue entries. |
 | `exports` | Client-side only (Excel / PDF downloads are shown as "Coming soon"). |
 | `integrations` | Scheduled and event connector runs are skipped (logged); `POST /integrations/{id}/sync` → 409 `feature_disabled`. |
+| `automations` | No rule runs (sweeper or stream); `POST` / `PATCH /automations` → 409 `feature_disabled`; `GET` still lists rules (`enabled: false`), `DELETE` and the dry run still work. |
+
+### Real-time events (AppSync Events WebSocket, Cognito ID token)
+
+Not a REST route: open pages subscribe to their tenant's channel on the Govern
+AppSync Events API (`terraform output govern_realtime_domains`) and re-read
+through the routes above when a message arrives (GOVERN_ARCHITECTURE.md §2.3.1).
+
+```
+Channel:  /govern/<encoded tenantId>
+          tenantId = custom:tenantId claim, else "u-<sub>"; "-" → "-0", "_" → "-1", "." → "-2";
+          split into 50-character segments (e.g. "u-1b2c" → /govern/u-01b2c)
+
+ContractChanged {
+  type: "contract.changed",
+  contractId: string,
+  action: string,          // the activity action (approve, comment, assign, rescored, …)
+  actor: string | null,    // display name only; "Sonar" for system entries; null when only an email is known
+  at: string               // the entry's ISO time
+}
+```
+
+One message per activity entry; nothing else is ever sent (no contents, values,
+comments, details or emails). Subscribing to another tenant's channel, or to a
+wildcard, is refused (`subscribe_error`). Browsers cannot publish (IAM only).
+Delivery is best effort: clients keep a slow polling safety net.
 
 ### Webhooks (no JWT)
 | POST | `/webhooks/docusign` | DocuSign Connect JSON; header `X-DocuSign-Signature-1` HMAC-SHA256 (base64) of the raw body with the key in Secrets Manager. `envelope-completed` with custom field `contractId` → `mark_signed`. |
+
+### Counterparty portal
+
+A reviewer shares one contract's open asks with the other side, who reads them
+and uploads a revised version without an account (`shared/govern/portal.py`).
+
+```
+PortalLink { id, status: "active" | "expired" | "revoked", createdAt, createdBy: Person | null,
+             expiresAt, allowUpload: boolean, note: string | null, opens: number,
+             lastOpenedAt: string | null, uploads: number, revokedAt: string | null }   # never the token
+PortalView { contractTitle, organizationName: string | null, needs: PortalNeed[],
+             requestedDate: "YYYY-MM-DD" | null, note: string | null, allowUpload: boolean, expiresAt }
+PortalNeed { clauseLabel, tier: "Required change" | "Change requested" | "Missing clause" | "Please confirm" | "Requested",
+             title, suggestedLanguage: string | null }
+```
+
+Reviewer routes (JWT, **edit** on the contract; viewers and leaders → 403, no access → 404):
+
+| Method | Path | Body → Response |
+|---|---|---|
+| POST | `/contracts/{id}/portal-links` | `{expiresInDays?: 1-60 (14), allowUpload?: boolean (true), note?: string ≤ 1000}` → 201 `{id, url, expiresAt, link: PortalLink}`. `url` (`APP_BASE_URL/portal/<token>`) is returned **once**. 409 `limit_reached` at 5 active links; 409 `invalid_transition` on a rejected / closed contract. Activity `portal_link_created`. |
+| GET | `/contracts/{id}/portal-links` | → `{links: PortalLink[] (newest first, ≤ 50), activeCount, maxActive: 5}` |
+| DELETE | `/contracts/{id}/portal-links/{linkId}` | → `{link: PortalLink}` (idempotent). Activity `portal_link_revoked`. |
+
+Public routes (no JWT; govern-portal Lambda; responses carry `Cache-Control: no-store`,
+`Referrer-Policy: no-referrer`, `X-Robots-Tag: noindex`):
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET | `/portal/{token}` | → `PortalView` (exactly these keys). Counts a view; the first view of a UTC day writes activity `portal_opened` ("Counterparty opened the link."). 429 `rate_limited` after 500 views of one link. |
+| POST | `/portal/{token}/upload-url` | `{filename: *.pdf | *.docx, size: bytes ≤ 25 MB}` → `{uploadUrl, headers: {"Content-Type"}, expiresIn: 300, maxBytes}`. PUT the file to `uploadUrl` with exactly those headers (type and size are signed). The same revision path as `GET /contracts/{id}/revision-upload-url`: a PENDING document with `revisionOf`, `uploadedVia: "portal"`, filed as the link's creator; intake makes it the next round. Activity `portal_upload` (actor "Counterparty via portal link"). 403 `upload_not_allowed` when the link does not allow uploads or the contract is signed / closed; 400 on type / size; 429 after 20 upload URLs per link. |
+
+An unknown, malformed, expired or revoked token — or one whose contract is gone —
+always gets the same 404 `{"error": "This link has expired or isn't valid. Ask your contact for a new one.", "code": "not_found"}`.

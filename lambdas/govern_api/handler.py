@@ -2,10 +2,13 @@
 
 Routes                                                      needs
 ------                                                      -----
-GET    /govern/me                                           signed in
+GET    /govern/me                                           signed in (creates the organization on first sign-in)
+GET    /govern/org                                          signed in (members + admin trail for admins)
+POST   /govern/org/admins · DELETE /govern/org/admins/{sub} admin of this organization
 GET    /contracts[?includeClosed=true]                      (lists what the caller may see)
 GET    /obligations                                         (open, dated obligations of visible contracts)
 POST   /contracts                                           edit on the document
+POST   /contracts/bulk                                      edit, per contract (results per id)
 GET    /contracts/{id}                                      view
 PATCH  /contracts/{id}                                      edit
 POST   /contracts/{id}/actions                              Contract.allowedActions (see workflow.allowed_actions)
@@ -16,6 +19,10 @@ POST   /contracts/{id}/obligations                          edit
 PATCH  /contracts/{id}/obligations/{oblId}                  edit
 PUT    /contracts/{id}/income                               edit
 GET    /contracts/{id}/revision-upload-url?filename=        edit
+GET    /contracts/{id}/activity?before=&limit=              view (older activity, newest first)
+GET    /contracts/{id}/portal-links                         edit (counterparty links; never the token)
+POST   /contracts/{id}/portal-links                         edit (max 5 active; the url is returned once)
+DELETE /contracts/{id}/portal-links/{linkId}                edit (revoke)
 GET    /matrix · GET /matrix/versions/{n}                   signed in
 PUT    /matrix · POST /matrix/import                        Govern admin
 GET    /workflow/settings                                   signed in
@@ -24,20 +31,28 @@ GET    /integrations · /integrations/sync-log · /integrations/unmatched
 PUT    /integrations/{id} · POST /integrations/{id}/sync    Govern admin
 GET    /reports/trends                                      Govern admin or leader
 GET    /reports/capture                                     signed in (what the caller may see)
+GET    /govern/people                                       signed in (people the caller can see)
+GET    /views?module= · POST /views                         signed in (saved list views)
+PATCH  /views/{id} · DELETE /views/{id}                     the view's creator
+GET    /automations                                         signed in (the organization's rules)
+POST   /automations · PATCH/DELETE /automations/{id}        Govern admin
+POST   /automations/{id}/test                               signed in + view on the contract (dry run, no writes)
 
 ACCESS. A contract is visible exactly when its document is: the caller's role
 on the contract is their strongest role (shared/access.py) on its first
 document (``contractId``) or its current one (``currentDocId``). No role →
 404, so ids cannot be probed; a role without the capability → 403.
 
-GOVERN ROLES come from the Cognito ``cognito:groups`` claim: ``govern-admin``
-(matrix, routing, settings, integrations), ``govern-reviewer`` (actions),
-``govern-leader`` (view, comment, approve when routed). Which actions a
-caller may take is ``Contract.allowedActions`` (workflow.allowed_actions):
-editors get every action valid in the state; viewers and leaders may comment,
-and office-approve when they approve for an office the contract waits on.
-When ``GOVERN_OPEN_ADMIN`` is true (sandbox default) a user in no Govern
-group is an admin.
+GOVERN ROLES. "Govern admin" (matrix, routing, settings, integrations,
+automations, the organization's admins) is per tenant: the organization's
+creator and the admins they add (shared/govern/org.py). A personal ``u-<sub>``
+workspace's user is its admin. Cognito groups are pool-wide, so they never
+grant admin: ``govern-reviewer`` (and the legacy ``govern-admin``) mean
+reviewer, ``govern-leader`` means leader (view, comment, approve when routed).
+Which actions a caller may take is ``Contract.allowedActions``
+(workflow.allowed_actions): editors get every action valid in the state;
+viewers and leaders may comment, and office-approve when they approve for an
+office the contract waits on.
 
 Every state change goes through shared/govern/workflow.py; this module only
 authorises, validates the request shape and renders responses.
@@ -47,7 +62,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable
@@ -58,11 +72,12 @@ from shared import dynamodb as ddb
 from shared.access import Caller, can
 from shared.auth import AuthError, jwt_claims
 from shared.config import settings
-from shared.govern import aggregates, capture, connectors, secrets, store, workflow
+from shared.govern import aggregates, automations, capture, connectors, portal, revisions, secrets, store, views, workflow
 from shared.govern import matrix as govern_matrix
+from shared.govern import org
 from shared.govern.store import ContractConflict, iso
 from shared.logger import get_logger, safe_trace
-from shared.uploads import clean_upload_filename, pending_document_meta, upload_key
+from shared.uploads import clean_upload_filename
 
 log = get_logger("blue-iq.govern-api")
 tracer = Tracer(service="blue-iq.govern-api")
@@ -76,7 +91,14 @@ _LEADER_READ_ONLY = "Leaders can view, comment and approve; ask a reviewer to ch
 # the next call; intake and the hourly reconciliation also create them).
 _MAX_LAZY_CREATES = 100
 _MAX_BODY_BYTES = 2_000_000
-_ROLE_GROUPS = (("govern-admin", "admin"), ("govern-reviewer", "reviewer"), ("govern-leader", "leader"))
+_MAX_BULK = 200            # contracts per POST /contracts/bulk
+_MAX_PEOPLE = 500          # people per GET /govern/people
+_PEOPLE_SOURCES = ("project", "reviewer", "owner")
+# Cognito groups are pool-wide, so none of them grants admin (that is per
+# tenant: shared/govern/org.py). ``govern-admin`` is kept as reviewer-level so
+# a user in it is never narrowed to a leader.
+_ROLE_GROUPS = (("govern-admin", "reviewer"), ("govern-reviewer", "reviewer"), ("govern-leader", "leader"))
+_SUB_RE = re.compile(r"[A-Za-z0-9-]{1,60}")
 _TEAMS_URL_RE = re.compile(r"^https://[A-Za-z0-9.-]+\.(?:webhook\.office\.com|logic\.azure\.com|office\.com)(?::\d+)?/\S+$")
 
 
@@ -85,25 +107,64 @@ _TEAMS_URL_RE = re.compile(r"^https://[A-Za-z0-9.-]+\.(?:webhook\.office\.com|lo
 # ---------------------------------------------------------------------------
 
 
+_UNREAD = object()
+
+
 class GovernUser:
-    """The verified caller plus their display name and Govern role."""
+    """The verified caller plus their display name and Govern role.
+
+    Admin is per tenant (shared/govern/org.py): the caller is an admin exactly
+    when they created this tenant's organization or one of its admins added
+    them. Cognito groups only say reviewer or leader."""
 
     def __init__(self, caller: Caller, claims: dict[str, Any]) -> None:
         self.caller = caller
         self.claims = claims
         self.groups = _groups(claims.get("cognito:groups"))
-        self.explicit_role = next((role for group, role in _ROLE_GROUPS if group in self.groups), None)
-        self.role = self.explicit_role or ("admin" if settings.govern_open_admin else "reviewer")
-        name = claims.get("name") or " ".join(p for p in (claims.get("given_name"), claims.get("family_name")) if p)
-        self.person = workflow.person(caller.email or claims.get("email") or caller.sub, name or None)
+        self.group_role = next((role for group, role in _ROLE_GROUPS if group in self.groups), None)
+        self.display_name = (claims.get("name") or " ".join(
+            p for p in (claims.get("given_name"), claims.get("family_name")) if p) or None)
+        self.person = workflow.person(caller.email or claims.get("email") or caller.sub, self.display_name)
+        self._org: Any = _UNREAD
+
+    @property
+    def org(self) -> dict[str, Any] | None:
+        """This tenant's ORG record (read once; None if it has none yet)."""
+        if self._org is _UNREAD:
+            self._org = org.get(self.caller.tenant_id)
+        return self._org
+
+    def ensure_org(self) -> dict[str, Any] | None:
+        """Create the ORG record on first sign-in (this caller becomes creator
+        when there is none) and remember the caller as a member."""
+        p = self.person or {}
+        self._org = org.ensure(self.caller.tenant_id, self.caller.sub, self.caller.email, p.get("name"))
+        org.record_member(self.caller.tenant_id, self.caller.sub, self.caller.email, p.get("name"))
+        return self._org
+
+    @property
+    def actor(self) -> dict[str, Any]:
+        return {"sub": self.caller.sub, "email": self.caller.email, "name": (self.person or {}).get("name")}
 
     @property
     def is_admin(self) -> bool:
-        return self.role == "admin"
+        if org.is_personal(self.caller.tenant_id):       # no read needed
+            return org.is_admin(None, self.caller.tenant_id, self.caller.sub)
+        return org.is_admin(self.org, self.caller.tenant_id, self.caller.sub)
+
+    @property
+    def is_creator(self) -> bool:
+        if org.is_personal(self.caller.tenant_id):
+            return org.is_creator(None, self.caller.tenant_id, self.caller.sub)
+        return org.is_creator(self.org, self.caller.tenant_id, self.caller.sub)
+
+    @property
+    def role(self) -> str:
+        return "admin" if self.is_admin else (self.group_role or "reviewer")
 
     @property
     def is_leader(self) -> bool:
-        return self.explicit_role == "leader"
+        return self.group_role == "leader"
 
 
 def _groups(raw: Any) -> set[str]:
@@ -121,7 +182,10 @@ def _groups(raw: Any) -> set[str]:
 # ---------------------------------------------------------------------------
 
 
-@tracer.capture_lambda_handler
+# capture_response=False: responses carry contract details, people and
+# presigned upload URLs; Powertools would otherwise copy each one into X-Ray
+# trace metadata, readable outside the tenant model.
+@tracer.capture_lambda_handler(capture_response=False)
 @log.inject_lambda_context(log_event=False)
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     return dispatch(event)
@@ -140,7 +204,7 @@ def dispatch(event: dict[str, Any]) -> dict[str, Any]:
     log.append_keys(tenantId=user.caller.tenant_id, method=method)
     try:
         return route(method, path, event, user)
-    except workflow.GovernError as exc:
+    except (workflow.GovernError, org.OrgError) as exc:
         return _err(exc.status, str(exc), exc.code)
     except ContractConflict:
         return _err(409, "Someone else changed this at the same time. Please try again.", "conflict")
@@ -170,16 +234,31 @@ def route(method: str, path: str, event: dict[str, Any], user: GovernUser) -> di
 # ---------------------------------------------------------------------------
 
 
+def _capped_revision_role(role: str | None) -> str | None:
+    """A role held on a REVISION document counts at most as editor on the contract.
+
+    Whoever uploads a revision (an editor, or the link creator when the
+    counterparty uploads through a portal link) owns that revision document.
+    Without this cap that ownership became "owner" of the whole contract once
+    the revision was made current — an editor could then delete the contract
+    (``delete_document``) that someone else owns. Contract ownership comes only
+    from the contract's first document."""
+    return "editor" if role == "owner" else role
+
+
 def _contract_role(c: dict[str, Any], user: GovernUser, metas: dict[str, dict[str, Any]] | None = None) -> str | None:
-    """Strongest document role on the contract's first or current document."""
+    """Strongest document role on the contract's first document, or (capped at
+    editor) on its current one."""
     from shared.access import stronger
 
-    ids = list(dict.fromkeys([c["contractId"], c.get("currentDocId") or c["contractId"]]))
+    first = c["contractId"]
+    current = c.get("currentDocId") or first
+    ids = list(dict.fromkeys([first, current]))
     if metas is None:
         metas = {m["docId"]: m for m in ddb.get_docs(ids) if m.get("docId")}
-    role = None
-    for doc_id in ids:
-        role = stronger(role, user.caller.document_role(metas.get(doc_id)))
+    role = user.caller.document_role(metas.get(first))
+    if current != first:
+        role = stronger(role, _capped_revision_role(user.caller.document_role(metas.get(current))))
     return role
 
 
@@ -259,8 +338,11 @@ def _render_list(contracts: list[dict[str, Any]], docs: dict[str, dict[str, Any]
         metas.update({m["docId"]: m for m in ddb.get_docs(list(missing)) if m.get("docId")})
     out = []
     for c in contracts:
-        role = stronger((docs.get(c["contractId"]) or {}).get("_role"),
-                        (docs.get(c.get("currentDocId") or "") or {}).get("_role"))
+        current = c.get("currentDocId") or ""
+        role = (docs.get(c["contractId"]) or {}).get("_role")
+        if current and current != c["contractId"]:
+            # Same rule as _contract_role: a revision's owner is an editor here.
+            role = stronger(role, _capped_revision_role((docs.get(current) or {}).get("_role")))
         out.append(workflow.to_api(c, now, cfg(c["tenantId"]), _analysis_meta(c, metas), _viewer(user, role)))
     return out
 
@@ -274,11 +356,59 @@ def _detail(contract_id: str, viewer: workflow.Viewer, now: datetime | None = No
                                  + [c.get("currentDocId"), c.get("pendingDocId")]))
     metas = {m["docId"]: m for m in ddb.get_docs([d for d in doc_ids if d]) if m.get("docId")}
     review = store.contracts.get_review(contract_id, c.get("reviewedDocId") or c.get("currentDocId") or contract_id)
-    return workflow.detail(
+    head = store.activity.head(contract_id, show=_DETAIL_ACTIVITY, count_up_to=_ACTIVITY_COUNT_CAP)
+    out = workflow.detail(
         c, now=now, cfg=workflow.get_settings(c["tenantId"]), doc_meta=_analysis_meta(c, metas), viewer=viewer,
         version_metas=metas, blockers=store.contracts.blockers(contract_id),
         obligations=store.contracts.obligations(contract_id), income=store.contracts.income(contract_id),
-        review=review, activity=store.activity.recent(contract_id, 200))
+        review=review, activity=_detail_activity(head))
+    out.update({"activityCount": head["count"], "activityHasMore": head["hasMore"], "activityCursor": head["cursor"]})
+    return out
+
+
+# The contract page shows the newest entries; older ones page in through
+# GET /contracts/{id}/activity. The count is exact up to the cap.
+_DETAIL_ACTIVITY = 20
+_ACTIVITY_COUNT_CAP = 200
+_ACTIVITY_PAGE_MAX = 100
+# Entries the page reads for more than the timeline: the latest send-back
+# (its clauses and note build the redline). Kept when older than the newest 20.
+_KEEP_LATEST = ("sent_back",)
+
+
+def _detail_activity(head: dict[str, Any]) -> list[dict[str, Any]]:
+    """The newest entries, plus the latest of each _KEEP_LATEST action read in
+    the same query. Those are older than every shown entry, so the list stays
+    newest first; the timeline drops the duplicate when it pages them in."""
+    entries = list(head["entries"])
+    have = {e.get("action") for e in entries}
+    for action in _KEEP_LATEST:
+        if action in have:
+            continue
+        older = next((e for e in head["window"] if e.get("action") == action), None)
+        if older is not None:
+            entries.append(older)
+    return entries
+
+
+def _contract_activity(event: dict[str, Any], user: GovernUser, contract_id: str) -> dict[str, Any]:
+    """One page of the activity log, newest first: ``{entries, nextCursor}``.
+    ``before`` is the previous page's ``nextCursor`` (or the detail's
+    ``activityCursor``); ``limit`` is 1-100, default 50."""
+    _contract_for(contract_id, user, "view")
+    qs = event.get("queryStringParameters") or {}
+    raw_limit = qs.get("limit")
+    try:
+        limit = int(raw_limit) if raw_limit not in (None, "") else 50
+    except (TypeError, ValueError):
+        raise workflow.BadRequest("limit must be a whole number from 1 to 100")
+    if not 1 <= limit <= _ACTIVITY_PAGE_MAX:
+        raise workflow.BadRequest("limit must be a whole number from 1 to 100")
+    before = qs.get("before") or None
+    if before is not None and (len(before) > 256 or not before.isprintable()):
+        raise workflow.BadRequest("before is not a valid cursor")
+    entries, cursor = store.activity.page(contract_id, before=before, limit=limit)
+    return _ok({"entries": [workflow.activity_view(e) for e in entries], "nextCursor": cursor})
 
 
 def _contract_response(contract_id: str, user: GovernUser, role: str | None, status: int = 200) -> dict[str, Any]:
@@ -412,6 +542,61 @@ def _patch_contract(event: dict[str, Any], user: GovernUser, contract_id: str) -
     return _contract_response(contract_id, user, role)
 
 
+def _bulk_update(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
+    """The same change on many contracts: PATCH fields and / or an owner (the
+    ``assign`` action). The body is validated once, before anything changes;
+    then each contract is authorised and changed on its own, and a failure is
+    reported in its result without stopping the rest. A contract the caller
+    cannot see is ``not_found``, exactly as PATCH /contracts/{id} answers."""
+    body = _body(event)
+    unknown = set(body) - {"contractIds", "fields", "owner"}
+    if unknown:
+        raise workflow.BadRequest(f"Unknown field(s): {', '.join(sorted(unknown))}")
+    ids = body.get("contractIds")
+    if not isinstance(ids, list) or not 1 <= len(ids) <= _MAX_BULK or not all(isinstance(i, str) for i in ids):
+        raise workflow.BadRequest(f"contractIds must be a list of 1 to {_MAX_BULK} contract ids")
+    if len(set(ids)) != len(ids):
+        raise workflow.BadRequest("contractIds must not repeat an id")
+    raw_fields = body.get("fields")
+    if raw_fields is not None and not isinstance(raw_fields, dict):
+        raise workflow.BadRequest("fields must be an object")
+    fields = workflow.clean_fields(raw_fields or {})
+    owner = workflow.parse_person(body["owner"], "owner") if body.get("owner") is not None else None
+    if not fields and owner is None:
+        raise workflow.BadRequest("Send fields and / or owner to update")
+
+    cfg = _Settings()
+    results: list[dict[str, Any]] = []
+    for contract_id in ids:
+        try:
+            if not _ID_RE.fullmatch(contract_id):
+                raise workflow.NotFound(_NOT_FOUND)
+            c, role = _contract_for(contract_id, user, "edit")
+            if owner is not None:
+                # Checked before the fields are written, so a contract that
+                # cannot be assigned (rejected, closed) is left untouched.
+                if "assign" not in workflow.allowed_actions(c, _viewer(user, role), cfg(c["tenantId"])):
+                    raise workflow.InvalidTransition(
+                        f"You cannot assign a contract that is {c.get('state', '').replace('_', ' ')}.")
+            if fields:
+                workflow.update_fields(contract_id, fields, user.person, cfg=cfg(c["tenantId"]))
+            if owner is not None:
+                workflow.perform_action(contract_id, "assign", {"owner": owner}, user.person, cfg=cfg(c["tenantId"]))
+            results.append({"contractId": contract_id, "ok": True})
+        except workflow.GovernError as exc:
+            results.append({"contractId": contract_id, "ok": False, "error": {"code": exc.code, "message": str(exc)}})
+        except ContractConflict:
+            results.append({"contractId": contract_id, "ok": False, "error": {
+                "code": "conflict", "message": "Someone else changed this at the same time. Please try again."}})
+        except Exception as exc:  # noqa: BLE001 - one contract's failure must not stop the rest
+            log.error("govern_api.bulk_item_failed", error_type=type(exc).__name__, trace=safe_trace(exc))
+            results.append({"contractId": contract_id, "ok": False,
+                            "error": {"code": "internal", "message": "Internal server error"}})
+    updated = sum(1 for r in results if r["ok"])
+    log.info("govern_api.bulk_update", requested=len(ids), updated=updated)
+    return _ok({"results": results, "updated": updated})
+
+
 def _post_action(event: dict[str, Any], user: GovernUser, contract_id: str) -> dict[str, Any]:
     body = _body(event)
     action = body.pop("action", None)
@@ -491,30 +676,46 @@ def _revision_upload_url(event: dict[str, Any], user: GovernUser, contract_id: s
     if not raw_bucket:
         log.error("govern_api.missing_raw_bucket")
         return _err(500, "Server misconfiguration: RAW_BUCKET not set", "internal")
-    base = ddb.get_doc_meta(c.get("currentDocId") or contract_id) or ddb.get_doc_meta(contract_id) or {}
-    project_ids = [p for p in base.get("projectIds") or [] if can(user.caller.project_role(p), "upload")]
-    doc_id = str(uuid.uuid4())
-    tenant_id = user.caller.tenant_id
-    from shared.aws import s3_client
-
-    upload_url = s3_client().generate_presigned_url(
-        "put_object", Params={"Bucket": raw_bucket, "Key": upload_key(tenant_id, doc_id, filename)}, ExpiresIn=300)
-    ddb.put_doc_meta(pending_document_meta(
-        doc_id=doc_id, tenant_id=tenant_id, owner_sub=user.caller.sub, owner_email=user.caller.email,
-        filename=filename, doc_type=base.get("docType") or "OTHER", project_ids=project_ids,
-        extra={"parentDocId": contract_id, "revisionOf": contract_id}))
-    for project_id in project_ids:
-        ddb.mutate_project(project_id, lambda p: p.__setitem__("docIds", list(p.get("docIds") or []) + [doc_id]))
-
-    def link(stored: dict[str, Any]) -> None:
-        stored["versionDocIds"] = list(stored.get("versionDocIds") or [contract_id]) + [doc_id]
-        stored.setdefault("versionRounds", {})[doc_id] = int(stored.get("rounds") or 0) + 1
-        stored["pendingDocId"] = doc_id
-        stored["updatedAt"] = iso()
-
-    store.contracts.mutate(contract_id, link)
+    project_ids = _uploadable_projects(c, user)
+    upload_url, doc_id = revisions.presign_revision(
+        c, raw_bucket=raw_bucket, tenant_id=user.caller.tenant_id, owner_sub=user.caller.sub,
+        owner_email=user.caller.email, filename=filename, project_ids=project_ids)
     log.info("govern_api.revision_upload", contractId=contract_id, docId=doc_id, projects=len(project_ids))
     return _ok({"uploadUrl": upload_url, "docId": doc_id})
+
+
+def _uploadable_projects(c: dict[str, Any], user: GovernUser) -> list[str]:
+    """The contract's projects the caller may upload to (a revision is filed there)."""
+    return [p for p in revisions.base_project_ids(c) if can(user.caller.project_role(p), "upload")]
+
+
+# ---------------------------------------------------------------------------
+# Counterparty portal links (shared/govern/portal.py; the public side is the
+# govern-portal Lambda)
+# ---------------------------------------------------------------------------
+
+
+def _create_portal_link(event: dict[str, Any], user: GovernUser, contract_id: str) -> dict[str, Any]:
+    c, _ = _contract_for(contract_id, user, "edit")
+    view, url = portal.create_link(c, _body(event), creator=user.person, creator_sub=user.caller.sub,
+                                   creator_email=user.caller.email, upload_tenant_id=user.caller.tenant_id,
+                                   project_ids=_uploadable_projects(c, user))
+    log.info("govern_api.portal_link_created", contractId=contract_id, linkId=view["id"])
+    return _ok({"id": view["id"], "url": url, "expiresAt": view["expiresAt"], "link": view}, 201)
+
+
+def _list_portal_links(event: dict[str, Any], user: GovernUser, contract_id: str) -> dict[str, Any]:
+    _contract_for(contract_id, user, "edit")
+    links = portal.list_links(contract_id)
+    return _ok({"links": links, "activeCount": sum(1 for v in links if v["status"] == "active"),
+                "maxActive": portal.MAX_ACTIVE_LINKS})
+
+
+def _revoke_portal_link(event: dict[str, Any], user: GovernUser, contract_id: str, link_id: str) -> dict[str, Any]:
+    c, _ = _contract_for(contract_id, user, "edit")
+    view = portal.revoke_link(c, link_id, user.person)
+    log.info("govern_api.portal_link_revoked", contractId=contract_id, linkId=link_id)
+    return _ok({"link": view})
 
 
 # ---------------------------------------------------------------------------
@@ -722,9 +923,12 @@ def _features_for(tenant_id: str) -> dict[str, bool]:
 
 def _me(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
     p = user.person or {}
+    user.ensure_org()
     edition = _edition_for(user.caller.tenant_id)
     return _ok({"email": p.get("email"), "name": p.get("name"), "role": user.role,
                 "tenantId": user.caller.tenant_id,
+                # Admin of THIS organization (its creator, or added by an admin).
+                "isAdmin": user.is_admin, "isCreator": user.is_creator, "isLeader": user.is_leader,
                 # Requirement 7: which edition this organization sees, and its vocabulary.
                 "edition": edition,
                 "defaultEdition": settings.govern_default_edition,
@@ -736,15 +940,168 @@ def _me(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# The organization and its admins (shared/govern/org.py)
+# ---------------------------------------------------------------------------
+
+
+def _org_response(user: GovernUser, record: dict[str, Any] | None) -> dict[str, Any]:
+    tenant = user.caller.tenant_id
+    out = org.view(record, tenant, user.caller.sub)
+    out["name"] = ((workflow.get_settings(tenant).get("organization") or {}).get("name"))
+    if out["you"]["isAdmin"]:
+        # Who can be made an admin (people who signed in here) and the trail.
+        out["members"] = org.members(tenant)
+        out["activity"] = [org.audit_view(e) for e in store.config.org_audit(tenant)]
+    return _ok(out)
+
+
+def _get_org(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
+    return _org_response(user, user.ensure_org())
+
+
+def _rev_arg(raw: Any) -> int | None:
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str) and raw.isdigit() and len(raw) <= 9:
+        return int(raw)
+    raise workflow.BadRequest("rev must be a whole number")
+
+
+def _add_org_admin(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
+    _require_admin(user)
+    body = _body(event)
+    unknown = set(body) - {"email", "rev"}
+    if unknown:
+        raise workflow.BadRequest(f"Unknown field(s): {', '.join(sorted(unknown))}")
+    record = org.add_admin(user.caller.tenant_id, user.actor, body.get("email"), _rev_arg(body.get("rev")))
+    return _org_response(user, record)
+
+
+def _remove_org_admin(event: dict[str, Any], user: GovernUser, sub: str) -> dict[str, Any]:
+    _require_admin(user)
+    if not _SUB_RE.fullmatch(sub):
+        raise workflow.NotFound("That person is not an admin of this organization")
+    rev = _rev_arg((event.get("queryStringParameters") or {}).get("rev"))
+    record = org.remove_admin(user.caller.tenant_id, user.actor, sub, rev)
+    return _org_response(user, record)
+
+
+def _people(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
+    """People the caller can reasonably assign or share with: members (and
+    owners) of the projects they belong to, the workspace's reviewers, and
+    owners of the contracts they can see — plus the caller. Nothing outside
+    what the caller can already see is listed."""
+    found: dict[str, dict[str, Any]] = {}
+
+    def add(email: Any, name: Any, source: str | None) -> None:
+        from shared.access import normalise_email
+
+        address = normalise_email(email)
+        if not address:
+            return
+        p = found.setdefault(address, {"email": address, "name": None, "sources": set()})
+        if not p["name"] and isinstance(name, str) and name.strip():
+            p["name"] = name.strip()[:200]
+        if source:
+            p["sources"].add(source)
+
+    roles = user.caller.project_roles()
+    for project in ddb.get_projects(list(roles)):
+        add(project.get("ownerEmail"), None, "project")
+        for member in ddb.list_project_members(project["projectId"]):
+            add(member.get("email"), member.get("name"), "project")
+    for reviewer in workflow.get_settings(user.caller.tenant_id).get("reviewers") or []:
+        add(reviewer.get("email"), reviewer.get("name"), "reviewer")
+    contracts, _docs = _visible_contracts(user, create_missing=False)
+    for c in contracts:
+        owner = c.get("owner") or {}
+        add(owner.get("email"), owner.get("name"), "owner")
+    me = user.person or {}
+    add(me.get("email"), me.get("name"), None)
+
+    people = sorted(found.values(), key=lambda p: (p["name"] is None, (p["name"] or "").lower(), p["email"]))
+    return _ok({"people": [{"email": p["email"], "name": p["name"],
+                            "sources": [s for s in _PEOPLE_SOURCES if s in p["sources"]]}
+                           for p in people[:_MAX_PEOPLE]]})
+
+
+# ---------------------------------------------------------------------------
+# Saved views (shared/govern/views.py)
+# ---------------------------------------------------------------------------
+
+
+def _list_views(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
+    module = (event.get("queryStringParameters") or {}).get("module")
+    return _ok({"views": views.list_views(user.caller.tenant_id, module, user.caller.sub, user.caller.email)})
+
+
+def _create_view(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
+    view = views.create_view(user.caller.tenant_id, _body(event), user.caller.sub, user.person)
+    return _ok({"view": view}, 201)
+
+
+def _patch_view(event: dict[str, Any], user: GovernUser, view_id: str) -> dict[str, Any]:
+    view = views.update_view(user.caller.tenant_id, view_id, _body(event), user.caller.sub, user.caller.email)
+    return _ok({"view": view})
+
+
+def _delete_view(event: dict[str, Any], user: GovernUser, view_id: str) -> dict[str, Any]:
+    deleted = views.delete_view(user.caller.tenant_id, view_id, user.caller.sub, user.caller.email)
+    return _ok({"deleted": True, "id": deleted})
+
+
+# ---------------------------------------------------------------------------
+# Automations (shared/govern/automations.py)
+# ---------------------------------------------------------------------------
+
+
+def _list_automations(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
+    tenant = user.caller.tenant_id
+    rules = automations.list_rules(tenant)
+    return _ok({"automations": rules, "count": len(rules), "limit": automations.MAX_RULES,
+                "enabled": automations.enabled_for(tenant)})
+
+
+def _create_automation(event: dict[str, Any], user: GovernUser) -> dict[str, Any]:
+    _require_admin(user)
+    workflow.require_feature(automations.FEATURE, "Automations")
+    return _ok({"automation": automations.create_rule(user.caller.tenant_id, _body(event), user.person)}, 201)
+
+
+def _patch_automation(event: dict[str, Any], user: GovernUser, rule_id: str) -> dict[str, Any]:
+    _require_admin(user)
+    workflow.require_feature(automations.FEATURE, "Automations")
+    return _ok({"automation": automations.update_rule(user.caller.tenant_id, rule_id, _body(event), user.person)})
+
+
+def _delete_automation(event: dict[str, Any], user: GovernUser, rule_id: str) -> dict[str, Any]:
+    _require_admin(user)
+    return _ok({"deleted": True, "id": automations.delete_rule(user.caller.tenant_id, rule_id)})
+
+
+def _test_automation(event: dict[str, Any], user: GovernUser, rule_id: str) -> dict[str, Any]:
+    tenant = user.caller.tenant_id
+    rule, contract_id = automations.resolve_for_test(tenant, rule_id, _body(event))
+    contract, _role = _contract_for(contract_id, user, "view")
+    return _ok({"result": automations.dry_run(tenant, rule, contract)})
+
+
+# ---------------------------------------------------------------------------
 # Route table (order matters: literal segments before wildcards)
 # ---------------------------------------------------------------------------
 
 _SEG = r"([^/]+)"
 _RAW_ROUTES: list[tuple[tuple[str, str], Callable[..., dict[str, Any]]]] = [
     (("GET", r"/govern/me"), _me),
+    (("GET", r"/govern/org"), _get_org),
+    (("POST", r"/govern/org/admins"), _add_org_admin),
+    (("DELETE", rf"/govern/org/admins/{_SEG}"), _remove_org_admin),
     (("GET", r"/contracts"), _list_contracts),
     (("GET", r"/obligations"), _list_obligations),
     (("POST", r"/contracts"), _create_contract),
+    (("POST", r"/contracts/bulk"), _bulk_update),
     (("GET", rf"/contracts/{_SEG}"), _get_contract),
     (("PATCH", rf"/contracts/{_SEG}"), _patch_contract),
     (("DELETE", rf"/contracts/{_SEG}"), _delete_contract),
@@ -756,6 +1113,10 @@ _RAW_ROUTES: list[tuple[tuple[str, str], Callable[..., dict[str, Any]]]] = [
     (("PATCH", rf"/contracts/{_SEG}/obligations/{_SEG}"), _edit_obligation),
     (("PUT", rf"/contracts/{_SEG}/income"), _put_income),
     (("GET", rf"/contracts/{_SEG}/revision-upload-url"), _revision_upload_url),
+    (("GET", rf"/contracts/{_SEG}/activity"), _contract_activity),
+    (("GET", rf"/contracts/{_SEG}/portal-links"), _list_portal_links),
+    (("POST", rf"/contracts/{_SEG}/portal-links"), _create_portal_link),
+    (("DELETE", rf"/contracts/{_SEG}/portal-links/{_SEG}"), _revoke_portal_link),
     (("GET", r"/matrix"), _get_matrix),
     (("PUT", r"/matrix"), _put_matrix),
     (("POST", r"/matrix/import"), _import_matrix),
@@ -769,6 +1130,16 @@ _RAW_ROUTES: list[tuple[tuple[str, str], Callable[..., dict[str, Any]]]] = [
     (("POST", rf"/integrations/{_SEG}/sync"), _sync_integration),
     (("GET", r"/reports/trends"), _trends),
     (("GET", r"/reports/capture"), _capture_report),
+    (("GET", r"/govern/people"), _people),
+    (("GET", r"/views"), _list_views),
+    (("POST", r"/views"), _create_view),
+    (("PATCH", rf"/views/{_SEG}"), _patch_view),
+    (("DELETE", rf"/views/{_SEG}"), _delete_view),
+    (("GET", r"/automations"), _list_automations),
+    (("POST", r"/automations"), _create_automation),
+    (("PATCH", rf"/automations/{_SEG}"), _patch_automation),
+    (("DELETE", rf"/automations/{_SEG}"), _delete_automation),
+    (("POST", rf"/automations/{_SEG}/test"), _test_automation),
 ]
 _ROUTES = [((method, re.compile(pattern)), fn) for (method, pattern), fn in _RAW_ROUTES]
 

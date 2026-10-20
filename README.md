@@ -63,8 +63,8 @@ Step Functions ── Persist ──► PutEvents "Document Analysed" ──► 
 platform bus ─► SQS ─► govern-intake     (contract, matrix review, revisions, auto-assign)
              ─► SQS ─► govern-notifier   (SES email, Teams card)
              ─► SQS ─► govern-connectors (Huron push-back; daily Huron / Workday pulls)
-govern-activity stream ─► govern-stream  (Govern.* events + trend aggregates)
-Scheduler hourly ─► govern-sweeper       (SLA overdue, obligations due, capture reconciliation)
+govern-activity stream ─► govern-stream  (Govern.* events + trend aggregates + event automations)
+Scheduler hourly ─► govern-sweeper       (SLA overdue, obligations due, capture reconciliation, time automations)
 API Gateway ─► govern-api  (JWT)  ·  POST /webhooks/{provider} ─► govern-webhooks (HMAC, no JWT)
 
 DynamoDB: govern-contracts · govern-activity (append-only, stream) · govern-config ·
@@ -84,6 +84,7 @@ grading is deterministic (`shared/govern/matrix.py`, no model call).
 | `GET·PUT /workflow/settings` | SLA targets, reviewers, assignment and routing rules, alerts (admin writes) |
 | `GET /integrations`, `PUT /integrations/{id}`, `POST /integrations/{id}/sync`, `GET /integrations/sync-log`, `GET /integrations/unmatched` | connectors (admin) |
 | `GET /reports/trends`, `GET /reports/capture` | write-time trend aggregates; capture gaps and missed documents |
+| `GET·POST /automations`, `PATCH·DELETE /automations/{id}`, `POST /automations/{id}/test` | automation rules: trigger → conditions → actions (admin writes; dry run) |
 | `POST /webhooks/docusign` | DocuSign Connect (HMAC-SHA256, 5-minute replay window) |
 
 ## Layout

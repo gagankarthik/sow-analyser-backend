@@ -109,3 +109,13 @@ def test_payment_is_missing_when_no_clause_states_it():
     clauses = [{"id": "c1", "number": "1", "title": "Scope", "category": "ScopeOfWork",
                 "body": "Vendor shall build the portal."}]
     assert _review("sow", clauses)["Payment"]["tier"] == "missing"
+
+
+def test_a_services_engagement_the_model_reads_as_a_sow_is_graded_as_one():
+    # "Website Design & Development for ..." has no "statement of work" in its
+    # title; the model's own reading decides, instead of falling to "other".
+    meta = {"title": "Website Design & Development for OceanBlue Solutions", "docType": "OTHER"}
+    assert matrix.infer_agreement_type(meta, {"agreement": {"agreementType": "sow"}}) == "sow"
+    assert matrix.infer_agreement_type(meta, {"agreement": {"agreementType": "msa"}}) == "msa"
+    from stages.classify_prompts import AGREEMENT_KINDS
+    assert {"sow", "msa", "staffing", "subcontract"} <= set(AGREEMENT_KINDS)

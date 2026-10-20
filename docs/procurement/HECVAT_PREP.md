@@ -61,7 +61,7 @@ Prepared 2026-10-08. This is a working draft to fill in the official EDUCAUSE HE
 |---|---|---|---|
 | SSO via SAML 2.0 (Shibboleth / InCommon) | **No** | Planned (`SSO_SHIBBOLETH.md`) | Implement before pilot |
 | MFA | TBC | Cognito pool managed outside Terraform | Confirm; with SSO, MFA is enforced at the the customer IdP |
-| Role-based access control | Yes | owner/editor/viewer per project; govern-admin/reviewer/leader | `GOVERN_OPEN_ADMIN` defaults to false |
+| Role-based access control | Yes | owner/editor/viewer per project; per-organization admins (creator + added admins); reviewer/leader groups | no everyone-is-admin switch |
 | Least privilege for service accounts | Partial | Per-function roles, resource-scoped (`iam.tf`) | Remove `appsync:GraphQL apis/*` from rag role (Govern roles in `govern.tf`) |
 | Session management / token lifetime | TBC | Cognito defaults | Set 60-min ID/access tokens, revocation on (SSO plan §3) |
 | Audit logging of user actions | Partial | Govern `govern-activity` append-only log (conditional put, never updated) | API access log lacks caller identity; add it. Confirm IAM put-only and PITR on activity table |

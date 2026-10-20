@@ -43,13 +43,20 @@ def contract(sub=OWNER, cid="lic-1", **kw):
 def test_me_reports_the_govern_role(world, monkeypatch):
     me = call("GET", "/govern/me", OWNER)[1]
     skip = {"features", "deploymentFeatures", "edition", "defaultEdition", "agreementTypes"}
-    assert {k: v for k, v in me.items() if k not in skip} == {"email": EMAIL[OWNER], "name": "Dana Ruiz",
-                                                             "role": "admin", "tenantId": f"u-{OWNER}"}
-    assert set(me["features"]) == {"routingRules", "docusign", "notifications", "obligations", "exports", "integrations"}
-    assert call("GET", "/govern/me", OWNER, groups=["govern-leader"])[1]["role"] == "leader"
-    assert call("GET", "/govern/me", OWNER, groups="[govern-reviewer other]")[1]["role"] == "reviewer"
-    monkeypatch.setattr(settings, "govern_open_admin", False)
-    assert call("GET", "/govern/me", OWNER)[1]["role"] == "reviewer"
+    assert {k: v for k, v in me.items() if k not in skip} == {
+        "email": EMAIL[OWNER], "name": "Dana Ruiz", "role": "admin", "tenantId": f"u-{OWNER}",
+        "isAdmin": True, "isCreator": True, "isLeader": False}
+    assert set(me["features"]) == {"routingRules", "docusign", "notifications", "obligations", "exports", "integrations",
+                                 "automations"}
+    # In a shared organization someone else created, the groups give the role.
+    assert call("GET", "/govern/me", OWNER, tenant="acme")[1]["isCreator"] is True
+    leader = call("GET", "/govern/me", EDITOR, groups=["govern-leader"], tenant="acme")[1]
+    assert (leader["role"], leader["isLeader"], leader["isAdmin"]) == ("leader", True, False)
+    assert call("GET", "/govern/me", EDITOR, groups="[govern-reviewer other]", tenant="acme")[1]["role"] == "reviewer"
+    assert call("GET", "/govern/me", EDITOR, tenant="acme")[1]["role"] == "reviewer"
+    # The pool-wide govern-admin group is not admin of this organization.
+    me = call("GET", "/govern/me", EDITOR, groups=["govern-admin"], tenant="acme")[1]
+    assert (me["role"], me["isAdmin"], me["isCreator"]) == ("reviewer", False, False)
 
 
 def test_contract_visibility_follows_the_document(world):
@@ -100,14 +107,17 @@ def test_admin_routes_need_the_admin_role(world, monkeypatch):
     for method, path, body in (("PUT", "/matrix", {"playbooks": {}}), ("PUT", "/workflow/settings", {}),
                                ("GET", "/integrations", None), ("PUT", "/integrations/huron", {"enabled": True}),
                                ("POST", "/integrations/workday/sync", {}), ("POST", "/matrix/import", {})):
-        status, out = call(method, path, OWNER, body, groups=["govern-reviewer"])
+        # EDITOR signs in to OWNER's workspace: a member, not its admin.
+        status, out = call(method, path, EDITOR, body, groups=["govern-reviewer"], tenant=f"u-{OWNER}")
         assert (status, out["code"]) == (403, "forbidden"), path
-    monkeypatch.setattr(settings, "govern_open_admin", False)
-    assert call("GET", "/integrations", OWNER)[0] == 403
-    assert call("GET", "/integrations", OWNER, groups=["govern-admin"])[0] == 200
-    assert call("GET", "/matrix", OWNER)[0] == 200                    # reading is open to everyone
-    assert call("GET", "/reports/trends", OWNER)[0] == 403
-    assert call("GET", "/reports/trends", OWNER, groups=["govern-leader"])[0] == 200
+        status, out = call(method, path, EDITOR, body, groups=["govern-admin"], tenant=f"u-{OWNER}")
+        assert (status, out["code"]) == (403, "forbidden"), path
+    assert call("GET", "/integrations", EDITOR, tenant=f"u-{OWNER}")[0] == 403
+    assert call("GET", "/integrations", OWNER)[0] == 200                  # the workspace's own user
+    assert call("GET", "/matrix", EDITOR, tenant=f"u-{OWNER}")[0] == 200  # reading is open to everyone
+    assert call("GET", "/reports/trends", EDITOR, tenant=f"u-{OWNER}")[0] == 403
+    assert call("GET", "/reports/trends", EDITOR, groups=["govern-leader"], tenant=f"u-{OWNER}")[0] == 200
+    assert call("GET", "/reports/trends", OWNER)[0] == 200
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +194,79 @@ def test_revision_upload_creates_a_linked_pending_document(world, ddb, monkeypat
     assert c["versionDocIds"] == ["lic-1", new_id] and c["analysisStatus"] == "PENDING"
     assert call("GET", "/contracts/lic-1/revision-upload-url", VIEWER, qs={"filename": "a.pdf"})[0] == 403
     assert call("GET", "/contracts/lic-1/revision-upload-url", EDITOR, qs={"filename": "a.exe"})[0] == 400
+
+
+# ---------------------------------------------------------------------------
+# Activity: the newest 20 on the contract, older ones by page
+# ---------------------------------------------------------------------------
+
+
+def test_contract_detail_sends_the_newest_activity_with_a_count(world):
+    small = contract()
+    assert small["activityCount"] == len(small["activity"]) and small["activityHasMore"] is False
+    assert small["activityCursor"] is None
+    for i in range(30):
+        assert call("POST", "/contracts/lic-1/actions", VIEWER, {"action": "comment", "text": f"note {i}"})[0] == 200
+    c = contract()
+    total = small["activityCount"] + 30
+    assert len(c["activity"]) == 20 and c["activityCount"] == total and c["activityHasMore"] is False
+    assert c["activity"][0]["action"] == "comment" and "note 29" in c["activity"][0]["summary"]
+    assert [a["at"] for a in c["activity"]] == sorted((a["at"] for a in c["activity"]), reverse=True)
+    assert c["activityCursor"]
+
+    # Paging from the detail's cursor continues exactly where it stopped.
+    status, page = call("GET", "/contracts/lic-1/activity", VIEWER, qs={"before": c["activityCursor"], "limit": "5"})
+    assert status == 200 and len(page["entries"]) == 5 and page["nextCursor"]
+    seen = [a["id"] for a in c["activity"]] + [a["id"] for a in page["entries"]]
+    cursor = page["nextCursor"]
+    while cursor:
+        status, page = call("GET", "/contracts/lic-1/activity", VIEWER, qs={"before": cursor, "limit": "100"})
+        assert status == 200
+        seen += [a["id"] for a in page["entries"]]
+        cursor = page["nextCursor"]
+    assert len(seen) == total and len(set(seen)) == total
+
+    # The first page without a cursor is the newest entries.
+    status, first = call("GET", "/contracts/lic-1/activity", VIEWER)
+    assert status == 200 and [a["id"] for a in first["entries"]][:20] == [a["id"] for a in c["activity"]]
+    assert set(first["entries"][0]) == {"id", "at", "actor", "action", "fromStage", "toStage", "summary", "detail"}
+
+
+def test_activity_count_is_capped_and_says_there_is_more(world, monkeypatch):
+    from govern_api import handler as api
+
+    monkeypatch.setattr(api, "_ACTIVITY_COUNT_CAP", 10)
+    for i in range(12):
+        call("POST", "/contracts/lic-1/actions", VIEWER, {"action": "comment", "text": f"note {i}"})
+    c = contract()
+    assert c["activityCount"] == 10 and c["activityHasMore"] is True and len(c["activity"]) == 10
+    assert c["activityCursor"] is None          # every entry read is shown; the count cap is below 20 here
+
+
+def test_detail_keeps_the_latest_send_back_for_the_redline(world):
+    call("POST", "/contracts/lic-1/actions", OWNER, {"action": "assign", "owner": DANA})
+    clauses = [{"clauseType": "governing_law", "label": "Governing law", "suggestedLanguage": "Ohio law."}]
+    assert call("POST", "/contracts/lic-1/actions", OWNER, {"action": "send_back", "clauses": clauses})[0] == 200
+    for i in range(25):
+        call("POST", "/contracts/lic-1/actions", VIEWER, {"action": "comment", "text": f"note {i}"})
+    c = contract()
+    assert len(c["activity"]) == 21 and c["activity"][-1]["action"] == "sent_back"
+    assert c["activity"][-1]["detail"]["clauses"] == clauses
+    assert all(a["action"] == "comment" for a in c["activity"][:20])
+
+
+def test_activity_pages_check_access_and_the_limit(world):
+    assert call("GET", "/contracts/lic-1/activity", OUTSIDER)[0] == 404
+    assert call("GET", "/contracts/nope/activity", OWNER)[0] == 404
+    for bad in ("0", "101", "ten", "-3"):
+        status, body = call("GET", "/contracts/lic-1/activity", OWNER, qs={"limit": bad})
+        assert (status, body["code"]) == (400, "bad_request"), bad
+    assert call("GET", "/contracts/lic-1/activity", OWNER, qs={"before": "x" * 300})[0] == 400
+    status, body = call("GET", "/contracts/lic-1/activity", OWNER, qs={"limit": "100"})
+    assert status == 200 and body["nextCursor"] is None and body["entries"]
+    status, body = call("GET", "/contracts/lic-1/activity", OWNER, qs={"before": "0000"})
+    assert status == 200 and body == {"entries": [], "nextCursor": None}
+    assert call("POST", "/contracts/lic-1/activity", OWNER, {})[0] == 405
 
 
 # ---------------------------------------------------------------------------
@@ -359,13 +442,12 @@ def test_unknown_routes_and_methods(world):
     assert status == 400
 
 
-def test_open_admin_is_off_unless_the_stage_turns_it_on(monkeypatch):
+def test_there_is_no_open_admin_switch(monkeypatch):
+    """GOVERN_OPEN_ADMIN (everyone-is-admin on dev) is gone: setting it grants nothing."""
     from shared.config import Settings
 
-    monkeypatch.delenv("GOVERN_OPEN_ADMIN", raising=False)
-    assert Settings().govern_open_admin is False
     monkeypatch.setenv("GOVERN_OPEN_ADMIN", "true")
-    assert Settings().govern_open_admin is True
+    assert not hasattr(Settings(), "govern_open_admin")
 
 
 def test_portfolio_obligations_list(world):
@@ -465,9 +547,10 @@ def test_edition_comes_from_the_organization_and_changes_the_vocabulary(world, m
     assert me["edition"] == "workforce"
     ids = [t["id"] for t in me["agreementTypes"]]
     assert ids[:3] == ["sow", "msa", "staffing"] and "sponsored_research" not in ids
-    # A reviewer cannot change it; clearing it falls back to the default.
-    assert call("PUT", "/workflow/settings", OWNER, groups=["govern-reviewer"],
+    # A member who is not its admin cannot change it; clearing it falls back to the default.
+    assert call("PUT", "/workflow/settings", EDITOR, groups=["govern-reviewer"], tenant=f"u-{OWNER}",
                 body={"organization": {"edition": "campus"}})[0] == 403
+    assert call("GET", "/govern/me", OWNER)[1]["edition"] == "workforce"
     assert call("PUT", "/workflow/settings", OWNER, body={"organization": {"edition": None}})[0] == 200
     assert call("GET", "/govern/me", OWNER)[1]["edition"] == "campus"
     assert call("PUT", "/workflow/settings", OWNER, body={"organization": {"edition": "enterprise"}})[0] == 400

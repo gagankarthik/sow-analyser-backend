@@ -31,7 +31,7 @@ log = get_logger("blue-iq.govern-connectors")
 tracer = Tracer(service="blue-iq.govern-connectors")
 
 
-@tracer.capture_lambda_handler
+@tracer.capture_lambda_handler(capture_response=False)   # no tenant data in X-Ray metadata
 @log.inject_lambda_context(log_event=False)
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if isinstance(event, dict) and "Records" in event:
