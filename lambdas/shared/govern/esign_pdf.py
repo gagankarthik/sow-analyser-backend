@@ -205,6 +205,19 @@ def flatten(source: bytes, fields: Iterable[dict[str, Any]], images: dict[str, b
 # ---------------------------------------------------------------------------
 
 
+def _when(value: Any) -> str:
+    """``2026-10-23T14:25:09Z`` → ``October 23, 2026, 2:25:09 PM UTC`` (unparsable values as given)."""
+    from datetime import datetime, timezone
+
+    text = str(value or "")
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return text
+    hour = dt.strftime("%I").lstrip("0") or "12"
+    return f"{dt.strftime('%B')} {dt.day}, {dt.year}, {hour}:{dt.strftime('%M:%S %p')} UTC"
+
+
 def certificate(*, envelope: dict[str, Any], organization: str | None, source_sha256: str,
                 signed_sha256: str, signatures: dict[str, bytes], completed_at: str) -> bytes:
     """The certificate-of-completion page(s) as a PDF.
@@ -262,7 +275,7 @@ def certificate(*, envelope: dict[str, Any], organization: str | None, source_sh
     if organization:
         line(f"Sent by: {organization}")
     line(f"Envelope ID: {envelope.get('envelopeId')}")
-    line(f"Pages: {envelope.get('source', {}).get('pageCount')}  ·  Completed: {completed_at}")
+    line(f"Pages: {envelope.get('source', {}).get('pageCount')}  ·  Completed: {_when(completed_at)}")
     line(f"Original document SHA-256: {source_sha256}", size=8.5)
     line(f"Signed document SHA-256 (before this certificate): {signed_sha256}", size=8.5, gap=22)
     rule()
@@ -279,7 +292,7 @@ def certificate(*, envelope: dict[str, Any], organization: str | None, source_sh
                   ("Agreed to electronic records", r.get("consentAt")), ("Signed", r.get("signedAt"))]
         for label, at in events:
             if at:
-                line(f"{label}: {at}", size=9, gap=12.5)
+                line(f"{label}: {_when(at)}", size=9, gap=12.5)
         if r.get("ip"):
             line(f"IP address: {r.get('ip')}", size=9, gap=12.5)
         if r.get("userAgent"):
