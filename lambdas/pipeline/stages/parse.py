@@ -254,7 +254,13 @@ def _parse_pdf(
             by_page = {p["page"]: p["text"] for p in ocr["pages"]}
             recovered = []
             for p in pages:
-                if p["page"] in need_ocr and len(by_page.get(p["page"], "").strip()) > len(p["text"].strip()):
+                if p["page"] not in need_ocr:
+                    continue
+                ocr_text = by_page.get(p["page"], "").strip()
+                # A rotated page's text layer reads as reversed words about as
+                # long as the real text, so "OCR is longer" would keep the
+                # garbage; for those, any OCR text wins.
+                if ocr_text and (p.get("rotated") or len(ocr_text) > len(p["text"].strip())):
                     p["text"] = by_page[p["page"]]
                     recovered.append(p["page"])
             stats["ocrPages"] = recovered
@@ -272,6 +278,7 @@ def _parse_pdf(
             )
     for p in pages:
         p.pop("needs_ocr", None)
+        p.pop("rotated", None)
         p.pop("columns", None)
     stats["headerFooterLinesRemoved"] = strip_repeating_lines(pages)
     return {"text": "\n\n".join(p["text"] for p in pages), "pages": pages}, ExtractionMethod.PDFPLUMBER
@@ -320,14 +327,15 @@ def _extract_pdf_page(page: Any) -> dict[str, Any]:
     else:
         text = (page.extract_text() or "").strip()
 
-    needs_ocr = False
+    needs_ocr = rotated = False
     if len(text) < SPARSE_PAGE_CHARS and _image_coverage(page, width, height) >= SCANNED_IMAGE_COVERAGE:
         needs_ocr = True
     else:
         chars = getattr(page, "chars", None) or []
         if len(chars) >= 40 and sum(1 for c in chars if c.get("upright") is False) / len(chars) > 0.5:
-            needs_ocr = True          # rotated text: the text layer reads as garbage
-    return {"text": text, "char_count": len(text), "needs_ocr": needs_ocr, "columns": bool(layout)}
+            needs_ocr = rotated = True    # rotated text: the text layer reads as garbage
+    return {"text": text, "char_count": len(text), "needs_ocr": needs_ocr, "rotated": rotated,
+            "columns": bool(layout)}
 
 
 def _has_tables(page: Any) -> bool:
@@ -517,13 +525,18 @@ def _textract_async(bucket: str, key: str) -> dict[str, Any]:
             raise TimeoutError(f"Textract job {job_id} timed out after {TEXTRACT_MAX_WAIT_S}s")
         time.sleep(TEXTRACT_POLL_INTERVAL_S)
         waited += TEXTRACT_POLL_INTERVAL_S
-        status  = tx.get_document_text_detection(JobId=job_id, MaxResults=1)["JobStatus"]
+        polled  = tx.get_document_text_detection(JobId=job_id, MaxResults=1)
+        status  = polled["JobStatus"]
         if status != "IN_PROGRESS":
             break
 
     # PARTIAL_SUCCESS still carries the pages that were read; discarding them
     # would turn "one bad page" into "no document".
     if status not in ("SUCCEEDED", "PARTIAL_SUCCESS"):
+        # Textract's own reason (e.g. an unsupported or encrypted PDF) — it names
+        # the failure, never the document's text.
+        log.warning("textract.failed", jobId=job_id, status=status,
+                    statusMessage=str(polled.get("StatusMessage") or "")[:200])
         raise RuntimeError(f"Textract job {job_id} failed with status: {status}")
 
     blocks: list[dict[str, Any]] = []

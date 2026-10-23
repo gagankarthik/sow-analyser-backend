@@ -360,6 +360,56 @@ def test_fully_scanned_pdf_goes_to_ocr_and_partial_success_is_kept(monkeypatch, 
     assert warnings == ["Text recognition could not read every page of this scan."]
 
 
+def test_rotated_page_takes_the_ocr_text_even_when_it_is_not_longer(monkeypatch, no_wait):
+    """pdfplumber reads a rotated page as reversed words about as long as the real
+    text; the OCR text must replace it, not be rejected for being shorter."""
+    garbage = "\n".join(["ehT", "reilppuS", "llahs", "reviled", "eht", "secivres"] * 8)
+    pages = [_Page(text="1. Scope\n" + "The supplier shall deliver the services. " * 10),
+             _Page(text=garbage, chars=[{"upright": False}] * 60)]
+    _fake_pdfplumber(monkeypatch, pages)
+    ocr_line = "The Supplier shall deliver the services"
+    assert len(ocr_line) < len(garbage)
+    monkeypatch.setattr(parse, "textract_client", lambda: _Textract({2: [ocr_line]}))
+    warnings, stats = [], {}
+    extracted, _ = parse._parse_pdf(b"%PDF-", "raw", "key", warnings, stats)
+    assert extracted["pages"][1]["text"] == ocr_line
+    assert stats["ocrPages"] == [2] and warnings == []
+    assert "rotated" not in extracted["pages"][1]                     # internal flag not persisted
+
+
+class _PagedTextract(_Textract):
+    """Results split across NextToken pages, blocks not in page order, plus WORD
+    blocks that must not be counted twice."""
+
+    def get_document_text_detection(self, **kw):
+        if kw.get("MaxResults") == 1:
+            return {"JobStatus": self.status}
+        line = lambda n, t: {"BlockType": "LINE", "Page": n, "Text": t}
+        word = lambda n, t: {"BlockType": "WORD", "Page": n, "Text": t}
+        chunks = {None: ([line(1, "Page one, line one"), word(1, "Page")], "t1"),
+                  "t1": ([line(3, "Page three"), line(1, "Page one, line two")], "t2"),
+                  "t2": ([line(2, "Page two"), word(2, "two")], None)}
+        blocks, token = chunks[kw.get("NextToken")]
+        return {"JobStatus": self.status, "Blocks": blocks, **({"NextToken": token} if token else {})}
+
+
+def test_textract_collects_every_result_page_in_page_order(monkeypatch, no_wait):
+    monkeypatch.setattr(parse, "textract_client", lambda: _PagedTextract({}))
+    out = parse._textract_async("raw", "key")
+    assert [p["page"] for p in out["pages"]] == [1, 2, 3]
+    assert out["pages"][0]["text"] == "Page one, line one\nPage one, line two"
+    assert out["text"] == "Page one, line one\nPage one, line two\n\nPage two\n\nPage three"
+
+
+def test_failed_or_slow_textract_job_raises_instead_of_returning_empty_text(monkeypatch, no_wait):
+    monkeypatch.setattr(parse, "textract_client", lambda: _Textract({}, status="FAILED"))
+    with pytest.raises(RuntimeError, match="FAILED"):
+        parse._textract_async("raw", "key")
+    monkeypatch.setattr(parse, "textract_client", lambda: _Textract({}, status="IN_PROGRESS"))
+    with pytest.raises(TimeoutError):
+        parse._textract_async("raw", "key")
+
+
 # ── The stage as a whole ─────────────────────────────────────────────────────
 
 DOC = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
