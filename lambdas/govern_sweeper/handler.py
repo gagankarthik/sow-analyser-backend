@@ -31,7 +31,7 @@ from aws_lambda_powertools import Tracer
 from shared import aws
 from shared.config import settings
 from shared.dynamodb import list_tenant_docs
-from shared.govern import automations, capture, store, workflow
+from shared.govern import automations, capture, esign, store, workflow
 from shared.logger import get_logger, safe_trace
 
 log = get_logger("blue-iq.govern-sweeper")
@@ -50,7 +50,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
 def sweep(now: datetime) -> dict[str, Any]:
     totals = {"tenants": 0, "overdue": 0, "termMoves": 0, "obligations": 0, "requeued": 0, "missed": 0,
-              "automations": 0, "failedTenants": 0}
+              "automations": 0, "signing": 0, "failedTenants": 0}
     for tenant_id in store.config.tenants():
         totals["tenants"] += 1
         try:
@@ -60,7 +60,7 @@ def sweep(now: datetime) -> dict[str, Any]:
                       trace=safe_trace(exc))
             totals["failedTenants"] += 1
             continue
-        for k in ("overdue", "termMoves", "obligations", "requeued", "missed", "automations"):
+        for k in ("overdue", "termMoves", "obligations", "requeued", "missed", "automations", "signing"):
             totals[k] += result[k]
     log.info("govern_sweeper.done", **totals)
     if totals["failedTenants"]:
@@ -83,6 +83,7 @@ def sweep_tenant(tenant_id: str, now: datetime) -> dict[str, int]:
         if c.get("state") in ("signed", "active") and c.get("termEndDate"):
             term_moves += int(workflow.advance_term(c["contractId"], now=now) is not None)
     obligations = _sweep_obligations(tenant_id, now)
+    signing = _sweep_signing(contracts, now)
     requeued, missed = reconcile(tenant_id, contracts, now)
     # Last, so a failing rule never holds up the reminders and the reconciliation.
     auto = automations.run_time_rules(tenant_id, store.contracts.for_tenant(tenant_id) if term_moves else contracts,
@@ -90,7 +91,21 @@ def sweep_tenant(tenant_id: str, now: datetime) -> dict[str, int]:
     if auto["failed"]:
         raise RuntimeError(f"{auto['failed']} automation firing(s) failed; the next sweep retries them")
     return {"overdue": overdue, "termMoves": term_moves, "obligations": obligations, "requeued": requeued,
-            "missed": missed, "automations": auto["fired"]}
+            "missed": missed, "automations": auto["fired"], "signing": signing}
+
+
+def _sweep_signing(contracts: list[dict[str, Any]], now: datetime) -> int:
+    """Govern e-signature: expire envelopes past their date, remind signers
+    whose turn it is (shared/govern/esign.py ``sweep_contract``)."""
+    done = 0
+    for c in contracts:
+        if c.get("state") != "out_for_signature":
+            continue
+        try:
+            done += int(esign.sweep_contract(c, now) is not None)
+        except Exception as exc:  # noqa: BLE001 — one envelope must not stop the sweep
+            log.error("govern_sweeper.signing_failed", contractId=c.get("contractId"), error_type=type(exc).__name__)
+    return done
 
 
 def _sweep_obligations(tenant_id: str, now: datetime) -> int:

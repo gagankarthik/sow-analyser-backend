@@ -192,6 +192,12 @@ variable "notify_from_email" {
   default     = ""
 }
 
+variable "signing_tsa_url" {
+  description = "RFC 3161 timestamp authority for Govern e-signature seals (empty = no timestamp)."
+  type        = string
+  default     = "http://timestamp.digicert.com"
+}
+
 variable "app_base_url" {
   description = "Web app base URL used in alert links."
   type        = string

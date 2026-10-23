@@ -10,6 +10,13 @@ botocore==1.35.36
 pdfplumber==0.11.9
 python-docx==1.1.2
 
+# ── Govern e-signature (docs/GOVERN_ESIGN.md) ───────────────────────────────
+# pyHanko: PAdES sealing with an external (KMS) signer · pypdf: page merging ·
+# reportlab: field overlays and the certificate of completion. MIT / BSD.
+pyhanko==0.25.3
+pypdf==5.1.0
+reportlab==4.2.5
+
 # ── OpenAI ───────────────────────────────────────────────────────────────────
 # httpx must be pinned explicitly: we import it directly in openai_client.py to
 # work around the aws-xray-sdk monkey-patch incompatibility (see that file).

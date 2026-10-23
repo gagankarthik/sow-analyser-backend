@@ -89,6 +89,12 @@ def sqs_client() -> Any:
 
 
 @lru_cache(maxsize=None)
+def kms_client() -> Any:
+    """KMS — govern-seal signs digests with the e-signature key (never exported)."""
+    return session().client("kms", config=_BOTO_CONFIG.merge(_SHORT_TIMEOUTS))
+
+
+@lru_cache(maxsize=None)
 def ses_client() -> Any:
     """SES v2 for alert email (its region may differ from the stack's)."""
     return session().client("sesv2", region_name=settings.ses_region or settings.aws_region,

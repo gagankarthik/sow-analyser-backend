@@ -1554,12 +1554,90 @@ def perform_action(contract_id: str, action: str, body: dict[str, Any], actor: d
             e["detail"] = {**(e.get("detail") or {}), **detail_tag}
         return result
 
+    before_sig = None
+    if action in _LEAVES_SIGNATURE:
+        before = store.contracts.get(contract_id)
+        before_sig = (before or {}).get("signature") if (before or {}).get("state") == "out_for_signature" else None
     stored, _ = _commit(contract_id, tagged)
+    if before_sig and before_sig.get("provider") == ESIGN_PROVIDER and stored.get("state") != "out_for_signature":
+        # The contract left signature another way (reopened, rejected, marked
+        # signed by hand): the Govern envelope must not stay open with live links.
+        from . import esign
+
+        esign.abandon(contract_id, str(before_sig.get("envelopeId") or ""), actor,
+                      reason=f"The contract was {_STATE_WORDS.get(stored.get('state') or '', 'changed')} in Govern.")
     if action == "mark_signed" and stored.get("state") == "signed":
         _replace_sonar_obligations(stored, extra.get("obligations") or [])
         if stored.get("parentContractId"):
             _apply_signed_amendment(stored, iso(_now(None)))
     return stored
+
+
+# ---------------------------------------------------------------------------
+# Govern e-signature (shared/govern/esign.py; docs/GOVERN_ESIGN.md)
+# ---------------------------------------------------------------------------
+
+ESIGN_PROVIDER = "govern"
+# Actions that can take a contract out of ``out_for_signature`` around an envelope.
+_LEAVES_SIGNATURE = frozenset({"reopen", "reject", "mark_signed"})
+ESIGN_SYSTEM = "Blue-IQ Govern e-signature"
+_ESIGN_OUTCOMES = {"declined": "declined to sign", "voided": "cancelled the signing request", "expired": "expired"}
+
+
+def send_for_esign(contract_id: str, envelope_id: str, signatories: list[dict[str, Any]],
+                   actor: dict[str, Any] | None, *, now: datetime | None = None) -> dict[str, Any]:
+    """``ready_to_sign`` → ``out_for_signature`` for a Govern envelope.
+
+    Not a POST /actions action: only esign.send calls it, after the envelope is
+    stored, so provider ``govern`` always names a real envelope."""
+    now_s = iso(_now(now))
+    who = display(actor)
+    names = ", ".join(display(p) for p in signatories[:3]) + (" and others" if len(signatories) > 3 else "")
+
+    def change(c: dict[str, Any], entries: list[dict[str, Any]]) -> Any:
+        _require_from(c, "send_for_signature")
+        c.pop("piRequest", None)
+        c["signature"] = {"provider": ESIGN_PROVIDER, "envelopeId": envelope_id, "sentAt": now_s, "signedAt": None,
+                          "signatory": signatories[0] if signatories else None,
+                          "signatories": signatories[:20]}
+        fs, ts = _enter_state(c, "out_for_signature", now_s)
+        entries.append(_entry("signature_sent", actor, f"{who} sent this to {names} to sign with Govern e-signature.",
+                              from_stage=fs, to_stage=ts, at=now_s,
+                              detail={"provider": ESIGN_PROVIDER, "envelopeId": envelope_id}))
+
+    stored, _ = _commit(contract_id, change)
+    return stored
+
+
+def cancel_esign(contract_id: str, envelope_id: str, outcome: str, *, actor: dict[str, Any] | None,
+                 reason: str | None = None, now: datetime | None = None) -> dict[str, Any] | None:
+    """The envelope ended without a signature (``declined`` / ``voided`` /
+    ``expired``): ``out_for_signature`` → ``ready_to_sign``. A contract that
+    already moved on (or is out with another envelope) is left alone."""
+    if outcome not in _ESIGN_OUTCOMES:
+        raise ValueError(f"unknown e-signature outcome {outcome!r}")
+    now_s = iso(_now(now))
+    who = display(actor, ESIGN_SYSTEM)
+
+    def change(c: dict[str, Any], entries: list[dict[str, Any]]) -> Any:
+        sig = c.get("signature") or {}
+        if c.get("state") != "out_for_signature" or sig.get("envelopeId") != envelope_id:
+            return False
+        c["signature"] = None
+        fs, ts = _enter_state(c, "ready_to_sign", now_s)
+        summary = (f"The signing request {_ESIGN_OUTCOMES[outcome]}." if outcome == "expired"
+                   else f"{who} {_ESIGN_OUTCOMES[outcome]}.")
+        if reason:
+            summary += f" “{_clip(reason, 160)}”"
+        entries.append(_entry(f"signature_{outcome}", actor, summary, from_stage=fs, to_stage=ts, at=now_s,
+                              detail={"provider": ESIGN_PROVIDER, "envelopeId": envelope_id,
+                                      **({"reason": reason} if reason else {})}))
+
+    try:
+        stored, entries = _commit(contract_id, change)
+    except NotFound:
+        return None
+    return stored if entries else None
 
 
 def _money_detail(c: dict[str, Any]) -> dict[str, Any]:
