@@ -175,6 +175,7 @@ intake links it, rescores it (clean) and returns the contract to review.
 | `…-govern-connectors-dlq-not-empty` | Huron push-back failed | See `GET /integrations/sync-log`; redrive after fixing credentials |
 | `…-govern-stream-dlq-not-empty` | activity entries not published / counted | Redrive is not possible for stream records: run `python scripts/backfill_govern_aggregates.py --stage <s> --apply` |
 | `…-govern-<fn>-errors` | a Lambda raised | Read its log group (`/aws/lambda/<p>-govern-<fn>`) |
+| `…-govern-seal-dlq-not-empty` | a signed envelope could not be sealed in three tries (it shows "failed") | Read `/aws/lambda/<p>-govern-seal` (`envelopeId` is logged). Common causes: the KMS key disabled, the source PDF missing. After fixing, set the envelope's `status` back to `sealing` and redrive the message. |
 
 ## 9. Audit
 
@@ -189,3 +190,31 @@ intake links it, rescores it (clean) and returns the contract to review.
   existing trail.
 * Trend aggregates can be rebuilt at any time from the activity log:
   `python scripts/backfill_govern_aggregates.py --stage <s>` (dry run) then `--apply`.
+
+## 10. Govern e-signature (docs/GOVERN_ESIGN.md)
+
+* **Prerequisites.** `NOTIFY_FROM_EMAIL` must be a verified SES identity (out of
+  the SES sandbox for external signers), or invitations are not emailed; the
+  reviewer can still copy each signer's link from the send result. The signing
+  key (`alias/<prefix>-govern-signing`) and the seal queue are created by
+  Terraform; nothing needs to be set by hand.
+* **The certificate.** On the first seal, govern-seal creates a self-issued
+  certificate for the KMS key and stores it in govern-config under
+  `PK = SIGNING`, `SK = CERT#<keyId>`. Sealed PDFs are valid and tamper-evident;
+  Adobe Reader shows "validity unknown" until the certificate is trusted.
+* **An Adobe-trusted certificate.** Buy a document-signing certificate from an
+  AATL member for the existing key: export its public key
+  (`aws kms get-public-key --key-id alias/<prefix>-govern-signing`), have the
+  CA issue against it (CSR signing uses `kms:Sign`), then replace the item's
+  `der` (base64 DER of the issued certificate) and set `source` to the CA's
+  name. New seals use it at once; earlier seals stay valid.
+* **Timestamps.** `var.signing_tsa_url` (default DigiCert's public RFC 3161
+  service). When the authority is unreachable the document is sealed without a
+  timestamp rather than failing (logged as `esign.timestamp_failed`).
+* **Checking a sealed PDF.** Open it in Adobe Reader's signature panel, or run
+  `python -c "from shared.govern import esign_seal; print(esign_seal.verify(open('x.pdf','rb').read()))"`
+  from `lambdas/` (intact, valid and whole-file coverage).
+* **Files** are kept under `esign/<tenant>/<contract>/<envelope>/` in the
+  processed bucket: `source.pdf`, `pages/<n>.png`, `sig/<recipient>-*.png`,
+  `sealed.pdf`. Deleting a contract removes its envelopes from DynamoDB; remove
+  the prefix with `aws s3 rm --recursive` when a tenant's data must go.

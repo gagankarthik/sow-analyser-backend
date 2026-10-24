@@ -23,6 +23,12 @@ GET    /contracts/{id}/activity?before=&limit=              view (older activity
 GET    /contracts/{id}/portal-links                         edit (counterparty links; never the token)
 POST   /contracts/{id}/portal-links                         edit (max 5 active; the url is returned once)
 DELETE /contracts/{id}/portal-links/{linkId}                edit (revoke)
+GET    /contracts/{id}/envelopes                            edit (Govern e-signature, docs/GOVERN_ESIGN.md)
+POST   /contracts/{id}/envelopes · /envelopes/upload-url    edit (a draft from the contract's PDF or an upload)
+GET · PUT · DELETE /contracts/{id}/envelopes/{envId}        edit (PUT and DELETE: drafts only)
+POST   /contracts/{id}/envelopes/{envId}/send · /void       edit
+POST   /contracts/{id}/envelopes/{envId}/recipients/{rid}/resend   edit
+GET    /contracts/{id}/envelopes/{envId}/download?file=     edit (sealed | source)
 GET    /matrix · GET /matrix/versions/{n}                   signed in
 PUT    /matrix · POST /matrix/import                        Govern admin
 GET    /workflow/settings                                   signed in
@@ -72,7 +78,7 @@ from shared import dynamodb as ddb
 from shared.access import Caller, can
 from shared.auth import AuthError, jwt_claims
 from shared.config import settings
-from shared.govern import aggregates, automations, capture, connectors, portal, revisions, secrets, store, views, workflow
+from shared.govern import aggregates, automations, capture, connectors, esign, portal, revisions, secrets, store, views, workflow
 from shared.govern import matrix as govern_matrix
 from shared.govern import org
 from shared.govern.store import ContractConflict, iso
@@ -719,6 +725,79 @@ def _revoke_portal_link(event: dict[str, Any], user: GovernUser, contract_id: st
 
 
 # ---------------------------------------------------------------------------
+# Govern e-signature (shared/govern/esign.py; docs/GOVERN_ESIGN.md)
+# ---------------------------------------------------------------------------
+
+
+def _envelope_for(contract_id: str, user: GovernUser, envelope_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    c, _ = _contract_for(contract_id, user, "edit")
+    env = esign.get_envelope(contract_id, envelope_id)
+    if env is None:
+        raise workflow.NotFound("Envelope not found")
+    return c, env
+
+
+def _list_envelopes(event: dict[str, Any], user: GovernUser, contract_id: str) -> dict[str, Any]:
+    _contract_for(contract_id, user, "edit")
+    return _ok({"envelopes": [esign.summary(e) for e in esign.envelopes_for(contract_id)]})
+
+
+def _create_envelope(event: dict[str, Any], user: GovernUser, contract_id: str) -> dict[str, Any]:
+    c, _ = _contract_for(contract_id, user, "edit")
+    env = esign.create_draft(c, _body(event), user.person)
+    log.info("govern_api.envelope_created", contractId=contract_id, envelopeId=env["envelopeId"])
+    return _ok(esign.detail(env, can_edit=True), 201)
+
+
+def _envelope_upload_url(event: dict[str, Any], user: GovernUser, contract_id: str) -> dict[str, Any]:
+    c, _ = _contract_for(contract_id, user, "edit")
+    return _ok(esign.upload_url(c, _body(event)))
+
+
+def _get_envelope(event: dict[str, Any], user: GovernUser, contract_id: str, envelope_id: str) -> dict[str, Any]:
+    _, env = _envelope_for(contract_id, user, envelope_id)
+    return _ok(esign.detail(env, can_edit=True))
+
+
+def _put_envelope(event: dict[str, Any], user: GovernUser, contract_id: str, envelope_id: str) -> dict[str, Any]:
+    c, _ = _envelope_for(contract_id, user, envelope_id)
+    return _ok(esign.detail(esign.update_draft(c, envelope_id, _body(event)), can_edit=True))
+
+
+def _delete_envelope(event: dict[str, Any], user: GovernUser, contract_id: str, envelope_id: str) -> dict[str, Any]:
+    c, _ = _envelope_for(contract_id, user, envelope_id)
+    esign.delete_draft(c, envelope_id)
+    return _ok({"deleted": True})
+
+
+def _send_envelope(event: dict[str, Any], user: GovernUser, contract_id: str, envelope_id: str) -> dict[str, Any]:
+    c, _ = _envelope_for(contract_id, user, envelope_id)
+    env, links = esign.send(c, envelope_id, user.person)
+    log.info("govern_api.envelope_sent", contractId=contract_id, envelopeId=envelope_id, links=len(links))
+    # The links are shown once, so the sender can share one by hand when email is off.
+    return _ok({**esign.detail(env, can_edit=True), "links": links})
+
+
+def _void_envelope(event: dict[str, Any], user: GovernUser, contract_id: str, envelope_id: str) -> dict[str, Any]:
+    c, _ = _envelope_for(contract_id, user, envelope_id)
+    env = esign.void(c, envelope_id, _body(event), user.person)
+    log.info("govern_api.envelope_voided", contractId=contract_id, envelopeId=envelope_id)
+    return _ok(esign.detail(env, can_edit=True))
+
+
+def _resend_envelope(event: dict[str, Any], user: GovernUser, contract_id: str, envelope_id: str,
+                     recipient_id: str) -> dict[str, Any]:
+    c, _ = _envelope_for(contract_id, user, envelope_id)
+    return _ok(esign.resend(c, envelope_id, recipient_id, user.person))
+
+
+def _download_envelope(event: dict[str, Any], user: GovernUser, contract_id: str, envelope_id: str) -> dict[str, Any]:
+    _, env = _envelope_for(contract_id, user, envelope_id)
+    which = (event.get("queryStringParameters") or {}).get("file") or "sealed"
+    return _ok(esign.download(env, which))
+
+
+# ---------------------------------------------------------------------------
 # Matrix
 # ---------------------------------------------------------------------------
 
@@ -1117,6 +1196,16 @@ _RAW_ROUTES: list[tuple[tuple[str, str], Callable[..., dict[str, Any]]]] = [
     (("GET", rf"/contracts/{_SEG}/portal-links"), _list_portal_links),
     (("POST", rf"/contracts/{_SEG}/portal-links"), _create_portal_link),
     (("DELETE", rf"/contracts/{_SEG}/portal-links/{_SEG}"), _revoke_portal_link),
+    (("GET", rf"/contracts/{_SEG}/envelopes"), _list_envelopes),
+    (("POST", rf"/contracts/{_SEG}/envelopes"), _create_envelope),
+    (("POST", rf"/contracts/{_SEG}/envelopes/upload-url"), _envelope_upload_url),
+    (("GET", rf"/contracts/{_SEG}/envelopes/{_SEG}"), _get_envelope),
+    (("PUT", rf"/contracts/{_SEG}/envelopes/{_SEG}"), _put_envelope),
+    (("DELETE", rf"/contracts/{_SEG}/envelopes/{_SEG}"), _delete_envelope),
+    (("POST", rf"/contracts/{_SEG}/envelopes/{_SEG}/send"), _send_envelope),
+    (("POST", rf"/contracts/{_SEG}/envelopes/{_SEG}/void"), _void_envelope),
+    (("POST", rf"/contracts/{_SEG}/envelopes/{_SEG}/recipients/{_SEG}/resend"), _resend_envelope),
+    (("GET", rf"/contracts/{_SEG}/envelopes/{_SEG}/download"), _download_envelope),
     (("GET", r"/matrix"), _get_matrix),
     (("PUT", r"/matrix"), _put_matrix),
     (("POST", r"/matrix/import"), _import_matrix),

@@ -37,21 +37,25 @@ locals {
     METRICS_TABLE                = aws_dynamodb_table.govern_metrics.name
     EVENT_BUS_NAME               = aws_cloudwatch_event_bus.platform.name
     INTAKE_QUEUE_URL             = aws_sqs_queue.govern["intake"].url
-    GOVERN_FEATURES              = var.govern_features
-    GOVERN_DEFAULT_EDITION       = var.govern_default_edition
-    NOTIFY_FROM_EMAIL            = var.notify_from_email
-    SES_REGION                   = local.region
-    APP_BASE_URL                 = var.app_base_url
-    TEAMS_SECRET_ARN             = aws_secretsmanager_secret.govern["teams"].arn
-    DOCUSIGN_SECRET_ARN          = aws_secretsmanager_secret.govern["docusign"].arn
-    HURON_SECRET_ARN             = aws_secretsmanager_secret.govern["huron"].arn
-    WORKDAY_SECRET_ARN           = aws_secretsmanager_secret.govern["workday"].arn
-    M365_SECRET_ARN              = aws_secretsmanager_secret.govern["m365"].arn
+    # Govern e-signature (govern_esign.tf, docs/GOVERN_ESIGN.md).
+    SIGNING_KMS_KEY_ID     = aws_kms_key.govern_signing.arn
+    SIGNING_TSA_URL        = var.signing_tsa_url
+    SEAL_QUEUE_URL         = aws_sqs_queue.govern_seal.url
+    GOVERN_FEATURES        = var.govern_features
+    GOVERN_DEFAULT_EDITION = var.govern_default_edition
+    NOTIFY_FROM_EMAIL      = var.notify_from_email
+    SES_REGION             = local.region
+    APP_BASE_URL           = var.app_base_url
+    TEAMS_SECRET_ARN       = aws_secretsmanager_secret.govern["teams"].arn
+    DOCUSIGN_SECRET_ARN    = aws_secretsmanager_secret.govern["docusign"].arn
+    HURON_SECRET_ARN       = aws_secretsmanager_secret.govern["huron"].arn
+    WORKDAY_SECRET_ARN     = aws_secretsmanager_secret.govern["workday"].arn
+    M365_SECRET_ARN        = aws_secretsmanager_secret.govern["m365"].arn
   }
 
   # name → package directory, sizing, description
   govern_functions = {
-    api        = { dir = "govern_api", memory = 512, timeout = 30, description = "Govern REST API (contracts, matrix, workflow, integrations, reports)" }
+    api        = { dir = "govern_api", memory = 1024, timeout = 30, description = "Govern REST API (contracts, matrix, workflow, integrations, reports)" }
     intake     = { dir = "govern_intake", memory = 512, timeout = 120, description = "Document Analysed → contract, matrix review, revisions" }
     stream     = { dir = "govern_stream", memory = 256, timeout = 60, description = "Activity stream → EventBridge Govern.* + trend aggregates" }
     notifier   = { dir = "govern_notifier", memory = 256, timeout = 60, description = "Email (SES) and Teams alerts for Govern events" }
@@ -59,6 +63,8 @@ locals {
     connectors = { dir = "govern_connectors", memory = 512, timeout = 300, description = "Huron / Workday / M365 / DocuSign connector runs" }
     webhooks   = { dir = "govern_webhooks", memory = 256, timeout = 30, description = "Signed webhooks (DocuSign Connect)" }
     portal     = { dir = "govern_portal", memory = 256, timeout = 15, description = "Counterparty portal links (public, token-authenticated)" }
+    signing    = { dir = "govern_signing", memory = 512, timeout = 20, description = "Govern e-signature signer links (public, token-authenticated)" }
+    seal       = { dir = "govern_seal", memory = 1536, timeout = 120, description = "Seals completed e-signature envelopes with the KMS key" }
   }
 
   # SQS-fed functions: queue name → consuming function, batch size
@@ -489,6 +495,13 @@ locals {
       { Sid = "MetricsReadAndReverse", Effect = "Allow", Action = ["dynamodb:BatchGetItem", "dynamodb:GetItem", "dynamodb:UpdateItem"], Resource = local.govern_table_arns.metrics },
       { Sid = "ProcessedArtefacts", Effect = "Allow", Action = ["s3:GetObject", "s3:PutObject"], Resource = "${aws_s3_bucket.processed.arn}/*" },
       { Sid = "SignRevisionUploads", Effect = "Allow", Action = ["s3:PutObject"], Resource = "${aws_s3_bucket.raw.arn}/tenants/*" },
+      # Govern e-signature: read the contract's PDF, prepare and delete drafts, send invitations.
+      { Sid = "EsignSourceDocument", Effect = "Allow", Action = ["s3:GetObject"], Resource = "${aws_s3_bucket.raw.arn}/tenants/*" },
+      { Sid = "EsignDrafts", Effect = "Allow", Action = ["s3:DeleteObject"], Resource = "${aws_s3_bucket.processed.arn}/esign/*" },
+      { Sid = "EsignDraftsList", Effect = "Allow", Action = ["s3:ListBucket"], Resource = aws_s3_bucket.processed.arn,
+      Condition = { StringLike = { "s3:prefix" = ["esign/*"] } } },
+      { Sid = "EsignInvitations", Effect = "Allow", Action = ["ses:SendEmail", "ses:SendRawEmail"],
+      Resource = "arn:aws:ses:${local.region}:${local.account_id}:identity/*" },
       { Sid = "IntegrationSecrets", Effect = "Allow", Action = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"],
       Resource = values(local.govern_secret_arns) },
     ]
@@ -537,7 +550,10 @@ locals {
       Resource = [local.govern_table_arns.contracts, "${local.govern_table_arns.contracts}/index/*"] },
       { Sid = "ActivityAppendOnly", Effect = "Allow", Action = ["dynamodb:PutItem"], Resource = local.govern_table_arns.activity },
       # UpdateItem: automation run counters (runCount / lastRunAt).
-      { Sid = "ConfigRead", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:UpdateItem"], Resource = local.govern_table_arns.config },
+      # PutItem: a reminder issues a fresh signer link (SIGNER#…); UpdateItem revokes links at expiry.
+      { Sid = "ConfigRead", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:UpdateItem", "dynamodb:PutItem"], Resource = local.govern_table_arns.config },
+      { Sid = "EsignReminders", Effect = "Allow", Action = ["ses:SendEmail", "ses:SendRawEmail"],
+      Resource = "arn:aws:ses:${local.region}:${local.account_id}:identity/*" },
       { Sid = "Reconcile", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem"], Resource = local.govern_table_arns.sync },
       { Sid = "AutomationMarkers", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"], Resource = local.govern_table_arns.metrics },
       { Sid = "Requeue", Effect = "Allow", Action = ["sqs:SendMessage"], Resource = aws_sqs_queue.govern["intake"].arn },
@@ -581,6 +597,46 @@ locals {
       { Sid = "RevisionDocument", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem"], Resource = aws_dynamodb_table.main.arn,
       Condition = { "ForAllValues:StringLike" = { "dynamodb:LeadingKeys" = ["DOC#*", "PROJ#*"] } } },
       { Sid = "SignRevisionUpload", Effect = "Allow", Action = ["s3:PutObject"], Resource = "${aws_s3_bucket.raw.arn}/tenants/*/uploads/*" },
+    ]
+    # Public and unauthenticated like the portal (the signer link token is the
+    # credential): keys limited by prefix, files limited to esign/, no secrets,
+    # no signing key (sealing happens in govern-seal).
+    signing = [
+      # Signer links: read by hash, count opens, revoke, and issue the next signer's link.
+      { Sid = "SignerLinks", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:PutItem"],
+      Resource = local.govern_table_arns.config, Condition = { "ForAllValues:StringLike" = { "dynamodb:LeadingKeys" = ["SIGNER#*"] } } },
+      { Sid = "OrganizationSettingsRead", Effect = "Allow", Action = ["dynamodb:GetItem"], Resource = local.govern_table_arns.config,
+      Condition = { "ForAllValues:StringLike" = { "dynamodb:LeadingKeys" = ["T#*"] } } },
+      # The envelope (ENV#) and the contract (decline returns it to ready to sign); optimistic locks on rev.
+      { Sid = "EnvelopeAndContract", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:PutItem"],
+      Resource = local.govern_table_arns.contracts, Condition = { "ForAllValues:StringLike" = { "dynamodb:LeadingKeys" = ["CON#*"] } } },
+      { Sid = "ActivityAppendOnly", Effect = "Allow", Action = ["dynamodb:PutItem"], Resource = local.govern_table_arns.activity },
+      { Sid = "LifecycleMirror", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:UpdateItem"], Resource = aws_dynamodb_table.main.arn,
+      Condition = { "ForAllValues:StringLike" = { "dynamodb:LeadingKeys" = ["DOC#*"] } } },
+      # Page images and the sealed copy (read, via presigned URLs), adopted signatures (write).
+      { Sid = "EsignFilesRead", Effect = "Allow", Action = ["s3:GetObject"], Resource = "${aws_s3_bucket.processed.arn}/esign/*" },
+      { Sid = "EsignSignatures", Effect = "Allow", Action = ["s3:PutObject"], Resource = "${aws_s3_bucket.processed.arn}/esign/*/sig/*" },
+      { Sid = "SealQueue", Effect = "Allow", Action = ["sqs:SendMessage"], Resource = aws_sqs_queue.govern_seal.arn },
+      { Sid = "Email", Effect = "Allow", Action = ["ses:SendEmail", "ses:SendRawEmail"],
+      Resource = "arn:aws:ses:${local.region}:${local.account_id}:identity/*" },
+    ]
+    seal = [
+      { Sid = "Documents", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:UpdateItem"], Resource = local.docs_table_arns },
+      # The envelope, and the contract moving to signed (with its obligations).
+      { Sid = "Contracts", Effect = "Allow", Action = local.ddb_contracts_write,
+      Resource = [local.govern_table_arns.contracts, "${local.govern_table_arns.contracts}/index/*"] },
+      { Sid = "ActivityAppendOnly", Effect = "Allow", Action = ["dynamodb:PutItem"], Resource = local.govern_table_arns.activity },
+      # Settings, the cached signing certificate (SIGNING / CERT#…), signer links kept for download.
+      { Sid = "Config", Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"],
+      Resource = local.govern_table_arns.config },
+      { Sid = "ProcessedArtefacts", Effect = "Allow", Action = ["s3:GetObject", "s3:PutObject"], Resource = "${aws_s3_bucket.processed.arn}/*" },
+      { Sid = "EsignFilesExist", Effect = "Allow", Action = ["s3:ListBucket"], Resource = aws_s3_bucket.processed.arn,
+      Condition = { StringLike = { "s3:prefix" = ["esign/*"] } } },
+      { Sid = "SealWithTheSigningKey", Effect = "Allow", Action = ["kms:Sign", "kms:GetPublicKey"], Resource = aws_kms_key.govern_signing.arn },
+      { Sid = "CompletedCopies", Effect = "Allow", Action = ["ses:SendEmail", "ses:SendRawEmail"],
+      Resource = "arn:aws:ses:${local.region}:${local.account_id}:identity/*" },
+      { Sid = "Queue", Effect = "Allow", Action = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:ChangeMessageVisibility"],
+      Resource = aws_sqs_queue.govern_seal.arn },
     ]
   }
 }
@@ -717,6 +773,11 @@ locals {
     # Counterparty portal links, reviewer side ({linkId} is matched from the raw path).
     "GET /contracts/{id}/portal-links", "POST /contracts/{id}/portal-links",
     "DELETE /contracts/{id}/portal-links/{linkId}",
+    # Govern e-signature, reviewer side ({envId} / {rid} are matched from the raw path).
+    "GET /contracts/{id}/envelopes", "POST /contracts/{id}/envelopes", "POST /contracts/{id}/envelopes/upload-url",
+    "GET /contracts/{id}/envelopes/{envId}", "PUT /contracts/{id}/envelopes/{envId}", "DELETE /contracts/{id}/envelopes/{envId}",
+    "POST /contracts/{id}/envelopes/{envId}/send", "POST /contracts/{id}/envelopes/{envId}/void",
+    "POST /contracts/{id}/envelopes/{envId}/recipients/{rid}/resend", "GET /contracts/{id}/envelopes/{envId}/download",
     "GET /matrix", "PUT /matrix", "POST /matrix/import", "GET /matrix/versions/{n}",
     "GET /workflow/settings", "PUT /workflow/settings",
     "GET /integrations", "GET /integrations/sync-log", "GET /integrations/unmatched",

@@ -225,6 +225,12 @@ class Settings:
     m365_secret_arn: str = field(default_factory=lambda: _env("M365_SECRET_ARN", ""))
     # Link to the web app used in alert emails / Teams cards ("Open in Govern").
     app_base_url: str = field(default_factory=lambda: _env("APP_BASE_URL", "https://govern.blue-iq.ai"))
+    # Govern e-signature (docs/GOVERN_ESIGN.md): the KMS key that seals signed
+    # documents (empty = signing unavailable), the RFC 3161 timestamp authority
+    # (empty = no timestamp) and the queue completed envelopes are sealed from.
+    signing_kms_key_id: str = field(default_factory=lambda: _env("SIGNING_KMS_KEY_ID", ""))
+    signing_tsa_url: str = field(default_factory=lambda: _env("SIGNING_TSA_URL", ""))
+    seal_queue_url: str = field(default_factory=lambda: _env("SEAL_QUEUE_URL", ""))
     # DocuSign Connect: reject webhook deliveries older than this (replay guard).
     webhook_max_age_s: int = field(default_factory=lambda: _int("WEBHOOK_MAX_AGE_S", 300))
     # Govern "Later" features switched on for this deployment (comma list, e.g.

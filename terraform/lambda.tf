@@ -539,6 +539,33 @@ resource "aws_apigatewayv2_stage" "default" {
     throttling_rate_limit  = 1
     throttling_burst_limit = 5
   }
+  # Govern e-signature: the public signer routes (each link also caps its own
+  # opens) and sending, which emails every signer whose turn it is.
+  route_settings {
+    route_key              = aws_apigatewayv2_route.govern_signing["GET /sign/{token}"].route_key
+    throttling_rate_limit  = 10
+    throttling_burst_limit = 20
+  }
+  route_settings {
+    route_key              = aws_apigatewayv2_route.govern_signing["POST /sign/{token}/complete"].route_key
+    throttling_rate_limit  = 5
+    throttling_burst_limit = 10
+  }
+  route_settings {
+    route_key              = aws_apigatewayv2_route.govern_signing["POST /sign/{token}/decline"].route_key
+    throttling_rate_limit  = 2
+    throttling_burst_limit = 5
+  }
+  route_settings {
+    route_key              = aws_apigatewayv2_route.govern_signing["GET /sign/{token}/download"].route_key
+    throttling_rate_limit  = 5
+    throttling_burst_limit = 10
+  }
+  route_settings {
+    route_key              = aws_apigatewayv2_route.govern["POST /contracts/{id}/envelopes/{envId}/send"].route_key
+    throttling_rate_limit  = 2
+    throttling_burst_limit = 5
+  }
 
   # One JSON line per request with who called (the verified JWT sub), kept
   # for var.govern_log_retention_days as audit evidence.
